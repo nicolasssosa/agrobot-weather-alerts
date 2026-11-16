@@ -1,7 +1,8 @@
 ---
 role: code-reviewer
 provider: opencode
-model: opencode/glm-5.3-flash-free
+model: opencode-go/glm-5.3-flash
+# 2026-11-16: free → OpenCode Go (el tier gratuito llegó a su límite durante S3).
 options: { variant: high }
 # Antes: claudeAgent / claude-opus-5-5 effort medium. Cambiado por costo de tokens (decisión del usuario,
 # 2026-11-16). Volver a Opus medium si las reviews de GLM no detectan problemas reales.
