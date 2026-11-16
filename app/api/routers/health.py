@@ -7,14 +7,25 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import text
 
 from app.api.deps import SessionDep
-from app.schemas.common import HealthStatus
+from app.schemas.common import HealthStatus, UnavailableStatus
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["health"])
 
 
-@router.get("/health", response_model=HealthStatus, responses={503: {"model": HealthStatus}})
+@router.get(
+    "/health",
+    response_model=HealthStatus,
+    summary="Estado del servicio",
+    responses={
+        503: {
+            "model": UnavailableStatus,
+            "description": "Base de datos no disponible",
+            "content": {"application/json": {"example": {"status": "unavailable"}}},
+        }
+    },
+)
 async def health(session: SessionDep) -> HealthStatus | JSONResponse:
     """Verifica la conexión con la base con `SELECT 1`."""
     try:

@@ -74,7 +74,7 @@ Archivos: `app/jobs/worker.py`, `app/scripts/seed.py`, `tests/jobs/test_worker.p
 - [ ] Seed idempotente según `JOBS.md` §Seed.
 - [ ] Prueba manual documentada en el PR: `make db-up migrate seed jobs-once` → notificaciones `sent`.
 
-## S8 — OpenAPI / Swagger como contrato · RNF-07
+## S8 — OpenAPI / Swagger como contrato · RNF-07 · ✅
 Archivos: `app/main.py` (solo metadata OpenAPI: descripción y `openapi_tags`), `app/api/deps.py`
 (esquema de seguridad), `app/schemas/*.py` (ejemplos + `ErrorResponse` en `common.py`),
 `app/api/routers/*.py` (`responses=` y summaries), `app/scripts/export_openapi.py` (nuevo),
