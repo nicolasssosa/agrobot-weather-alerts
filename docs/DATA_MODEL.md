@@ -127,8 +127,8 @@ Configuración del usuario: "avisame cuando la probabilidad de `event_type` en `
 
 Constraints / índices:
 - `deleted_at TIMESTAMPTZ NULL` (S9, migración 0003): borrado lógico. Una alerta borrada no se lista, no se evalúa y no se puede modificar; su historial de notificaciones se conserva.
-- ~~`UNIQUE (field_id, event_type)`~~ (Fase 1) → reemplazado en 0003 por el **índice único parcial**
-  `uq_alerts_field_event_threshold_alive` en `(field_id, event_type, threshold) WHERE deleted_at IS NULL`:
+- **Índice único parcial** `uq_alerts_field_event_threshold_alive` en
+  `(field_id, event_type, threshold) WHERE deleted_at IS NULL` (migración 0003):
   varias alertas por evento con umbrales distintos; una borrada se puede recrear.
 - Índice parcial `ix_alerts_active_field_event` en `(field_id, event_type) WHERE is_active AND deleted_at IS NULL` (0003)
   (lo usa el evaluador). En el modelo:

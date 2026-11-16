@@ -87,11 +87,6 @@ Archivos: `app/main.py` (solo metadata OpenAPI: descripción y `openapi_tags`), 
 - [ ] Test de contrato: `app.openapi()` == `docs/openapi.json`; si difieren, falla con el mensaje "corré `make openapi`". Tests de que cada endpoint protegido declara 401 y el security scheme, y que los ejemplos validan contra sus propios schemas.
 - [ ] Ningún cambio de comportamiento: toda la suite existente sigue verde sin modificarse.
 
-# Fase 2 — Mejoras de producción
-
-Decisiones D1, D2, D5, D9 (revisadas) y D11–D16 en `REQUIREMENTS.md` §6. Cada historia detalla
-su contrato en `DATA_MODEL.md` / `API.md` / `JOBS.md` antes de arrancar.
-
 ## S9 — Alertas: borrado lógico, varios umbrales y validación al enviar · D5, D11, D12 · ✅
 Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.py`,
 `app/services/alerts.py`, `app/api/routers/alerts.py`, `app/jobs/{evaluator,dispatcher}.py`,
