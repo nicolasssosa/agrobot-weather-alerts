@@ -33,3 +33,13 @@ async def test_initial_migration_creates_all_tables(db_session: AsyncSession) ->
     )
     tables = set(result.scalars().all())
     assert {"users", "fields", "weather_forecasts", "alerts", "notifications"} <= tables
+
+
+def test_migration_0002_upgrade_and_downgrade_are_clean() -> None:
+    """La migración `0002` se revierte y se vuelve a aplicar sin errores."""
+    cfg = Config(str(ROOT / "alembic.ini"))
+    cfg.set_main_option("script_location", str(ROOT / "migrations"))
+    cfg.set_main_option("sqlalchemy.url", TEST_DATABASE_URL)
+
+    command.downgrade(cfg, "0001")
+    command.upgrade(cfg, "head")

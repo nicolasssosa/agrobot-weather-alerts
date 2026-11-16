@@ -32,7 +32,7 @@ Request `UserCreate`:
 ```json
 {"phone_number": "+5491122334455", "name": "Juan Pérez"}
 ```
-- `phone_number`: regex E.164 `^\+[1-9]\d{7,14}$`.
+- `phone_number`: regex E.164 `^\+[1-9][0-9]{7,14}$` (dígitos ASCII, idéntico al CHECK de la DB).
 - `name`: 1..120 chars, se aplica `strip()`; vacío tras strip → 422.
 
 Respuesta **201** `UserRead`: `{"id", "phone_number", "name", "created_at"}`.
