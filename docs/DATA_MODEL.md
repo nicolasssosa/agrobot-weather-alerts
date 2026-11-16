@@ -66,7 +66,8 @@ Usuario de Agrobot. En producción se identifica por su número de WhatsApp.
 | created_at   | TIMESTAMPTZ   | no   | now()   |                                           |
 | updated_at   | TIMESTAMPTZ   | no   | now()   |                                           |
 
-Constraints: `UNIQUE (phone_number)`.
+Constraints: `UNIQUE (phone_number)`; CHECK `phone_number ~ '^\+[1-9][0-9]{7,14}$'` (name=`phone_number_e164`,
+migración `0002`): el formato E.164 lo garantiza la DB, así el UNIQUE es unicidad real del número.
 
 ## fields
 
@@ -148,7 +149,7 @@ Guarda un **snapshot** de los valores que dispararon la alerta (el forecast pued
 | threshold       | SMALLINT    | no   |           | snapshot del umbral al momento de disparar, CHECK 1..100 (name=`threshold_range`) |
 | status          | VARCHAR(16) | no   | 'pending' | CHECK enum `notification_status`                          |
 | attempts        | SMALLINT    | no   | 0         | CHECK `attempts >= 0` (name=`attempts_non_negative`)      |
-| last_error      | TEXT        | sí   |           | último error del notifier (truncado a 1000 chars)         |
+| last_error      | TEXT        | sí   |           | último error del notifier; CHECK `last_error IS NULL OR char_length(last_error) <= 1000` (name=`last_error_length`, migración `0002`) |
 | next_attempt_at | TIMESTAMPTZ | no   | now()     | no se reintenta antes de esta fecha (backoff)             |
 | sent_at         | TIMESTAMPTZ | sí   |           | seteado cuando status = sent                              |
 | created_at      | TIMESTAMPTZ | no   |           |                                                           |
@@ -163,7 +164,15 @@ Constraints / índices:
   El UNIQUE `(alert_id, forecast_date)` ya cubre búsquedas por `alert_id`, así que este es opcional;
   incluirlo.
 
-## Migración inicial (T2)
+## Migración 0002 — hardening (S2)
+
+- Archivo `migrations/versions/<fecha>_0002_constraints_hardening.py`, `revision = "0002"`, `down_revision = "0001"`.
+- `op.create_check_constraint("phone_number_e164", "users", ...)` y `op.create_check_constraint("last_error_length", "notifications", ...)`
+  (la naming convention los convierte en `ck_users_phone_number_e164` / `ck_notifications_last_error_length`).
+- `downgrade()` los elimina con `op.drop_constraint(..., type_="check")` usando el nombre final.
+- Agregar los mismos `CheckConstraint` a los modelos `User` y `Notification`.
+
+## Migración inicial (S1)
 
 - Archivo: `migrations/versions/<fecha>_0001_initial_schema.py`, `revision = "0001"`,
   `down_revision = None`. Crear con `make migration m="initial schema"` y editar el `revision` a `"0001"`.

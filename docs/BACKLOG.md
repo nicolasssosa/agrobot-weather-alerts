@@ -23,9 +23,12 @@ Archivos: `app/models/{user,field,weather,alert,notification}.py`, `app/models/_
 - [ ] Factories `make_user/make_field/make_forecast/make_alert` + helper `auth()`.
 - [ ] Tests de constraints: probability 101 → IntegrityError; alerta duplicada (campo, evento) → IntegrityError; notificación duplicada (alerta, día) → IntegrityError; borrar field cascadea a alerts/forecasts/notifications.
 
-## S2 — Users, Fields y Health API · RF-01, RF-11, RNF-06, RNF-08
+## S2 — Users, Fields y Health API + hardening de esquema · RF-01, RF-11, RNF-06, RNF-08
 Archivos: `app/schemas/{common,user,field}.py`, `app/api/deps.py`, `app/services/{users,fields}.py`,
-`app/api/routers/{health,users,fields}.py`, `tests/api/test_{health,users,fields}.py`.
+`app/api/routers/{health,users,fields}.py`, `tests/api/test_{health,users,fields}.py`,
+`migrations/versions/*_0002_constraints_hardening.py`, `app/models/{user,notification}.py`
+(solo los CheckConstraint nuevos), `tests/test_models.py`, `tests/test_schema.py` (solo agregar casos de 0002).
+- [ ] Migración `0002` según `DATA_MODEL.md` §Migración 0002 (follow-ups S1 SEC-1 y SEC-2): CHECK E.164 en `users.phone_number` y largo máximo de `notifications.last_error`; upgrade/downgrade limpios; `alembic check` sin diferencias; tests de ambos CHECK (válido / inválido / borde 1000 vs 1001).
 - [ ] Endpoints de `API.md` §health, §users, §fields con sus códigos de estado.
 - [ ] `get_current_user` → 401 si el header falta, es inválido o el usuario no existe.
 - [ ] Ownership: el campo de otro usuario → 404.
@@ -85,7 +88,7 @@ Archivos: `.github/workflows/ci.yml`.
 
 | Origen | Severidad | Descripción | Destino sugerido |
 |--------|-----------|-------------|------------------|
-| S1 SEC-2 | minor | CHECK E.164 en `users.phone_number` en la DB (hoy solo lo valida Pydantic; variantes del número esquivan el UNIQUE) | migración 0002 junto con S2 |
-| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | migración 0002 / S6 |
+| S1 SEC-2 | minor | CHECK E.164 en `users.phone_number` en la DB (hoy solo lo valida Pydantic; variantes del número esquivan el UNIQUE) | **S2** (migración 0002) |
+| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | **S2** (CHECK, migración 0002); enmascarado de PII en S6 |
 | S1 CR-2 | nit | Derivar la lista de valores del CHECK de `event_type` de `EventType` en vez de repetirla | próxima migración |
 | S1 CR-1 | nit | Migración: nombres de PK/UQ/FK explícitos vs. CHECK en forma base (inconsistencia sin impacto) | — |
