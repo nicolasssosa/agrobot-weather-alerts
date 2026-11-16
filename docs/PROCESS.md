@@ -43,8 +43,8 @@ Riesgos y rollback: qué puede salir mal y cómo se revierte
 
 | Nivel | Se dispara si el cambio… | ¿Revisión humana? | Merge |
 |-------|--------------------------|-------------------|-------|
-| 🔴 Crítica | agrega o modifica **migraciones** de esquema · toca **auth, ownership o permisos** · cambia un **contrato público** (paths, status codes, tablas) o una decisión de producto · toca **CI/CD, Docker o secretos** · agrega **dependencias** · cambia la lógica de **envío de notificaciones** (dedupe, reintentos: impacta a usuarios reales) · tuvo un hallazgo blocker/major corregido en la última ronda, 3 rondas o desvíos reportados por el Coder | **Sí** | el PM frena, presenta el resumen y espera el OK explícito del usuario |
-| 🟡 Media | agrega funcionalidad nueva aditiva, cubierta por tests, con ambas reviews en APPROVE sin desvíos | No | automático; el usuario recibe el resumen |
+| 🔴 Crítica | agrega o modifica **migraciones** de esquema · toca **auth, ownership o permisos** · cambia un **contrato público** (paths, status codes, tablas) o una decisión de producto · toca **CI/CD, Docker o secretos** · agrega **dependencias** · cambia la lógica de **envío de notificaciones** (dedupe, reintentos: impacta a usuarios reales) · tuvo un hallazgo blocker/major **de seguridad o de integridad de datos** corregido en la última ronda · llegó a 3 rondas · el Coder reportó desvíos de contrato | **Sí** | el PM frena, presenta el resumen y espera el OK explícito del usuario |
+| 🟡 Media | agrega funcionalidad nueva aditiva, cubierta por tests, con ambas reviews en APPROVE sin desvíos de contrato (un bug funcional/performance ya corregido y re-verificado no sube el nivel) | No | automático; el usuario recibe el resumen |
 | 🟢 Baja | solo docs, solo tests, o refactor sin cambio de comportamiento | No | automático |
 
 ## Severidades

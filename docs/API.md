@@ -5,7 +5,7 @@ Base: `/api/v1` (excepto `/health`). JSON en todos lados. OpenAPI en `/docs`.
 ## Convenciones
 
 - **Autenticación (simulada):** header `X-User-Id: <int>`. Lo resuelve `get_current_user`
-  (`app/api/deps.py`). Ausente, no numérico o usuario inexistente → **401**
+  (`app/api/deps.py`). Debe ser un entero positivo en dígitos ASCII de hasta 19 caracteres (rango BIGINT). Ausente, inválido o usuario inexistente → **401**
   `{"detail": "Missing or invalid X-User-Id header"}`. En producción se reemplaza por la identidad
   que entregue el gateway de WhatsApp (número de teléfono → user). Solo `POST /users` y `/health`
   no lo requieren.

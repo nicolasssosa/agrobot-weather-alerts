@@ -44,11 +44,14 @@ Archivos: `app/weather/{provider,ingestion}.py`, `app/scripts/ingest.py`, `app/s
 - [ ] `GET /fields/{id}/forecasts` con filtros, orden y validación `date_from <= date_to`.
 
 ## S4 — Alerts API · RF-02, RF-03, RF-11, D4, D5
-Archivos: `app/schemas/alert.py`, `app/services/alerts.py`, `app/api/routers/alerts.py`, `tests/api/test_alerts.py`.
+Archivos: `app/schemas/alert.py`, `app/services/alerts.py`, `app/api/routers/alerts.py`, `tests/api/test_alerts.py`,
+`app/core/errors.py` (solo el handler de SEC-4), `app/services/_db_errors.py` (nuevo), `app/services/{users,fields}.py` (solo reemplazar el helper duplicado), tests de 422 en `tests/api/`.
 - [ ] CRUD completo según `API.md` §alerts.
 - [ ] Duplicado (campo, evento) → 409, detectado con IntegrityError (no SELECT previo).
 - [ ] PATCH parcial; `{}` → 422; `field_id`/`event_type` no editables (422 por `extra="forbid"`).
 - [ ] DELETE cascadea a las notificaciones.
+- [ ] Follow-up S2 SEC-4 (autorizado tocar `app/core/errors.py`): handler global de `RequestValidationError` que sanee `input` de los errores (surrogates UTF-16, NaN/Infinity) para que todo 422 sea JSON serializable; tests con surrogate suelto en `name` de users, fields y un payload de alerts.
+- [ ] Follow-up S2 CR-dup: mover `_is_unique_violation` a un único módulo compartido (ej. `app/services/_db_errors.py`) y usarlo en users, fields y alerts.
 
 ## S5 — Evaluador de alertas · RF-05, RF-06, RF-08, RNF-03, D1, D2
 Archivos: `app/jobs/evaluator.py`, `tests/jobs/test_evaluator.py`.
@@ -92,8 +95,8 @@ Archivos: `.github/workflows/ci.yml`.
 | S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | ✅ CHECK en S2 (0002); enmascarado de PII pendiente en S6 |
 | S1 CR-2 | nit | Derivar la lista de valores del CHECK de `event_type` de `EventType` en vez de repetirla | próxima migración |
 | S1 CR-1 | nit | Migración: nombres de PK/UQ/FK explícitos vs. CHECK en forma base (inconsistencia sin impacto) | — |
-| S2 SEC-4 | minor | Surrogate UTF-16 suelto en un string → el 422 de FastAPI no serializa → 500. Fix: handler global de `RequestValidationError` que sanee `input` (cubre también NaN/surrogates en schemas futuros) | **S4** (app/core/errors.py, con OK del PM) |
+| S2 SEC-4 | minor | Surrogate UTF-16 suelto en un string → el 422 de FastAPI no serializa → 500. Fix: handler global de `RequestValidationError` que sanee `input` (cubre también NaN/surrogates en schemas futuros) | **S4** (incluido en sus criterios) |
 | S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | README §Próximos pasos |
-| S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | documentar en API.md §Autenticación |
-| S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | consolidar en S4 (alerts también lo necesita) |
+| S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | ✅ documentado en API.md §Convenciones |
+| S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | **S4** (incluido en sus criterios) |
 | S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
