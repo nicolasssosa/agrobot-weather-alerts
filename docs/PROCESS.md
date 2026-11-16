@@ -21,7 +21,7 @@ proceso de ingeniería alrededor de ellos.
 
 - Branch por historia: `feat/<Sx>-<slug>` desde `origin/main`.
 - Conventional Commits; un commit squash por historia en `main`:
-  `feat(alerts): S4 alerts CRUD API`.
+  `feat(alerts): S4 alerts CRUD API`. Sin trailers de atribución (`Co-Authored-By`).
 - Descripción del PR = `.github/pull_request_template.md` con los reportes de QA y las reviews.
 - `main` siempre en verde. Hasta que exista el CI (S8), el gate es `make check`, re-ejecutado por el PM.
 

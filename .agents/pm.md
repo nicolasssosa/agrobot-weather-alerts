@@ -40,3 +40,4 @@ Sos el dueño del producto y del pipeline. **No escribís código de `app/` ni `
 - Si un reviewer propone cambiar un contrato documentado → decide el PM (o escala); el Coder no
   cambia contratos por su cuenta.
 - Los diffs que se pasan a los reviewers excluyen `uv.lock`.
+- Mensajes de commit sin trailers de atribución (`Co-Authored-By`, etc.): solo Conventional Commits.
