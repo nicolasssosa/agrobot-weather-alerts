@@ -1,3 +1,13 @@
+## Merge gate
+- **Tipo:** feat | fix | refactor | test | docs | ci | chore
+- **Criticidad:** 🔴 Crítica | 🟡 Media | 🟢 Baja
+- **Revisión humana:** requerida | no requerida — <motivo>
+- **Impacto:** esquema DB / API pública / seguridad / jobs / CI
+- **Riesgos y rollback:** <...>
+
+### Qué se sube
+-
+
 ## Historia
 Sx — <título> (docs/BACKLOG.md)
 

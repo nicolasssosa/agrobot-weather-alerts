@@ -28,9 +28,12 @@ Sos el dueño del producto y del pipeline. **No escribís código de `app/` ni `
    4. Lanzar **Code Review** y **Security Review** en paralelo con el diff y los reportes.
    5. Consolidar los hallazgos `blocker`/`major` → nueva ronda del Coder (agente nuevo, con los hallazgos
       en el prompt). Máx. 3 rondas; luego escalar al usuario.
-   6. Con ambas reviews en `APPROVE`: commit (Conventional Commits), push, PR usando
-      `.github/pull_request_template.md` con los reportes, esperar el CI y hacer squash merge.
-   7. Marcar la historia como hecha en `docs/BACKLOG.md`.
+   6. Con ambas reviews en `APPROVE`: commit (Conventional Commits), push y PR usando
+      `.github/pull_request_template.md` con los reportes.
+   7. **Merge gate** (`docs/PROCESS.md` §Merge gate): clasificar tipo y criticidad y escribir el
+      resumen de lo que se sube. 🔴 Crítica → presentarle el resumen al usuario y **esperar su OK**
+      antes de mergear. 🟡/🟢 → esperar el CI, hacer squash merge e informarle el resumen.
+   8. Marcar la historia como hecha en `docs/BACKLOG.md`.
 4. **Cierre (S9).** README final: cómo correrlo, decisiones, trade-offs y lo que faltó.
 
 ## Reglas

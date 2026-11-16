@@ -25,6 +25,28 @@ proceso de ingeniería alrededor de ellos.
 - Descripción del PR = `.github/pull_request_template.md` con los reportes de QA y las reviews.
 - `main` siempre en verde. Hasta que exista el CI (S8), el gate es `make check`, re-ejecutado por el PM.
 
+## Merge gate (antes de cada merge)
+
+Con QA y reviews aprobadas, el PM clasifica el cambio y escribe el **resumen de lo que se sube**
+(va arriba en la descripción del PR y se le muestra al usuario):
+
+```
+Tipo:        feat | fix | refactor | test | docs | ci | chore   (Conventional Commits)
+Criticidad:  🔴 Crítica | 🟡 Media | 🟢 Baja
+Revisión humana: requerida | no requerida  (+ motivo)
+Qué se sube: comportamiento nuevo o cambiado, en 3 a 5 bullets
+Impacto:     esquema de DB / API pública / seguridad / jobs / CI
+Riesgos y rollback: qué puede salir mal y cómo se revierte
+```
+
+### Criterios de criticidad (gana el nivel más alto que aplique)
+
+| Nivel | Se dispara si el cambio… | ¿Revisión humana? | Merge |
+|-------|--------------------------|-------------------|-------|
+| 🔴 Crítica | agrega o modifica **migraciones** de esquema · toca **auth, ownership o permisos** · cambia un **contrato público** (paths, status codes, tablas) o una decisión de producto · toca **CI/CD, Docker o secretos** · agrega **dependencias** · cambia la lógica de **envío de notificaciones** (dedupe, reintentos: impacta a usuarios reales) · tuvo un hallazgo blocker/major corregido en la última ronda, 3 rondas o desvíos reportados por el Coder | **Sí** | el PM frena, presenta el resumen y espera el OK explícito del usuario |
+| 🟡 Media | agrega funcionalidad nueva aditiva, cubierta por tests, con ambas reviews en APPROVE sin desvíos | No | automático; el usuario recibe el resumen |
+| 🟢 Baja | solo docs, solo tests, o refactor sin cambio de comportamiento | No | automático |
+
 ## Severidades
 
 | Severidad | Significado | ¿Bloquea el merge? |
