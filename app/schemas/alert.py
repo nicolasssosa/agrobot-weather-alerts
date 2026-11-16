@@ -6,6 +6,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, StrictInt, model_validator
 
 from app.models import EventType
+from app.schemas.common import Page
 
 
 class AlertCreate(BaseModel):
@@ -15,7 +16,12 @@ class AlertCreate(BaseModel):
     casos responden 404 "Field not found" (igual que un campo inexistente).
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [{"field_id": 1, "event_type": "frost", "threshold": 70}],
+        },
+    )
 
     field_id: int
     event_type: EventType
@@ -30,7 +36,10 @@ class AlertUpdate(BaseModel):
     422 porque no hay nada que actualizar, y un `null` explícito no es un valor válido.
     """
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{"threshold": 80, "is_active": False}]},
+    )
 
     threshold: StrictInt | None = Field(default=None, ge=1, le=100)
     is_active: bool | None = None
@@ -49,7 +58,22 @@ class AlertUpdate(BaseModel):
 class AlertRead(BaseModel):
     """Respuesta con los datos de una alerta."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": 1,
+                    "field_id": 1,
+                    "event_type": "frost",
+                    "threshold": 70,
+                    "is_active": True,
+                    "created_at": "2026-11-16T12:00:00Z",
+                    "updated_at": "2026-11-16T12:00:00Z",
+                }
+            ],
+        },
+    )
 
     id: int
     field_id: int
@@ -58,3 +82,7 @@ class AlertRead(BaseModel):
     is_active: bool
     created_at: datetime
     updated_at: datetime
+
+
+class AlertPage(Page[AlertRead]):
+    """Respuesta paginada de `GET /api/v1/alerts`."""

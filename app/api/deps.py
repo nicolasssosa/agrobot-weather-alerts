@@ -3,24 +3,34 @@
 import re
 from typing import Annotated
 
-from fastapi import Depends, Header, HTTPException, status
+from fastapi import Depends, HTTPException, Security, status
+from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
 from app.models import User
-from app.schemas.common import BIGINT_MAX
+from app.schemas.common import AUTH_ERROR_DETAIL, BIGINT_MAX
 from app.services.users import get_user
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
-_AUTH_ERROR_DETAIL = "Missing or invalid X-User-Id header"
+# `auto_error=False`: el 401 lo arma `get_current_user` con el mensaje único de la API.
+_x_user_id_header = APIKeyHeader(
+    name="X-User-Id",
+    scheme_name="X-User-Id",
+    auto_error=False,
+    description=(
+        "Id numérico del usuario autenticado (autenticación simulada). "
+        "Usá el botón **Authorize** de Swagger UI."
+    ),
+)
 # Solo dígitos ASCII: `int("+1")`, `int(" 1 ")` e `int("\u0661")` (dígito árabe) serían aceptados.
 _ID_HEADER_PATTERN = re.compile(r"[0-9]+")
 _MAX_ID_DIGITS = len(str(BIGINT_MAX))
 
 
 def _invalid_credentials() -> HTTPException:
-    return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=_AUTH_ERROR_DETAIL)
+    return HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=AUTH_ERROR_DETAIL)
 
 
 def _parse_user_id(raw: str) -> int | None:
@@ -35,7 +45,7 @@ def _parse_user_id(raw: str) -> int | None:
 
 async def get_current_user(
     session: SessionDep,
-    x_user_id: Annotated[str | None, Header(alias="X-User-Id")] = None,
+    x_user_id: Annotated[str | None, Security(_x_user_id_header)] = None,
 ) -> User:
     """Resuelve el usuario autenticado a partir del header `X-User-Id`."""
     if x_user_id is None:

@@ -12,13 +12,22 @@ from fastapi import APIRouter, HTTPException, Query
 
 from app.api.deps import CurrentUser, SessionDep
 from app.models import EventType, WeatherForecast
-from app.schemas.forecast import ForecastRead
+from app.schemas.common import protected_responses
+from app.schemas.forecast import FORECASTS_422_RESPONSE, ForecastRead
 from app.services.forecasts import list_forecasts
 
 router = APIRouter(prefix="/fields", tags=["forecasts"])
 
 
-@router.get("/{field_id}/forecasts", response_model=list[ForecastRead])
+@router.get(
+    "/{field_id}/forecasts",
+    response_model=list[ForecastRead],
+    summary="Listar los pronósticos de un campo",
+    responses={
+        **protected_responses((404, "Field not found")),
+        422: FORECASTS_422_RESPONSE,
+    },
+)
 async def list_forecasts_endpoint(
     field_id: int,
     user: CurrentUser,

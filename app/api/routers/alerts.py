@@ -6,8 +6,8 @@ from fastapi import APIRouter, Depends, Query, status
 
 from app.api.deps import CurrentUser, SessionDep
 from app.models import Alert, EventType
-from app.schemas.alert import AlertCreate, AlertRead, AlertUpdate
-from app.schemas.common import BIGINT_MAX, Page, PaginationParams
+from app.schemas.alert import AlertCreate, AlertPage, AlertRead, AlertUpdate
+from app.schemas.common import BIGINT_MAX, PaginationParams, protected_responses
 from app.services.alerts import (
     create_alert,
     delete_alert,
@@ -19,7 +19,21 @@ from app.services.alerts import (
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
 
-@router.post("", response_model=AlertRead, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=AlertRead,
+    status_code=status.HTTP_201_CREATED,
+    summary="Crear una alerta",
+    description=(
+        "El `field_id` del ejemplo es un placeholder: reemplazalo por el `id` de un campo "
+        "propio (creado con `POST /api/v1/fields`). Un campo inexistente o de otro usuario "
+        "responde 404 `Field not found`."
+    ),
+    responses=protected_responses(
+        (404, "Field not found"),
+        (409, "An alert for this field and event type already exists"),
+    ),
+)
 async def create_alert_endpoint(
     payload: AlertCreate, user: CurrentUser, session: SessionDep
 ) -> Alert:
@@ -27,7 +41,12 @@ async def create_alert_endpoint(
     return await create_alert(session, user.id, payload)
 
 
-@router.get("", response_model=Page[AlertRead])
+@router.get(
+    "",
+    response_model=AlertPage,
+    summary="Listar las alertas del usuario",
+    responses=protected_responses(),
+)
 async def list_alerts_endpoint(
     user: CurrentUser,
     session: SessionDep,
@@ -35,7 +54,7 @@ async def list_alerts_endpoint(
     field_id: Annotated[int | None, Query(ge=1, le=BIGINT_MAX)] = None,
     event_type: Annotated[EventType | None, Query()] = None,
     is_active: Annotated[bool | None, Query()] = None,
-) -> Page[AlertRead]:
+) -> AlertPage:
     """Lista paginada de las alertas del usuario autenticado."""
     alerts = await list_alerts(
         session,
@@ -46,20 +65,30 @@ async def list_alerts_endpoint(
         limit=pagination.limit,
         offset=pagination.offset,
     )
-    return Page[AlertRead](
+    return AlertPage(
         items=[AlertRead.model_validate(alert) for alert in alerts],
         limit=pagination.limit,
         offset=pagination.offset,
     )
 
 
-@router.get("/{alert_id}", response_model=AlertRead)
+@router.get(
+    "/{alert_id}",
+    response_model=AlertRead,
+    summary="Obtener una alerta",
+    responses=protected_responses((404, "Alert not found")),
+)
 async def read_alert_endpoint(alert_id: int, user: CurrentUser, session: SessionDep) -> Alert:
     """Devuelve una alerta del usuario; 404 si no existe o es de otro usuario."""
     return await get_alert(session, user.id, alert_id)
 
 
-@router.patch("/{alert_id}", response_model=AlertRead)
+@router.patch(
+    "/{alert_id}",
+    response_model=AlertRead,
+    summary="Actualizar una alerta",
+    responses=protected_responses((404, "Alert not found")),
+)
 async def update_alert_endpoint(
     alert_id: int, payload: AlertUpdate, user: CurrentUser, session: SessionDep
 ) -> Alert:
@@ -67,7 +96,12 @@ async def update_alert_endpoint(
     return await update_alert(session, user.id, alert_id, payload)
 
 
-@router.delete("/{alert_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{alert_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    summary="Borrar una alerta",
+    responses=protected_responses((404, "Alert not found")),
+)
 async def delete_alert_endpoint(alert_id: int, user: CurrentUser, session: SessionDep) -> None:
     """Borra una alerta del usuario; 204 sin body."""
     await delete_alert(session, user.id, alert_id)

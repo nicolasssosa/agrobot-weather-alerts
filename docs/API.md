@@ -30,7 +30,7 @@ Ejecuta `SELECT 1` contra la base.
 ### `POST /api/v1/users` — sin auth
 Request `UserCreate`:
 ```json
-{"phone_number": "+5491122334455", "name": "Juan Pérez"}
+{"phone_number": "+5491100000001", "name": "Juan Pérez"}
 ```
 - `phone_number`: regex E.164 `^\+[1-9][0-9]{7,14}$` (dígitos ASCII, idéntico al CHECK de la DB).
 - `name`: 1..120 chars, se aplica `strip()`; vacío tras strip → 422.

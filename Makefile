@@ -1,4 +1,4 @@
-.PHONY: install db-up db-down migrate migration seed ingest api worker jobs-once test lint fmt typecheck check up down
+.PHONY: install db-up db-down migrate migration seed ingest api worker jobs-once openapi test lint fmt typecheck check up down
 
 install:        ## Instala dependencias (incluye dev)
 	uv sync
@@ -23,6 +23,9 @@ ingest:         ## Corre una ingesta mock de forecasts (simula el job existente)
 
 api:            ## API con autoreload en http://localhost:8000/docs
 	uv run uvicorn app.main:app --reload
+
+openapi:        ## Regenera docs/openapi.json (contrato OpenAPI versionado)
+	uv run python -m app.scripts.export_openapi
 
 worker:         ## Background job en loop
 	uv run python -m app.jobs.worker

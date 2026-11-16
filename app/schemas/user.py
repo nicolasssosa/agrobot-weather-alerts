@@ -12,7 +12,12 @@ PHONE_E164_PATTERN = r"^\+[1-9][0-9]{7,14}$"
 class UserCreate(BaseModel):
     """Request de `POST /api/v1/users`."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra={
+            "examples": [{"phone_number": "+5491100000001", "name": "Juan Pérez"}],
+        },
+    )
 
     phone_number: str = Field(pattern=PHONE_E164_PATTERN)
     name: str = Field(min_length=1, max_length=120)
@@ -36,7 +41,19 @@ class UserCreate(BaseModel):
 class UserRead(BaseModel):
     """Respuesta con los datos públicos de un usuario."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": 1,
+                    "phone_number": "+5491100000001",
+                    "name": "Juan Pérez",
+                    "created_at": "2026-11-16T12:00:00Z",
+                }
+            ],
+        },
+    )
 
     id: int
     phone_number: str

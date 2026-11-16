@@ -61,7 +61,7 @@ Usuario de Agrobot. En producción se identifica por su número de WhatsApp.
 | columna      | tipo          | null | default | notas                                     |
 |--------------|---------------|------|---------|-------------------------------------------|
 | id           | BIGINT        | no   | identity| PK                                        |
-| phone_number | VARCHAR(20)   | no   |         | E.164 (`+5491122334455`), **UNIQUE**      |
+| phone_number | VARCHAR(20)   | no   |         | E.164 (`+5491100000001`), **UNIQUE**      |
 | name         | VARCHAR(120)  | no   |         |                                           |
 | created_at   | TIMESTAMPTZ   | no   | now()   |                                           |
 | updated_at   | TIMESTAMPTZ   | no   | now()   |                                           |

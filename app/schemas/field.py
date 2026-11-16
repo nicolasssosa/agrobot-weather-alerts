@@ -6,11 +6,19 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from app.schemas.common import Page
+
 
 class FieldCreate(BaseModel):
     """Request de `POST /api/v1/fields`."""
 
-    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    model_config = ConfigDict(
+        extra="forbid",
+        allow_inf_nan=False,
+        json_schema_extra={
+            "examples": [{"name": "Lote Norte", "latitude": -34.6037, "longitude": -58.3816}],
+        },
+    )
 
     name: str = Field(min_length=1, max_length=120)
     latitude: float = Field(ge=-90, le=90)
@@ -47,10 +55,27 @@ class FieldCreate(BaseModel):
 class FieldRead(BaseModel):
     """Respuesta con los datos de un campo."""
 
-    model_config = ConfigDict(from_attributes=True)
+    model_config = ConfigDict(
+        from_attributes=True,
+        json_schema_extra={
+            "examples": [
+                {
+                    "id": 1,
+                    "name": "Lote Norte",
+                    "latitude": -34.6037,
+                    "longitude": -58.3816,
+                    "created_at": "2026-11-16T12:00:00Z",
+                }
+            ],
+        },
+    )
 
     id: int
     name: str
     latitude: float
     longitude: float
     created_at: datetime
+
+
+class FieldPage(Page[FieldRead]):
+    """Respuesta paginada de `GET /api/v1/fields`."""
