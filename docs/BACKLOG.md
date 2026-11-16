@@ -35,7 +35,7 @@ Archivos: `app/schemas/{common,user,field}.py`, `app/api/deps.py`, `app/services
 - [ ] Paginación `Page[T]` con `limit`/`offset` validados.
 - [ ] Todos los casos de `TESTING.md` para esos archivos.
 
-## S3 — Datos meteorológicos: ingesta mock + consulta · RF-04, D3
+## S3 — Datos meteorológicos: ingesta mock + consulta · RF-04, D3 · ✅
 Archivos: `app/weather/{provider,ingestion}.py`, `app/scripts/ingest.py`, `app/schemas/forecast.py`,
 `app/services/forecasts.py`, `app/api/routers/forecasts.py`, `tests/weather/test_ingestion.py`, `tests/api/test_forecasts.py`.
 - [ ] `MockWeatherProvider` determinístico: `days × 5` puntos por campo, 0..100.
@@ -96,3 +96,4 @@ Archivos: `.github/workflows/ci.yml`.
 | S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | README §Próximos pasos |
 | S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | documentar en API.md §Autenticación |
 | S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | consolidar en S4 (alerts también lo necesita) |
+| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
