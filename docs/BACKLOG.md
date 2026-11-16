@@ -67,7 +67,7 @@ Archivos: `app/jobs/dispatcher.py`, `app/notifiers/log.py`, `app/schemas/notific
 - [ ] `GET /notifications` con ownership y filtros.
 - [ ] (Opcional) test de concurrencia con dos conexiones.
 
-## S7 — Worker y seed · RF-05, RNF-04, RNF-09
+## S7 — Worker y seed · RF-05, RNF-04, RNF-09 · ✅
 Archivos: `app/jobs/worker.py`, `app/scripts/seed.py`, `tests/jobs/test_worker.py`.
 - [ ] `run_cycle` (evaluar + commit, despachar en lotes + commit), `run_forever` resiliente e interrumpible, `main --once`.
 - [ ] SIGTERM → shutdown limpio (termina el ciclo en curso).
@@ -105,3 +105,7 @@ Archivos: `.github/workflows/ci.yml`.
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
 | S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
 | S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |
+| S7 SEC-3 | minor | `worker --once` no le pasa `stop_event` a `run_cycle`: un SIGTERM espera a drenar toda la cola (riesgo de SIGKILL y reenvío al vencer el lease). Fix de una línea + test | S8/S9 |
+| S7 SEC-4 | minor | El seed reutiliza un usuario existente con el teléfono demo (aunque sea real) y le agrega datos mock. Fix: abortar si el nombre no coincide o usar un rango de teléfonos no asignable | README §Limitaciones |
+| S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | S8/S9 |
+| S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |

@@ -21,11 +21,17 @@ _BATCH_SIZE = 500
 _MAX_PARAMS = 32_000
 
 
-async def _list_fields_page(session: AsyncSession, *, last_id: int) -> Sequence[Field]:
-    """Siguiente página de campos por id (keyset: `id > last_id`, sin OFFSET)."""
-    result = await session.execute(
-        select(Field).where(Field.id > last_id).order_by(Field.id).limit(_BATCH_SIZE)
-    )
+async def _list_fields_page(
+    session: AsyncSession, *, last_id: int, field_ids: Sequence[int] | None = None
+) -> Sequence[Field]:
+    """Siguiente página de campos por id (keyset: `id > last_id`, sin OFFSET).
+
+    Con `field_ids`, la misma paginación keyset se restringe a esos campos.
+    """
+    statement = select(Field).where(Field.id > last_id)
+    if field_ids is not None:
+        statement = statement.where(Field.id.in_(field_ids))
+    result = await session.execute(statement.order_by(Field.id).limit(_BATCH_SIZE))
     return result.scalars().all()
 
 
@@ -87,16 +93,18 @@ async def ingest_forecasts(
     start: date,
     days: int,
     source: str = "mock",
+    field_ids: Sequence[int] | None = None,
 ) -> int:
-    """Upsertea los pronósticos de todos los campos para `[start, start + days)`.
+    """Upsertea los pronósticos para `[start, start + days)`.
 
+    Sin `field_ids` procesa todos los campos; si se pasa, solo esos (misma paginación keyset).
     No commitea: el caller (la API o el script) es dueño de la transacción.
     Devuelve la cantidad de filas procesadas.
     """
     last_id = 0
     processed = 0
     while True:
-        fields = await _list_fields_page(session, last_id=last_id)
+        fields = await _list_fields_page(session, last_id=last_id, field_ids=field_ids)
         if not fields:
             break
         processed += await _upsert_page(
