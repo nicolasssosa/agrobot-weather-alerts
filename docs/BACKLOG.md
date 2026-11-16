@@ -14,7 +14,7 @@ QA + Code review + Security review aprobados.
 Infra (pyproject, Docker, compose, Alembic async, config, DB, errores, enums, contratos de Notifier),
 `conftest.py`, stubs y docs. Commit inicial en `main`.
 
-## S1 — Modelo de datos y migración inicial · RNF-02, RNF-07
+## S1 — Modelo de datos y migración inicial · RNF-02, RNF-07 · ✅
 Archivos: `app/models/{user,field,weather,alert,notification}.py`, `app/models/__init__.py`,
 `migrations/versions/*_0001_initial_schema.py`, factories en `tests/conftest.py`, `tests/test_migrations.py`.
 - [ ] Los 5 modelos coinciden con `DATA_MODEL.md` (tipos, nullability, CHECKs, UNIQUEs, índices parciales, `ondelete`).
@@ -78,3 +78,14 @@ Archivos: `.github/workflows/ci.yml`.
 ## S9 — README final y cierre · Owner: PM
 - [ ] README: cómo correr (compose y local), arquitectura, decisiones (de `REQUIREMENTS.md` §6), trade-offs, qué faltó / próximos pasos.
 - [ ] Verificación end-to-end con `docker compose up --build`.
+
+---
+
+## Follow-ups (hallazgos minor/nit de las reviews)
+
+| Origen | Severidad | Descripción | Destino sugerido |
+|--------|-----------|-------------|------------------|
+| S1 SEC-2 | minor | CHECK E.164 en `users.phone_number` en la DB (hoy solo lo valida Pydantic; variantes del número esquivan el UNIQUE) | migración 0002 junto con S2 |
+| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | migración 0002 / S6 |
+| S1 CR-2 | nit | Derivar la lista de valores del CHECK de `event_type` de `EventType` en vez de repetirla | próxima migración |
+| S1 CR-1 | nit | Migración: nombres de PK/UQ/FK explícitos vs. CHECK en forma base (inconsistencia sin impacto) | — |

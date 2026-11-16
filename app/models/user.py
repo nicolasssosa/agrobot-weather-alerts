@@ -1,7 +1,26 @@
-"""Modelo `User` (tabla `users`).
+"""Modelo `User` (tabla `users`). Ver docs/DATA_MODEL.md §users."""
 
-TODO(S1): implementar EXACTAMENTE según docs/DATA_MODEL.md §users
-(columnas, tipos, nullability, CHECKs, UNIQUEs, índices, FKs con ondelete).
-Usar SQLAlchemy 2.0 tipado: `Mapped[...]` + `mapped_column(...)`, heredar de
-`Base` (y `TimestampMixin` si la tabla tiene created_at/updated_at).
-"""
+from typing import TYPE_CHECKING
+
+from sqlalchemy import BigInteger, Identity, String
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from app.models.base import Base, TimestampMixin
+
+if TYPE_CHECKING:
+    from app.models.field import Field
+
+
+class User(Base, TimestampMixin):
+    """Usuario de Agrobot, identificado por su teléfono de WhatsApp (E.164)."""
+
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    phone_number: Mapped[str] = mapped_column(String(20), unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+
+    fields: Mapped[list["Field"]] = relationship(
+        back_populates="user",
+        lazy="raise",
+    )

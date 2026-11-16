@@ -4,13 +4,14 @@
 - Una vez por sesión: `alembic downgrade base` + `alembic upgrade head` (valida migraciones).
 - Cada test corre dentro de una transacción que se revierte al final; los `commit()`
   de services/jobs se convierten en SAVEPOINTs (`join_transaction_mode="create_savepoint"`).
-
-TODO(S1): agregar acá las factories descritas en docs/TESTING.md §Factories
-(`make_user`, `make_field`, `make_forecast`, `make_alert`) una vez existan los modelos.
+- Factories (docs/TESTING.md §Factories): valores por defecto únicos por contador.
 """
 
+import itertools
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from pathlib import Path
 
 import pytest
@@ -22,6 +23,8 @@ from sqlalchemy.pool import NullPool
 
 from app.core.db import get_session
 from app.main import create_app
+from app.models import Alert, Field, User, WeatherForecast
+from app.models.enums import EventType
 from app.notifiers.base import NotificationMessage, NotifierError
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -86,3 +89,101 @@ class FakeNotifier:
 @pytest.fixture
 def fake_notifier() -> FakeNotifier:
     return FakeNotifier()
+
+
+# --- Factories (docs/TESTING.md §Factories) ---------------------------------
+
+_seq = itertools.count(1)
+
+MakeUser = Callable[..., Awaitable[User]]
+MakeField = Callable[..., Awaitable[Field]]
+MakeForecast = Callable[..., Awaitable[WeatherForecast]]
+MakeAlert = Callable[..., Awaitable[Alert]]
+
+
+def auth(user: User) -> dict[str, str]:
+    """Headers de la autenticación simulada de la API (header `X-User-Id`)."""
+    return {"X-User-Id": str(user.id)}
+
+
+@pytest.fixture
+def make_user(db_session: AsyncSession) -> MakeUser:
+    async def _make(*, phone_number: str | None = None, name: str | None = None) -> User:
+        n = next(_seq)
+        user = User(phone_number=phone_number or f"+54911{n:08d}", name=name or f"User {n}")
+        db_session.add(user)
+        await db_session.flush()
+        return user
+
+    return _make
+
+
+@pytest.fixture
+def make_field(db_session: AsyncSession, make_user: MakeUser) -> MakeField:
+    async def _make(
+        user: User | None = None,
+        *,
+        name: str | None = None,
+        latitude: Decimal = Decimal("-34.6"),
+        longitude: Decimal = Decimal("-58.4"),
+    ) -> Field:
+        n = next(_seq)
+        owner = user if user is not None else await make_user()
+        field = Field(
+            user_id=owner.id,
+            name=name or f"Field {n}",
+            latitude=latitude,
+            longitude=longitude,
+        )
+        db_session.add(field)
+        await db_session.flush()
+        return field
+
+    return _make
+
+
+@pytest.fixture
+def make_forecast(db_session: AsyncSession) -> MakeForecast:
+    async def _make(
+        field: Field,
+        *,
+        forecast_date: date,
+        event_type: EventType,
+        probability: int,
+        source: str = "mock",
+    ) -> WeatherForecast:
+        forecast = WeatherForecast(
+            field_id=field.id,
+            forecast_date=forecast_date,
+            event_type=event_type,
+            probability=probability,
+            source=source,
+            fetched_at=datetime.now(UTC),
+        )
+        db_session.add(forecast)
+        await db_session.flush()
+        return forecast
+
+    return _make
+
+
+@pytest.fixture
+def make_alert(db_session: AsyncSession) -> MakeAlert:
+    async def _make(
+        field: Field,
+        *,
+        event_type: EventType = EventType.FROST,
+        threshold: int = 70,
+        is_active: bool = True,
+    ) -> Alert:
+        alert = Alert(
+            field_id=field.id,
+            event_type=event_type,
+            threshold=threshold,
+            is_active=is_active,
+        )
+        db_session.add(alert)
+        await db_session.flush()
+        return alert
+
+    return _make
