@@ -87,7 +87,41 @@ Archivos: `app/main.py` (solo metadata OpenAPI: descripción y `openapi_tags`), 
 - [ ] Test de contrato: `app.openapi()` == `docs/openapi.json`; si difieren, falla con el mensaje "corré `make openapi`". Tests de que cada endpoint protegido declara 401 y el security scheme, y que los ejemplos validan contra sus propios schemas.
 - [ ] Ningún cambio de comportamiento: toda la suite existente sigue verde sin modificarse.
 
-## S9 — CI (GitHub Actions) + hardening de operación · RNF-07
+# Fase 2 — Mejoras de producción
+
+Decisiones D1, D2, D5, D9 (revisadas) y D11–D16 en `REQUIREMENTS.md` §6. Cada historia detalla
+su contrato en `DATA_MODEL.md` / `API.md` / `JOBS.md` antes de arrancar.
+
+## S9 — Alertas: borrado lógico, varios umbrales y validación al enviar · D5, D11, D12
+Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.py`,
+`app/services/alerts.py`, `app/api/routers/alerts.py`, `app/jobs/{evaluator,dispatcher}.py`,
+`docs/openapi.json`, tests.
+- [ ] `alerts.deleted_at`; DELETE lógico e idempotente (204 también si ya estaba borrada; 404 si no existe o es ajena); las alertas borradas no aparecen en GET ni se evalúan.
+- [ ] Al borrar, las notificaciones `pending` de esa alerta pasan a `cancelled` (motivo `alert_deleted`); el historial (`sent`/`failed`/`cancelled`) sigue visible en `GET /notifications`.
+- [ ] Unicidad `(field_id, event_type, threshold)` solo entre alertas no borradas → 409; se puede recrear una alerta borrada.
+- [ ] Estado `cancelled` en notificaciones. El dispatcher, en el claim, cancela (sin enviar) las que ya no corresponden: alerta borrada, inactiva o probabilidad < umbral actual.
+- [ ] OpenAPI regenerado y contrato actualizado.
+
+## S10 — Idempotency-Key en los POST · D13
+- [ ] Header opcional `Idempotency-Key` en `POST /users`, `/fields`, `/alerts`: replay de la respuesta original, 422 si el body cambió, vigencia 24 h, seguro ante requests concurrentes con la misma clave. Documentado en OpenAPI.
+
+## S11 — Calidad de pronósticos · D14
+- [ ] `weather_forecasts.issued_at`; upsert condicional (solo datos más nuevos); evaluador ignora pronósticos desactualizados y loguea un warning con la cantidad; `issued_at` visible en `GET /forecasts`.
+
+## S12 — Evaluador v2: zona horaria, horizonte y re-aviso por episodio · D1, D2, D9
+- [ ] `fields.timezone` (IANA, validada); "hoy" local por campo; horizonte configurable.
+- [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa. Sigue siendo set-based en SQL; la regla de transición se documenta y se testea también como función pura de referencia (tests de equivalencia).
+
+## S13 — Envío agrupado por usuario + horario de silencio · D15
+- [ ] Un mensaje por usuario y ciclo con todas sus notificaciones; cada notificación conserva su estado individual. Horario de silencio configurable: se difiere el envío hasta que termine.
+
+## S14 — Operación · D16
+- [ ] Advisory lock del evaluador (una réplica evalúa por vez); `statement_timeout`/`lock_timeout`; cuotas por usuario; notificaciones `failed` reintentables; job de retención (pronósticos pasados, claves de idempotencia vencidas); límite de tamaño de request y de cantidad de errores en el 422 (follow-ups S4).
+
+## S15 — Observabilidad
+- [ ] Logs JSON estructurados con `request_id`; métricas Prometheus (`/metrics`); `GET /health/live` y `/health/ready` (DB + heartbeat del worker).
+
+## S16 — CI (GitHub Actions) + pre-commit + cobertura · RNF-07
 Archivos: `.github/workflows/ci.yml`.
 - [ ] Trigger en `pull_request` y `push` a `main`.
 - [ ] Job con service `postgres:16-alpine` (crea `agrobot_test`), `astral-sh/setup-uv`, `uv sync --frozen`, `ruff check`, `ruff format --check`, `mypy app`, `pytest`.
@@ -97,7 +131,7 @@ Archivos: `.github/workflows/ci.yml`.
 - [ ] Follow-up S7 SEC-3: `worker --once` le pasa `stop_event` a `run_cycle` (+ test).
 - [ ] Follow-up S7 SEC-5: declarar `ENVIRONMENT` explícito en el `app-env` del compose y que el seed exija `ENVIRONMENT` definida (o flag `--yes-demo`).
 
-## S10 — README final y cierre · Owner: PM
+## S17 — README final, `make demo`, Postman y review integral · Owner: PM
 - [ ] README: cómo correr (compose y local), arquitectura, decisiones (de `REQUIREMENTS.md` §6), trade-offs, qué faltó / próximos pasos.
 - [ ] Verificación end-to-end con `docker compose up --build`.
 
@@ -121,7 +155,7 @@ Archivos: `.github/workflows/ci.yml`.
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
 | S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
 | S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |
-| S7 SEC-3 | minor | `worker --once` no le pasa `stop_event` a `run_cycle`: un SIGTERM espera a drenar toda la cola (riesgo de SIGKILL y reenvío al vencer el lease). Fix de una línea + test | **S9** |
+| S7 SEC-3 | minor | `worker --once` no le pasa `stop_event` a `run_cycle`: un SIGTERM espera a drenar toda la cola (riesgo de SIGKILL y reenvío al vencer el lease). Fix de una línea + test | **S16** |
 | S7 SEC-4 | minor | El seed reutiliza un usuario existente con el teléfono demo (aunque sea real) y le agrega datos mock. Fix: abortar si el nombre no coincide o usar un rango de teléfonos no asignable | README §Limitaciones |
-| S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S9** |
+| S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S16** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |

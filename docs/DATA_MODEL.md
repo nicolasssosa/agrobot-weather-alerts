@@ -50,7 +50,7 @@ Motivo: agregar un tipo de evento nuevo es una migración trivial (recrear el CH
 
 Valores:
 - `event_type`: `frost`, `rain`, `hail`, `strong_wind`, `heat_wave`
-- `notification_status`: `pending`, `sent`, `failed`
+- `notification_status`: `pending`, `sent`, `failed`, `cancelled` (S9: ya no correspondía enviarla)
 
 ---
 
@@ -126,8 +126,11 @@ Configuración del usuario: "avisame cuando la probabilidad de `event_type` en `
 | updated_at | TIMESTAMPTZ | no   |         |                                                          |
 
 Constraints / índices:
-- `UNIQUE (field_id, event_type)` → una alerta por evento por campo; para cambiar el umbral se usa PATCH.
-- Índice parcial `ix_alerts_active_field_event` en `(field_id, event_type) WHERE is_active`
+- `deleted_at TIMESTAMPTZ NULL` (S9, migración 0003): borrado lógico. Una alerta borrada no se lista, no se evalúa y no se puede modificar; su historial de notificaciones se conserva.
+- ~~`UNIQUE (field_id, event_type)`~~ (Fase 1) → reemplazado en 0003 por el **índice único parcial**
+  `uq_alerts_field_event_threshold_alive` en `(field_id, event_type, threshold) WHERE deleted_at IS NULL`:
+  varias alertas por evento con umbrales distintos; una borrada se puede recrear.
+- Índice parcial `ix_alerts_active_field_event` en `(field_id, event_type) WHERE is_active AND deleted_at IS NULL` (0003)
   (lo usa el evaluador). En el modelo:
   `Index("ix_alerts_active_field_event", "field_id", "event_type", postgresql_where=text("is_active"))`.
 
@@ -163,6 +166,17 @@ Constraints / índices:
 - Índice `ix_notifications_alert_id_created_at` en `(alert_id, created_at)` (listado por usuario).
   El UNIQUE `(alert_id, forecast_date)` ya cubre búsquedas por `alert_id`, así que este es opcional;
   incluirlo.
+
+## Migración 0003 — alertas: borrado lógico y varios umbrales (S9)
+
+- `revision = "0003"`, `down_revision = "0002"`.
+- `alerts.deleted_at` (TIMESTAMPTZ NULL).
+- Drop `uq_alerts_field_id_event_type`; create unique index `uq_alerts_field_event_threshold_alive`
+  `(field_id, event_type, threshold) WHERE deleted_at IS NULL`.
+- Recrear `ix_alerts_active_field_event` con predicado `is_active AND deleted_at IS NULL`.
+- Recrear los CHECK de `notifications.status` con el valor nuevo `cancelled`.
+- `downgrade()`: revierte todo; si hay alertas duplicadas vivas por (campo, evento) o notificaciones
+  `cancelled`, el downgrade falla con un mensaje claro (no borra datos en silencio).
 
 ## Migración 0002 — hardening (S2)
 

@@ -87,7 +87,7 @@ Respuesta **201** `AlertRead`:
  "created_at": "...", "updated_at": "..."}
 ```
 - 404 `Field not found` si el campo no es del usuario.
-- 409 si ya hay una alerta para (campo, evento).
+- 409 `An alert with this field, event type and threshold already exists` si ya hay una alerta **no borrada** con el mismo (campo, evento, umbral). Se permiten varias alertas del mismo evento con umbrales distintos (ej. 50 "atención" y 80 "crítico").
 
 ### `GET /api/v1/alerts` → 200 `Page[AlertRead]`
 Filtros opcionales: `field_id`, `event_type`, `is_active`.
@@ -103,6 +103,11 @@ con un `model_validator`):
 `field_id` y `event_type` no son editables (crear otra alerta). 200 `AlertRead` | 404.
 
 ### `DELETE /api/v1/alerts/{alert_id}` → 204 sin body | 404
+**Borrado lógico e idempotente:** marca `deleted_at`; repetir el DELETE sobre una alerta propia ya
+borrada también devuelve 204. 404 solo si no existe o es de otro usuario. Las notificaciones
+`pending` de la alerta pasan a `cancelled`; el historial sigue visible en `GET /notifications`.
+Una alerta borrada responde 404 en `GET`/`PATCH /alerts/{id}` y no aparece en `GET /alerts`.
+PATCH que deje dos alertas vivas con el mismo (campo, evento, umbral) → 409.
 
 ## notifications
 

@@ -30,7 +30,7 @@ FROM alerts a
 JOIN weather_forecasts wf
   ON wf.field_id = a.field_id
  AND wf.event_type = a.event_type
-WHERE a.is_active            -- literal así (no `IS true`): habilita el índice parcial ix_alerts_active_field_event
+WHERE a.is_active AND a.deleted_at IS NULL   -- predicado igual al del índice parcial ix_alerts_active_field_event (S9)
   AND wf.forecast_date >= :today                      -- todos los días futuros (incluye hoy)
   AND wf.probability   >= a.threshold                 -- "a partir de" => >=
 ON CONFLICT (alert_id, forecast_date) DO NOTHING
@@ -72,7 +72,12 @@ autovacuum de toda la base y bloqueaba DELETEs de la API.)
 
 Algoritmo, en **dos transacciones cortas** con el envío en el medio:
 
-1. **Claim + lease** (transacción 1, milisegundos): en una sesión nueva del `sessionmaker`
+1. **Claim + lease + validación** (transacción 1, milisegundos). Además del lease, el claim
+   **re-verifica contra la alerta actual** (S9, D12): si la alerta está borrada (`deleted_at`),
+   inactiva, o `n.probability < a.threshold` (umbral vigente), la notificación pasa a
+   `status='cancelled'`, `last_error` = `alert_deleted` | `alert_inactive` | `below_current_threshold`
+   en la misma transacción y **no se envía**. Contarlas en `DispatchResult.cancelled`.
+   En una sesión nueva del `sessionmaker`
    ```sql
    SELECT n.id, n.forecast_date, n.event_type, n.probability, n.threshold, n.attempts,
           u.phone_number, f.name AS field_name

@@ -63,16 +63,22 @@ una notificación cuando los pronósticos almacenados superen ese umbral.
 
 | # | Tema | Decisión | Alternativa descartada / futura |
 |---|------|----------|---------------------------------|
-| D1 | Re-notificación | Una vez por (alerta, día). | Re-notificar si la probabilidad sube ≥ N puntos o si cambia el umbral. |
-| D2 | Horizonte de evaluación | **Sin horizonte**: todos los días ≥ hoy (el enunciado no lo define). | Horizonte global o por alerta (`lookahead_days`). |
+| D1 | Re-notificación | **Por episodio** (S12): se avisa cada vez que el pronóstico de una alerta y día **cruza el umbral hacia arriba**; mientras siga arriba no se repite. Margen anti-oscilación configurable (`REARM_MARGIN`). Cambiar el umbral re-evalúa la alerta desde cero. *(Fase 1: una vez por alerta y día.)* | Re-notificar solo si sube ≥ N puntos. |
+| D2 | Horizonte de evaluación | **Configurable** `ALERT_HORIZON_DAYS` (default 7; 0 = sin límite) (S12): los pronósticos lejanos son poco confiables y generan ruido. *(Fase 1: sin horizonte.)* | Horizonte por alerta. |
 | D3 | Granularidad de pronósticos | Por campo (`weather_forecasts.field_id`). | Tabla `locations` compartida entre campos cercanos. |
 | D4 | Umbral | Entero 1..100 (%); dispara con `>=`. | — |
-| D5 | Alertas por campo | Una por (campo, evento); el umbral se cambia con PATCH. | Varias alertas por evento con distintos umbrales. |
+| D5 | Alertas por campo | **Varias por (campo, evento) con umbrales distintos** (ej. 50 = atención, 80 = crítico); única por (campo, evento, umbral) entre alertas no borradas (S9). *(Fase 1: una por campo y evento.)* | — |
 | D6 | Eventos | `frost`, `rain`, `hail`, `strong_wind`, `heat_wave` (extensibles: VARCHAR + CHECK). | — |
 | D7 | Canal | `Notifier` Protocol; implementación `LoggingNotifier`. | Adaptador WhatsApp (fuera de alcance). |
 | D8 | Auth | Header `X-User-Id` simulado. | Identidad provista por el gateway de WhatsApp. |
-| D9 | "Hoy" | Fecha UTC del worker. | Zona horaria por usuario. |
+| D9 | "Hoy" | **Fecha local del campo** según su zona IANA (`fields.timezone`, default `America/Argentina/Buenos_Aires`) (S12). *(Fase 1: UTC, que salteaba el día local entre las 21 y las 24 h en Argentina.)* | — |
 | D10 | Entrega | At-least-once (puede duplicarse solo si el proceso muere entre el envío y el commit). | Idempotency key en el proveedor. |
+| D11 | Borrado de alertas | **Lógico** (`deleted_at`): DELETE idempotente, el historial de notificaciones se conserva y las pendientes se cancelan (S9). | Borrado físico (Fase 1). |
+| D12 | Validación al enviar | El dispatcher re-verifica contra la alerta **actual** antes de enviar (activa, no borrada, probabilidad ≥ umbral vigente); si ya no corresponde, la notificación queda `cancelled` (S9). | — |
+| D13 | Reintentos de clientes | Header `Idempotency-Key` en los POST: misma clave + mismo body → misma respuesta; misma clave + otro body → 422; vigencia 24 h (S10). | — |
+| D14 | Pronósticos desactualizados | Cada pronóstico guarda `issued_at` del proveedor; un dato más viejo nunca pisa a uno más nuevo; el evaluador ignora pronósticos con más de `MAX_FORECAST_AGE_HOURS` (default 24) y lo reporta (S11). | — |
+| D15 | Envío agrupado | Un mensaje por usuario y ciclo con todas sus alertas (digest) + horario de silencio configurable (S13). | Un mensaje por notificación (Fase 1). |
+| D16 | Límites | Cuotas por usuario (campos, alertas por campo) configurables (S14). | — |
 
 ## 7. Supuestos
 
