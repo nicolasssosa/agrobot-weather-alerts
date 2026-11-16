@@ -132,7 +132,10 @@ Ej: `⚠️ Alerta de helada en "Lote Norte": 85% de probabilidad para el 18/11/
 ## Worker — `app/jobs/worker.py`
 
 ```python
-async def run_cycle(sessionmaker, notifier, settings, *, now: datetime | None = None) -> CycleResult
+async def run_cycle(
+    sessionmaker, notifier, settings, *, now: datetime | None = None,
+    clock: Callable[[], datetime] = utc_now, stop_event: asyncio.Event | None = None,
+) -> CycleResult
 ```
 1. `now = now or datetime.now(UTC)`.
 2. `async with sessionmaker() as s:` → `created = await evaluate_alerts(s, today=now.date())` → `await s.commit()`.
@@ -140,6 +143,8 @@ async def run_cycle(sessionmaker, notifier, settings, *, now: datetime | None = 
    `dispatch_pending(sessionmaker, notifier, ...)` (maneja sus propias transacciones) mientras el
    lote haya venido lleno (`sent + retried + failed == batch_size`), **con un `now` fresco
    (`datetime.now(UTC)`) en cada llamada** (S6 SEC-3). Acumular el `DispatchResult`.
+   **Si `stop_event` está seteado, no arrancar un lote nuevo** (S7 SEC-2): el shutdown no espera
+   a drenar toda la cola; lo pendiente queda para el próximo arranque.
 4. Devolver `CycleResult(created, dispatch)`.
 
 ```python
@@ -172,7 +177,8 @@ Simula el job existente. `MockWeatherProvider.fetch(field, start=, days=)` devue
 en `[start, start+days)` y **cada** `EventType`, una probabilidad determinística:
 `random.Random(f"{seed}:{field.id}:{day.isoformat()}:{event.value}").randint(0, 100)`.
 
-`ingest_forecasts(session, provider, start=, days=, source="mock") -> int`:
+`ingest_forecasts(session, provider, start=, days=, source="mock", field_ids=None) -> int`
+(`field_ids` opcional: si se pasa, solo ingesta esos campos):
 - Itera todos los `fields` ordenados por id, de a 500 (`.limit(500)` + `where id > last_id`).
 - Upsert con `postgresql.insert(...).on_conflict_do_update(index_elements=[field_id, forecast_date, event_type], set_={probability, source, fetched_at: func.now(), updated_at: func.now()})`.
 - Devuelve filas procesadas. No commitea.
@@ -186,4 +192,9 @@ Idempotente (usar upserts `ON CONFLICT DO NOTHING` / buscar antes de crear):
 - Ana: campos `Lote Norte (-34.60, -58.38)` y `Lote Sur (-34.90, -58.50)`. Bruno: `La Esperanza (-31.42, -64.18)`.
 - Alertas: Ana/Lote Norte `frost ≥ 60`, Ana/Lote Norte `rain ≥ 80`, Ana/Lote Sur `hail ≥ 50`,
   Bruno/La Esperanza `heat_wave ≥ 40`.
-- Corre la ingesta mock para 14 días. Commit. Imprime los IDs creados y un ejemplo de curl.
+- Corre la ingesta mock para 14 días **solo sobre los 3 campos del seed** (`ingest_forecasts(...,
+  field_ids=[...])`): nunca pisa pronósticos de otros campos (S7 SEC-1). Commit. Imprime los IDs
+  creados y un ejemplo de curl con la URL completa (`http://localhost:8000/api/v1/...`).
+- **Guarda de entorno:** si `Settings.environment` es `staging` o `production`, sale con error sin
+  tocar la base (S7 SEC-1).
+- No es seguro ante dos corridas concurrentes (check-then-insert): es un script de demo one-shot.

@@ -167,6 +167,59 @@ async def test_ingest_paginates_fields_by_id(
     assert len(provider.fetched_field_ids) == len(set(provider.fetched_field_ids))
 
 
+async def test_ingest_with_field_ids_only_touches_the_requested_fields(
+    db_session: AsyncSession, make_field: MakeField, make_forecast: MakeForecast
+) -> None:
+    """Con `field_ids`, solo se ingesta ese campo y los demás quedan intactos (S7 SEC-1)."""
+    wanted = await make_field()
+    other = await make_field()
+    existing = await make_forecast(
+        other,
+        forecast_date=START,
+        event_type=EventType.RAIN,
+        probability=7,
+        source="manual",
+    )
+
+    processed = await ingest_forecasts(
+        db_session,
+        MockWeatherProvider(),
+        start=START,
+        days=2,
+        field_ids=[wanted.id],
+    )
+
+    assert processed == 2 * len(EventType)
+    assert len(await _rows(db_session, wanted.id)) == 2 * len(EventType)
+    await db_session.refresh(existing)
+    assert existing.probability == 7
+    assert existing.source == "manual"
+    # El campo ajeno conserva únicamente su fila preexistente: la ingesta no lo tocó.
+    assert len(await _rows(db_session, other.id)) == 1
+
+
+async def test_ingest_with_field_ids_keeps_the_keyset_pagination(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La paginación keyset sigue funcionando restringida a los `field_ids` pedidos."""
+    monkeypatch.setattr(ingestion_module, "_BATCH_SIZE", 2)
+    fields = [await make_field() for _ in range(5)]
+    wanted_ids = [fields[0].id, fields[2].id, fields[4].id]
+    provider = _RecordingProvider()
+
+    processed = await ingest_forecasts(
+        db_session, provider, start=START, days=1, field_ids=wanted_ids
+    )
+
+    assert processed == len(wanted_ids) * len(EventType)
+    assert provider.fetched_field_ids == wanted_ids
+    for field in fields:
+        expected = len(EventType) if field.id in wanted_ids else 0
+        assert len(await _rows(db_session, field.id)) == expected
+
+
 async def test_ingest_leaves_forecasts_outside_the_requested_range_untouched(
     db_session: AsyncSession, make_field: MakeField, make_forecast: MakeForecast
 ) -> None:

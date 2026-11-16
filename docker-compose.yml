@@ -42,6 +42,7 @@ services:
     build: .
     command: ["python", "-m", "app.jobs.worker"]
     environment: *app-env
+    stop_grace_period: 120s
     depends_on:
       migrate:
         condition: service_completed_successfully
