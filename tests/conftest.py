@@ -18,7 +18,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from app.core.db import get_session
@@ -57,6 +57,19 @@ async def db_session() -> AsyncIterator[AsyncSession]:
             await session.close()
             await outer.rollback()
     await engine.dispose()
+
+
+@pytest.fixture
+def test_sessionmaker(db_session: AsyncSession) -> async_sessionmaker[AsyncSession]:
+    """Sesiones propias para los jobs: sus `commit()` son SAVEPOINTs del test.
+
+    El rollback final de la transacción del test sigue limpiando todo.
+    """
+    return async_sessionmaker(
+        bind=db_session.bind,
+        expire_on_commit=False,
+        join_transaction_mode="create_savepoint",
+    )
 
 
 @pytest.fixture

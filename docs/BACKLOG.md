@@ -58,10 +58,10 @@ Archivos: `app/jobs/evaluator.py`, `tests/jobs/test_evaluator.py`.
 - [ ] Un único `INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING` (nada de loops en Python).
 - [ ] Todos los casos de `TESTING.md` §test_evaluator (borde `==`, inactiva, pasado, hoy, futuro lejano, otro evento/campo, idempotencia).
 
-## S6 — Dispatcher, Notifier y API de notificaciones · RF-07, RF-09, RF-10, RNF-03, RNF-04, D7, D10
+## S6 — Dispatcher, Notifier y API de notificaciones · RF-07, RF-09, RF-10, RNF-03, RNF-04, D7, D10 · ✅
 Archivos: `app/jobs/dispatcher.py`, `app/notifiers/log.py`, `app/schemas/notification.py`,
 `app/services/notifications.py`, `app/api/routers/notifications.py`, `tests/jobs/test_dispatcher.py`, `tests/api/test_notifications.py`.
-- [ ] `FOR UPDATE OF notifications SKIP LOCKED`, lote limitado, timeout por envío.
+- [ ] Patrón lease (JOBS.md §Dispatcher): claim corto con `FOR UPDATE OF notifications SKIP LOCKED` + lease vía `next_attempt_at`, envío fuera de transacción con concurrencia acotada, resultados en otra transacción corta. Timeout por envío.
 - [ ] Éxito/reintento/backoff/`failed` exactamente como `JOBS.md`.
 - [ ] Texto del mensaje exacto. Teléfono enmascarado en el log.
 - [ ] `GET /notifications` con ownership y filtros.
@@ -92,7 +92,7 @@ Archivos: `.github/workflows/ci.yml`.
 | Origen | Severidad | Descripción | Destino sugerido |
 |--------|-----------|-------------|------------------|
 | S1 SEC-2 | minor | CHECK E.164 en `users.phone_number` en la DB (hoy solo lo valida Pydantic; variantes del número esquivan el UNIQUE) | ✅ resuelto en S2 (migración 0002) |
-| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | ✅ CHECK en S2 (0002); enmascarado de PII pendiente en S6 |
+| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | ✅ CHECK en S2 (0002); enmascarado de PII en S6 (`app/core/pii.py`) |
 | S1 CR-2 | nit | Derivar la lista de valores del CHECK de `event_type` de `EventType` en vez de repetirla | próxima migración |
 | S1 CR-1 | nit | Migración: nombres de PK/UQ/FK explícitos vs. CHECK en forma base (inconsistencia sin impacto) | — |
 | S2 SEC-4 | minor | Surrogate UTF-16 suelto en un string → el 422 de FastAPI no serializa → 500. Fix: handler global de `RequestValidationError` que sanee `input` (cubre también NaN/surrogates en schemas futuros) | ✅ resuelto en S4 |
@@ -104,3 +104,4 @@ Archivos: `.github/workflows/ci.yml`.
 | S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | README §Próximos pasos |
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
 | S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
+| S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |

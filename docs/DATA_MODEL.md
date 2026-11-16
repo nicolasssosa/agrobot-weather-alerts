@@ -150,7 +150,7 @@ Guarda un **snapshot** de los valores que dispararon la alerta (el forecast pued
 | status          | VARCHAR(16) | no   | 'pending' | CHECK enum `notification_status`                          |
 | attempts        | SMALLINT    | no   | 0         | CHECK `attempts >= 0` (name=`attempts_non_negative`)      |
 | last_error      | TEXT        | sí   |           | último error del notifier; CHECK `last_error IS NULL OR char_length(last_error) <= 1000` (name=`last_error_length`, migración `0002`) |
-| next_attempt_at | TIMESTAMPTZ | no   | now()     | no se reintenta antes de esta fecha (backoff)             |
+| next_attempt_at | TIMESTAMPTZ | no   | now()     | doble uso, sin columnas extra: (1) **backoff**: no se reintenta antes de esta fecha; (2) **lease** del dispatcher: al reclamar se corre a `now + lease` (nadie más la toma) y su valor exacto es el **token de propiedad** para registrar el resultado. Ver JOBS.md §Dispatcher |
 | sent_at         | TIMESTAMPTZ | sí   |           | seteado cuando status = sent                              |
 | created_at      | TIMESTAMPTZ | no   |           |                                                           |
 | updated_at      | TIMESTAMPTZ | no   |           |                                                           |
