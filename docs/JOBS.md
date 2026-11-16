@@ -56,20 +56,26 @@ Reglas de negocio (cubiertas por tests):
 
 `today` lo calcula el worker como `datetime.now(UTC).date()` y se inyecta (testeable).
 
-## Dispatcher — `app/jobs/dispatcher.py`
+## Dispatcher — `app/jobs/dispatcher.py` (patrón lease)
 
 ```python
 async def dispatch_pending(
-    session, notifier, *, now: datetime, batch_size: int, max_attempts: int,
-    backoff_base_seconds: int, timeout_seconds: float,
+    sessionmaker: async_sessionmaker[AsyncSession], notifier: Notifier, *, now: datetime,
+    batch_size: int, max_attempts: int, backoff_base_seconds: int, timeout_seconds: float,
+    concurrency: int, lease_seconds: int,
 ) -> DispatchResult
 ```
 
-Algoritmo:
+**Regla de oro: nunca se espera a la red con una transacción abierta.** (S6 CR-1/SEC-2: con el
+envío dentro de la transacción del claim, un proveedor colgado dejaba ~17 min de locks, frenaba el
+autovacuum de toda la base y bloqueaba DELETEs de la API.)
 
-1. Reclamar un lote (lockeando **solo** filas de `notifications`):
+Algoritmo, en **dos transacciones cortas** con el envío en el medio:
+
+1. **Claim + lease** (transacción 1, milisegundos): en una sesión nueva del `sessionmaker`
    ```sql
-   SELECT n.*, u.phone_number, f.name AS field_name
+   SELECT n.id, n.forecast_date, n.event_type, n.probability, n.threshold, n.attempts,
+          u.phone_number, f.name AS field_name
    FROM notifications n
    JOIN alerts a ON a.id = n.alert_id
    JOIN fields f ON f.id = a.field_id
@@ -79,23 +85,38 @@ Algoritmo:
    LIMIT :batch_size
    FOR UPDATE OF n SKIP LOCKED
    ```
-   En SQLAlchemy: `.with_for_update(of=Notification, skip_locked=True)`.
-   `SKIP LOCKED` ⇒ dos workers nunca envían la misma notificación.
-2. Para cada fila:
-   - `text = build_message_text(...)`; `msg = NotificationMessage(n.id, phone_number, text)`.
-   - `await asyncio.wait_for(notifier.send(msg), timeout=timeout_seconds)`.
-   - **Éxito:** `status='sent'`, `sent_at=now`, `attempts += 1`, `last_error=None`.
-   - **Excepción** (cualquiera, incluido `TimeoutError`; nunca dejar que corte el lote):
-     `attempts += 1`, `last_error = f"{type(e).__name__}: {e}"[:1000]`.
-     - si `attempts >= max_attempts` → `status='failed'` (contar como `failed`).
-     - si no → `next_attempt_at = now + timedelta(seconds=backoff_base_seconds * 2 ** (attempts - 1))`
-       (contar como `retried`). Ej. base 30: 30s, 60s, 120s, 240s…
-3. `await session.flush()`; **no commitea** (el worker commitea el lote → libera locks).
-4. Loguear `dispatch_done sent=.. retried=.. failed=..`.
+   y en la misma transacción `UPDATE notifications SET next_attempt_at = :lease_until
+   WHERE id IN (...)` con `lease_until = now + lease_seconds` → **commit** (libera los locks).
+   **`now` debe ser la hora real del momento del claim** (S6 SEC-3): nunca reutilizar un `now` viejo
+   entre lotes, o el lease nace vencido y otra réplica reenvía. `lease_until` funciona además como
+   **token de propiedad** del lote. Las filas quedan `pending` pero "arrendadas":
+   ningún otro worker las ve hasta que venza el lease. No requiere columnas nuevas.
+   Se copian los datos a objetos planos (dataclass) antes de cerrar la sesión.
+2. **Envío fuera de toda transacción**, en paralelo acotado (`asyncio.Semaphore(concurrency)` +
+   `asyncio.gather`): `await asyncio.wait_for(notifier.send(msg), timeout=timeout_seconds)`.
+   Cada envío produce un resultado (ok / error); una excepción (`Exception`, incluido
+   `TimeoutError`) nunca corta el lote. `asyncio.CancelledError` se propaga (shutdown): las filas
+   arrendadas se reintentan solas cuando vence el lease.
+3. **Resultados** (transacción 2, milisegundos): en una sesión nueva, por cada notificación
+   `UPDATE … WHERE id = :id AND status = 'pending' AND next_attempt_at = :lease_until` (solo el dueño
+   del lease escribe: si el lease venció y otro worker la reclamó, o si la alerta se borró, afecta 0
+   filas y se ignora; así nunca se cuenta dos veces un intento). `now` para `sent_at` y el backoff
+   es la hora real al momento de registrar:
+   - **Éxito:** `status='sent'`, `sent_at=now`, `attempts = attempts + 1`, `last_error=NULL`.
+   - **Error:** `attempts = attempts + 1`, `last_error` = `f"{type(e).__name__}: {e}"` con el
+     teléfono enmascarado (todas sus variantes) y truncado a 1000.
+     - si `attempts + 1 >= max_attempts` → `status='failed'`;
+     - si no → `next_attempt_at = now + backoff_base_seconds * 2 ** attempts` (con `attempts` previo
+       al incremento: 30 s, 60 s, 120 s…).
+   → **commit**.
+4. Loguear `dispatch_done sent=.. retried=.. failed=.. duration_ms=..`.
 
-Semántica de entrega: **at-least-once**. Si el proceso muere después de enviar y antes del commit,
-la notificación se reenvía en el próximo ciclo. Aceptable para un aviso climático; mitigable en
-producción con una idempotency key (`notification_id`) en el proveedor de WhatsApp.
+`lease_seconds` debe ser mayor que el peor caso de envío del lote
+(`ceil(batch_size / concurrency) * timeout_seconds`); se valida en Settings.
+
+Semántica de entrega: **at-least-once**. Si el proceso muere después de enviar y antes de la
+transacción 2, la notificación se reenvía cuando vence el lease. Mitigable en producción con una
+idempotency key (`notification_id`, ya incluida en `NotificationMessage`) en el proveedor.
 
 ### Texto del mensaje
 
@@ -115,9 +136,10 @@ async def run_cycle(sessionmaker, notifier, settings, *, now: datetime | None = 
 ```
 1. `now = now or datetime.now(UTC)`.
 2. `async with sessionmaker() as s:` → `created = await evaluate_alerts(s, today=now.date())` → `await s.commit()`.
-3. Despachar en lotes hasta vaciar la cola vencida: repetir en sesión nueva
-   `dispatch_pending(... batch_size=settings.dispatch_batch_size ...)` + `commit()` mientras el lote
-   haya venido lleno (`sent + retried + failed == batch_size`). Acumular el `DispatchResult`.
+3. Despachar en lotes hasta vaciar la cola vencida: llamar
+   `dispatch_pending(sessionmaker, notifier, ...)` (maneja sus propias transacciones) mientras el
+   lote haya venido lleno (`sent + retried + failed == batch_size`), **con un `now` fresco
+   (`datetime.now(UTC)`) en cada llamada** (S6 SEC-3). Acumular el `DispatchResult`.
 4. Devolver `CycleResult(created, dispatch)`.
 
 ```python
