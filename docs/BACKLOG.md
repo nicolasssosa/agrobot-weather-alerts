@@ -74,14 +74,30 @@ Archivos: `app/jobs/worker.py`, `app/scripts/seed.py`, `tests/jobs/test_worker.p
 - [ ] Seed idempotente según `JOBS.md` §Seed.
 - [ ] Prueba manual documentada en el PR: `make db-up migrate seed jobs-once` → notificaciones `sent`.
 
-## S8 — CI (GitHub Actions) · RNF-07
+## S8 — OpenAPI / Swagger como contrato · RNF-07
+Archivos: `app/main.py` (solo metadata OpenAPI: descripción y `openapi_tags`), `app/api/deps.py`
+(esquema de seguridad), `app/schemas/*.py` (ejemplos + `ErrorResponse` en `common.py`),
+`app/api/routers/*.py` (`responses=` y summaries), `app/scripts/export_openapi.py` (nuevo),
+`docs/openapi.json` (generado), `Makefile` (target `openapi`), `tests/test_openapi_contract.py` (nuevo).
+- [ ] Schema común `ErrorResponse {detail: str}`; cada endpoint declara en `responses=` los códigos que realmente devuelve (401 sin/mal header, 404 por ownership/inexistente, 409 por duplicado, 422 validación) según `API.md`.
+- [ ] `X-User-Id` como esquema de seguridad `apiKey` en header (`APIKeyHeader(name="X-User-Id", auto_error=False)`): botón **Authorize** en `/docs`; el comportamiento no cambia (401 con el mismo mensaje). Endpoints públicos (`POST /users`, `/health`) sin seguridad.
+- [ ] Ejemplos válidos en todos los requests y responses (`json_schema_extra` / `Field(examples=...)`): "Try it out" funciona sin editar el body.
+- [ ] Descripción de la API (cómo autenticarse, flujo típico: crear usuario → campo → alerta → ver notificaciones) y descripción por tag.
+- [ ] `python -m app.scripts.export_openapi` / `make openapi` escribe `docs/openapi.json` (JSON ordenado, determinista).
+- [ ] Test de contrato: `app.openapi()` == `docs/openapi.json`; si difieren, falla con el mensaje "corré `make openapi`". Tests de que cada endpoint protegido declara 401 y el security scheme, y que los ejemplos validan contra sus propios schemas.
+- [ ] Ningún cambio de comportamiento: toda la suite existente sigue verde sin modificarse.
+
+## S9 — CI (GitHub Actions) + hardening de operación · RNF-07
 Archivos: `.github/workflows/ci.yml`.
 - [ ] Trigger en `pull_request` y `push` a `main`.
 - [ ] Job con service `postgres:16-alpine` (crea `agrobot_test`), `astral-sh/setup-uv`, `uv sync --frozen`, `ruff check`, `ruff format --check`, `mypy app`, `pytest`.
 - [ ] Job `docker build` (sin push) para validar el Dockerfile.
 - [ ] Permisos mínimos (`permissions: contents: read`), acciones pinneadas por versión mayor, cache de uv.
+- [ ] Job que verifica el contrato OpenAPI (corre el test de contrato de S8).
+- [ ] Follow-up S7 SEC-3: `worker --once` le pasa `stop_event` a `run_cycle` (+ test).
+- [ ] Follow-up S7 SEC-5: declarar `ENVIRONMENT` explícito en el `app-env` del compose y que el seed exija `ENVIRONMENT` definida (o flag `--yes-demo`).
 
-## S9 — README final y cierre · Owner: PM
+## S10 — README final y cierre · Owner: PM
 - [ ] README: cómo correr (compose y local), arquitectura, decisiones (de `REQUIREMENTS.md` §6), trade-offs, qué faltó / próximos pasos.
 - [ ] Verificación end-to-end con `docker compose up --build`.
 
@@ -105,7 +121,7 @@ Archivos: `.github/workflows/ci.yml`.
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
 | S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
 | S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |
-| S7 SEC-3 | minor | `worker --once` no le pasa `stop_event` a `run_cycle`: un SIGTERM espera a drenar toda la cola (riesgo de SIGKILL y reenvío al vencer el lease). Fix de una línea + test | S8/S9 |
+| S7 SEC-3 | minor | `worker --once` no le pasa `stop_event` a `run_cycle`: un SIGTERM espera a drenar toda la cola (riesgo de SIGKILL y reenvío al vencer el lease). Fix de una línea + test | **S9** |
 | S7 SEC-4 | minor | El seed reutiliza un usuario existente con el teléfono demo (aunque sea real) y le agrega datos mock. Fix: abortar si el nombre no coincide o usar un rango de teléfonos no asignable | README §Limitaciones |
-| S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | S8/S9 |
+| S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S9** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
