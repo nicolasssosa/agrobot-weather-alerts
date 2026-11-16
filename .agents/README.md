@@ -9,8 +9,8 @@ El orquestador (T3 Code) lee el archivo del rol y lanza el agente con esos pará
 | Rol | Archivo | Proveedor / modelo | Effort | Escribe | Salida |
 |-----|---------|--------------------|--------|---------|--------|
 | PM / Orquestador | [pm.md](pm.md) | claudeAgent / `claude-opus-5-5` | default | `docs/`, `.agents/`, `README.md`, git/PRs | backlog, PRs, merge |
-| Coder | [coder.md](coder.md) | opencode / `opencode/deepseek-v4.1-flash-free` | `high` | archivos de la historia | `CODER_REPORT` |
-| QA | [qa.md](qa.md) | opencode / `opencode/deepseek-v4.1-flash-free` | `high` | solo `tests/` | `QA_REPORT` (JSON) |
+| Coder | [coder.md](coder.md) | opencode / `opencode-go/deepseek-v4.1-flash` | `high` | archivos de la historia | `CODER_REPORT` |
+| QA | [qa.md](qa.md) | opencode / `opencode-go/deepseek-v4.1-flash` | `high` | solo `tests/` | `QA_REPORT` (JSON) |
 | Code Reviewer | [code-reviewer.md](code-reviewer.md) | opencode / `opencode/glm-5.3-flash-free` | `high` | nada (solo lectura) | `REVIEW` (JSON) |
 | Security Reviewer | [security-reviewer.md](security-reviewer.md) | claudeAgent / `claude-opus-5-5` | `medium` | nada (solo lectura) | `REVIEW` (JSON) |
 

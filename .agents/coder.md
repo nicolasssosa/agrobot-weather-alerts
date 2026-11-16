@@ -1,7 +1,9 @@
 ---
 role: coder
 provider: opencode
-model: opencode/deepseek-v4.1-flash-free
+model: opencode-go/deepseek-v4.1-flash
+# Antes: opencode/deepseek-v4.1-flash-free; cambiado al plan pago (OpenCode Go) el 2026-11-16
+# porque el tier gratuito llegó a su límite de uso durante S3.
 options: { variant: high }
 writes: ["archivos listados en docs/BACKLOG.md §{story_id}", "tests/**"]
 reads:
