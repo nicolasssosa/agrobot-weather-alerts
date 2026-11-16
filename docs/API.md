@@ -107,12 +107,19 @@ con un `model_validator`):
 borrada también devuelve 204. 404 solo si no existe o es de otro usuario. Las notificaciones
 `pending` de la alerta pasan a `cancelled`; el historial sigue visible en `GET /notifications`.
 Una alerta borrada responde 404 en `GET`/`PATCH /alerts/{id}` y no aparece en `GET /alerts`.
-PATCH que deje dos alertas vivas con el mismo (campo, evento, umbral) → 409.
+PATCH que deje dos alertas vivas con el mismo (campo, evento, umbral) → 409. Un PATCH que compite
+con un DELETE de la misma alerta responde 404 (nunca modifica una alerta borrada).
+Las notificaciones que el dispatcher tiene **en vuelo** (arrendadas) no se cancelan al borrar: el
+dispatcher registra su resultado real (`sent`/`failed`), así el historial nunca dice `cancelled`
+para un mensaje que salió.
+
+**Límite:** como máximo `MAX_ALERTS_PER_FIELD` (default 10) alertas vivas por campo; la siguiente
+→ 409 `Alert limit reached for this field`.
 
 ## notifications
 
 ### `GET /api/v1/notifications` → 200 `Page[NotificationRead]`
-Filtros opcionales: `status` (`pending|sent|failed`), `alert_id`.
+Filtros opcionales: `status` (`pending|sent|failed|cancelled`), `alert_id`.
 ```json
 {"id": 10, "alert_id": 1, "forecast_date": "2026-11-18", "event_type": "frost",
  "probability": 85, "threshold": 70, "status": "sent", "attempts": 1,

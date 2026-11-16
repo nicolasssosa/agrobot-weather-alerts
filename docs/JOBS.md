@@ -80,6 +80,7 @@ Algoritmo, en **dos transacciones cortas** con el envío en el medio:
    En una sesión nueva del `sessionmaker`
    ```sql
    SELECT n.id, n.forecast_date, n.event_type, n.probability, n.threshold, n.attempts,
+          a.is_active, a.deleted_at, a.threshold AS current_threshold,   -- validación D12 (S9)
           u.phone_number, f.name AS field_name
    FROM notifications n
    JOIN alerts a ON a.id = n.alert_id
@@ -114,7 +115,7 @@ Algoritmo, en **dos transacciones cortas** con el envío en el medio:
      - si no → `next_attempt_at = now + backoff_base_seconds * 2 ** attempts` (con `attempts` previo
        al incremento: 30 s, 60 s, 120 s…).
    → **commit**.
-4. Loguear `dispatch_done sent=.. retried=.. failed=.. duration_ms=..`.
+4. Loguear `dispatch_done sent=.. retried=.. failed=.. cancelled=.. duration_ms=..`.
 
 `lease_seconds` debe ser mayor que el peor caso de envío del lote
 (`ceil(batch_size / concurrency) * timeout_seconds`); se valida en Settings.

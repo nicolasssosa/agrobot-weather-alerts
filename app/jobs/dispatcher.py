@@ -15,7 +15,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
-from sqlalchemy import Select, select, update
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.pii import mask_phone_in_text
@@ -35,11 +35,13 @@ def _utc_now() -> datetime:
 
 @dataclass(frozen=True, slots=True)
 class DispatchResult:
-    """Conteo del lote: enviadas, reintentadas y agotadas (`failed`)."""
+    """Conteo del lote: enviadas, reintentadas, agotadas (`failed`) y canceladas."""
 
     sent: int
     retried: int
     failed: int
+    #: Notificaciones que ya no correspondía enviar (alerta borrada/inactiva/umbral).
+    cancelled: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -96,15 +98,26 @@ def _backoff_seconds(attempts: int, backoff_base_seconds: int) -> int:
     return backoff_base_seconds * int(2**attempts)
 
 
-def _claim_statement(now: datetime, batch_size: int) -> Select[tuple[Notification, str, str]]:
-    """SELECT del lote vencido, con teléfono y nombre de campo (sin N+1).
+def _claim_statement(
+    now: datetime, batch_size: int
+) -> Select[tuple[Notification, str, str, datetime | None, bool, int]]:
+    """SELECT del lote vencido, con teléfono, campo y estado actual de la alerta (sin N+1).
 
     El predicado de estado es una igualdad (`status == PENDING`) para que el planner pueda
     usar el índice parcial `ix_notifications_pending_due ... WHERE status = 'pending'`.
     `FOR UPDATE OF notifications` lockea solo la cola: `alerts`/`fields`/`users` no se lockean.
+    Se traen `deleted_at`, `is_active` y `threshold` de la alerta para la re-validación (D12)
+    dentro de la misma transacción del claim.
     """
     return (
-        select(Notification, User.phone_number, Field.name)
+        select(
+            Notification,
+            User.phone_number,
+            Field.name,
+            Alert.deleted_at,
+            Alert.is_active,
+            Alert.threshold,
+        )
         .join(Alert, Alert.id == Notification.alert_id)
         .join(Field, Field.id == Alert.field_id)
         .join(User, User.id == Field.user_id)
@@ -118,14 +131,39 @@ def _claim_statement(now: datetime, batch_size: int) -> Select[tuple[Notificatio
     )
 
 
+def _cancellation_reason(
+    *,
+    alert_deleted_at: datetime | None,
+    alert_is_active: bool,
+    probability: int,
+    alert_threshold: int,
+) -> str | None:
+    """Motivo por el que una notificación reclamada ya no corresponde enviarse (D12).
+
+    El orden importa: una alerta borrada gana sobre una inactiva, y una inactiva gana sobre el
+    umbral (así `last_error` es determinístico).
+    """
+    if alert_deleted_at is not None:
+        return "alert_deleted"
+    if not alert_is_active:
+        return "alert_inactive"
+    if probability < alert_threshold:
+        return "below_current_threshold"
+    return None
+
+
 async def _claim_batch(
     sessionmaker: async_sessionmaker[AsyncSession],
     *,
     now: datetime,
     batch_size: int,
     lease_seconds: int,
-) -> list[ClaimedNotification]:
-    """Transacción 1: reclama el lote con `SKIP LOCKED`, lo arrienda y commitea.
+) -> tuple[list[ClaimedNotification], int]:
+    """Transacción 1: reclama el lote con `SKIP LOCKED`, valida y arrienda; commitea.
+
+    Además del lease, re-verifica contra la alerta **actual** (S9, D12): las notificaciones
+    cuya alerta está borrada, inactiva o ya no alcanza el umbral vigente pasan a `cancelled`
+    con su motivo en `last_error` y no se envían. Todo ocurre en esta misma transacción corta.
 
     El commit libera los locks: nadie espera a la red con una transacción abierta.
     `lease_until = now + lease_seconds` se calcula una sola vez por lote; ese valor exacto es el
@@ -133,22 +171,55 @@ async def _claim_batch(
     real del claim: reusar un `now` viejo haría nacer el lease ya vencido.
     """
     lease_until = now + timedelta(seconds=lease_seconds)
+    claimed: list[ClaimedNotification] = []
+    cancellations: dict[str, list[int]] = {}
     async with sessionmaker() as session:
         rows = (await session.execute(_claim_statement(now, batch_size))).all()
-        claimed = [
-            ClaimedNotification(
-                id=notification.id,
-                forecast_date=notification.forecast_date,
-                event_type=notification.event_type,
+        for (
+            notification,
+            phone_number,
+            field_name,
+            alert_deleted_at,
+            alert_is_active,
+            alert_threshold,
+        ) in rows:
+            reason = _cancellation_reason(
+                alert_deleted_at=alert_deleted_at,
+                alert_is_active=alert_is_active,
                 probability=notification.probability,
-                threshold=notification.threshold,
-                attempts=notification.attempts,
-                phone_number=phone_number,
-                field_name=field_name,
-                lease_until=lease_until,
+                alert_threshold=alert_threshold,
             )
-            for notification, phone_number, field_name in rows
-        ]
+            if reason is not None:
+                cancellations.setdefault(reason, []).append(notification.id)
+                continue
+            claimed.append(
+                ClaimedNotification(
+                    id=notification.id,
+                    forecast_date=notification.forecast_date,
+                    event_type=notification.event_type,
+                    probability=notification.probability,
+                    threshold=notification.threshold,
+                    attempts=notification.attempts,
+                    phone_number=phone_number,
+                    field_name=field_name,
+                    lease_until=lease_until,
+                )
+            )
+
+        for reason, notification_ids in cancellations.items():
+            await session.execute(
+                update(Notification)
+                .where(
+                    Notification.id.in_(notification_ids),
+                    Notification.status == NotificationStatus.PENDING,
+                )
+                .values(
+                    status=NotificationStatus.CANCELLED,
+                    last_error=reason,
+                    updated_at=func.now(),
+                )
+                .execution_options(synchronize_session=False)
+            )
         if claimed:
             await session.execute(
                 update(Notification)
@@ -157,7 +228,7 @@ async def _claim_batch(
                 .execution_options(synchronize_session=False)
             )
         await session.commit()
-    return claimed
+    return claimed, sum(len(ids) for ids in cancellations.values())
 
 
 async def _send_batch(
@@ -279,7 +350,8 @@ async def dispatch_pending(
 ) -> DispatchResult:
     """Envía hasta `batch_size` notificaciones pendientes vencidas (patrón lease).
 
-    1. Claim + lease en una transacción corta (commitea y libera los locks).
+    1. Claim + lease + validación contra la alerta actual en una transacción corta: las que
+       ya no corresponden pasan a `cancelled` sin enviarse (se cuentan en `cancelled`).
     2. Envío en paralelo acotado (`concurrency`) con timeout por mensaje, sin transacción.
     3. Resultados en otra transacción corta: `sent`, reintento con backoff exponencial o
        `failed` al agotar `max_attempts`.
@@ -292,7 +364,7 @@ async def dispatch_pending(
     """
     claim_now = now if now is not None else clock()
     started = time.perf_counter()
-    claimed = await _claim_batch(
+    claimed, cancelled = await _claim_batch(
         sessionmaker, now=claim_now, batch_size=batch_size, lease_seconds=lease_seconds
     )
     if claimed:
@@ -302,22 +374,29 @@ async def dispatch_pending(
             timeout_seconds=timeout_seconds,
             concurrency=concurrency,
         )
-        result = await _record_outcomes(
+        recorded = await _record_outcomes(
             sessionmaker,
             outcomes,
             clock=clock,
             max_attempts=max_attempts,
             backoff_base_seconds=backoff_base_seconds,
         )
+        result = DispatchResult(
+            sent=recorded.sent,
+            retried=recorded.retried,
+            failed=recorded.failed,
+            cancelled=cancelled,
+        )
     else:
-        result = DispatchResult(sent=0, retried=0, failed=0)
+        result = DispatchResult(sent=0, retried=0, failed=0, cancelled=cancelled)
 
     duration_ms = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "dispatch_done sent=%d retried=%d failed=%d duration_ms=%d",
+        "dispatch_done sent=%d retried=%d failed=%d cancelled=%d duration_ms=%d",
         result.sent,
         result.retried,
         result.failed,
+        result.cancelled,
         duration_ms,
     )
     return result

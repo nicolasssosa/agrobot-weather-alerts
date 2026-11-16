@@ -7,28 +7,60 @@ usuario se comporta como inexistente (NotFoundError, nunca 403) para no filtrar 
 
 from collections.abc import Sequence
 
-from sqlalchemy import Select, delete, select
+from sqlalchemy import Select, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm.exc import ObjectDeletedError, StaleDataError
 
+from app.core.config import get_settings
 from app.core.errors import ConflictError, NotFoundError
-from app.models import Alert, EventType, Field
+from app.models import Alert, EventType, Field, Notification, NotificationStatus
 from app.schemas.alert import AlertCreate, AlertUpdate
 from app.schemas.common import BIGINT_MAX
 from app.services._db_errors import is_unique_violation
 from app.services.fields import get_field
 
+#: Detalle del 409 (docs/API.md §alerts): unicidad solo entre alertas no borradas.
+DUPLICATE_ALERT_DETAIL = "An alert with this field, event type and threshold already exists"
 
-def _owned_alerts(user_id: int) -> Select[tuple[Alert]]:
-    """Query base de las alertas del usuario (ownership vía JOIN con `fields`)."""
-    return select(Alert).join(Field, Field.id == Alert.field_id).where(Field.user_id == user_id)
+#: Detalle del 409 (docs/API.md §alerts, "Límite"): tope de alertas vivas por campo.
+ALERT_LIMIT_DETAIL = "Alert limit reached for this field"
+
+
+def _owned_alerts(user_id: int, *, include_deleted: bool = False) -> Select[tuple[Alert]]:
+    """Query base de las alertas del usuario (ownership vía JOIN con `fields`).
+
+    Por defecto excluye las alertas borradas lógicamente: no se listan, no se leen, no se
+    modifican y el evaluador tampoco las considera. `include_deleted` solo lo usa el DELETE,
+    que es idempotente sobre una alerta propia ya borrada.
+    """
+    query = select(Alert).join(Field, Field.id == Alert.field_id).where(Field.user_id == user_id)
+    if not include_deleted:
+        query = query.where(Alert.deleted_at.is_(None))
+    return query
 
 
 async def create_alert(session: AsyncSession, user_id: int, data: AlertCreate) -> Alert:
-    """Crea una alerta del usuario. Campo ajeno/inexistente -> 404; duplicado -> 409."""
+    """Crea una alerta del usuario.
+
+    Campo ajeno/inexistente -> 404; duplicado -> 409; campo con
+    `max_alerts_per_field` alertas vivas -> 409 (docs/API.md §alerts, "Límite").
+    """
     # Valida rango BIGINT y ownership: un id fuera de rango no se consulta (sería un 500).
     field = await get_field(session, user_id, data.field_id)
+    # Lock de la fila del campo dentro de esta transacción: el conteo y el INSERT quedan
+    # serializados contra otros POST del mismo campo. Sin el lock, dos requests en el
+    # límite podrían contar N-1 e insertar ambos (N+1 alertas vivas).
+    await session.execute(select(Field.id).where(Field.id == field.id).with_for_update())
+    live_alerts = (
+        await session.execute(
+            select(func.count())
+            .select_from(Alert)
+            .where(Alert.field_id == field.id, Alert.deleted_at.is_(None))
+        )
+    ).scalar_one()
+    if live_alerts >= get_settings().max_alerts_per_field:
+        await session.rollback()
+        raise ConflictError(ALERT_LIMIT_DETAIL)
     alert = Alert(field_id=field.id, event_type=data.event_type, threshold=data.threshold)
     session.add(alert)
     try:
@@ -37,8 +69,10 @@ async def create_alert(session: AsyncSession, user_id: int, data: AlertCreate) -
         await session.rollback()
         if not is_unique_violation(exc):
             raise
-        # UNIQUE (field_id, event_type): detectado con la constraint, no con un SELECT previo.
-        raise ConflictError("An alert for this field and event type already exists") from None
+        # Índice único parcial (field_id, event_type, threshold) WHERE deleted_at IS NULL:
+        # detectado con la constraint, no con un SELECT previo. Una alerta borrada se puede
+        # recrear con el mismo umbral.
+        raise ConflictError(DUPLICATE_ALERT_DETAIL) from None
     return alert
 
 
@@ -82,30 +116,88 @@ async def update_alert(
 ) -> Alert:
     """Actualiza solo los campos presentes en el PATCH. Commit en el service.
 
-    Un DELETE concurrente de la misma alerta (entre el SELECT y el UPDATE) hace que el
-    `UPDATE` afecte 0 filas o que el `refresh` ya no encuentre la fila. Ambas carreras se
-    traducen en 404, igual que una alerta inexistente.
+    La escritura es un `UPDATE ... WHERE id = :id AND deleted_at IS NULL RETURNING ...`:
+    si un DELETE concurrente commitea entre la lectura de ownership y la escritura, el
+    UPDATE afecta 0 filas y se responde 404 (nunca se modifica una alerta ya borrada).
+    Cambiar el `threshold` a uno que ya usa otra alerta viva del mismo (campo, evento)
+    viola el índice único parcial -> 409.
     """
-    alert = await get_alert(session, user_id, alert_id)
-    for name, value in data.model_dump(exclude_unset=True).items():
-        setattr(alert, name, value)
+    # Valida ownership y existencia (404) antes de escribir.
+    await get_alert(session, user_id, alert_id)
     try:
+        updated = (
+            await session.execute(
+                update(Alert)
+                .where(Alert.id == alert_id, Alert.deleted_at.is_(None))
+                .values(**data.model_dump(exclude_unset=True))
+                .returning(Alert)
+                .execution_options(synchronize_session=False, populate_existing=True)
+            )
+        ).scalar_one_or_none()
+        if updated is None:
+            await session.rollback()
+            raise NotFoundError("Alert not found")
         await session.commit()
-        # `updated_at` usa `onupdate=func.now()`: el flush expira el atributo y, en async, un
-        # acceso implícito durante la serialización fallaría. Refresh explícito para devolverlo.
-        await session.refresh(alert)
-    except (StaleDataError, ObjectDeletedError):
+    except IntegrityError as exc:
         await session.rollback()
-        raise NotFoundError("Alert not found") from None
-    return alert
+        if not is_unique_violation(exc):
+            raise
+        raise ConflictError(DUPLICATE_ALERT_DETAIL) from None
+    return updated
 
 
 async def delete_alert(session: AsyncSession, user_id: int, alert_id: int) -> None:
-    """Borra la alerta; sus notificaciones caen por el ON DELETE CASCADE de la FK.
+    """Borra lógicamente la alerta y cancela sus notificaciones pendientes no arrendadas.
 
-    Se usa un DELETE de Core (y no `session.delete`) para no cargar la relación
-    `notifications` (declarada `lazy="raise"`): el cascade lo resuelve Postgres.
+    Borrado lógico e idempotente (D11): marca `deleted_at` y, en la misma transacción, pasa
+    las notificaciones `pending` de la alerta a `cancelled` con `last_error='alert_deleted'`.
+    Solo se cancelan las que ya vencieron (`next_attempt_at <= now()`); las que el dispatcher
+    tiene arrendadas (`next_attempt_at` en el futuro) se dejan intactas para que registre su
+    resultado real (`sent`/`failed`): un mensaje que salió nunca queda como `cancelled`. Si el
+    worker muere sin registrar, al vencer el lease el próximo claim la cancela por
+    `alert_deleted` (validación D12). El historial (`sent`/`failed`/`cancelled`) se conserva.
+    Repetir el DELETE de una alerta propia ya borrada sigue siendo 204; solo una alerta
+    inexistente o ajena es 404.
+
+    Se bloquea la fila (`FOR UPDATE OF alerts`) para que dos DELETEs concurrentes no se pisen
+    y para que el UPDATE de notificaciones sea atómico con el marcado.
     """
-    alert = await get_alert(session, user_id, alert_id)
-    await session.execute(delete(Alert).where(Alert.id == alert.id))
+    if not 1 <= alert_id <= BIGINT_MAX:
+        raise NotFoundError("Alert not found")
+    result = await session.execute(
+        _owned_alerts(user_id, include_deleted=True)
+        .where(Alert.id == alert_id)
+        .with_for_update(of=Alert)
+        # Una sesión puede tener la instancia cacheada con `deleted_at=None` (p. ej. repetir
+        # el DELETE en el mismo request de test): se relee el estado real bajo el lock.
+        .execution_options(populate_existing=True)
+    )
+    alert = result.scalar_one_or_none()
+    if alert is None:
+        raise NotFoundError("Alert not found")
+    if alert.deleted_at is not None:
+        # Idempotencia (D11): ya estaba borrada; no se mueve el `deleted_at` original.
+        return
+
+    await session.execute(
+        update(Alert)
+        .where(Alert.id == alert.id, Alert.deleted_at.is_(None))
+        .values(deleted_at=func.now(), updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(
+        update(Notification)
+        .where(
+            Notification.alert_id == alert.id,
+            Notification.status == NotificationStatus.PENDING,
+            # Solo las no arrendadas: un lease vigente tiene `next_attempt_at` en el futuro.
+            Notification.next_attempt_at <= func.now(),
+        )
+        .values(
+            status=NotificationStatus.CANCELLED,
+            last_error="alert_deleted",
+            updated_at=func.now(),
+        )
+        .execution_options(synchronize_session=False)
+    )
     await session.commit()

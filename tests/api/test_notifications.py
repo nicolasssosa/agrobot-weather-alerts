@@ -88,6 +88,80 @@ async def test_filters_by_status(
     assert [item["id"] for item in response.json()["items"]] == [pending.id]
 
 
+async def test_filters_by_cancelled_status(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S9: `cancelled` es un estado filtrable del historial."""
+    user = await make_user()
+    alert = await make_alert(await make_field(user), event_type=EventType.FROST)
+    cancelled = await _add_notification(db_session, alert, status=NotificationStatus.CANCELLED)
+    await _add_notification(db_session, alert, forecast_date=date(2026, 11, 19))
+
+    response = await client.get(f"{API}?status=cancelled", headers=auth(user))
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [cancelled.id]
+    assert response.json()["items"][0]["status"] == "cancelled"
+
+
+async def test_the_history_of_a_soft_deleted_alert_stays_visible(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    user = await make_user()
+    alert = await make_alert(await make_field(user), event_type=EventType.FROST)
+    sent = await _add_notification(db_session, alert, status=NotificationStatus.SENT)
+    pending = await _add_notification(
+        db_session, alert, forecast_date=date(2026, 11, 19), status=NotificationStatus.PENDING
+    )
+
+    deleted = await client.delete(f"/api/v1/alerts/{alert.id}", headers=auth(user))
+
+    assert deleted.status_code == 204
+    history = await client.get(f"{API}?alert_id={alert.id}", headers=auth(user))
+    cancelled = await client.get(f"{API}?status=cancelled", headers=auth(user))
+    assert history.status_code == 200
+    assert {item["id"] for item in history.json()["items"]} == {sent.id, pending.id}
+    assert [item["id"] for item in cancelled.json()["items"]] == [pending.id]
+
+
+async def test_the_cancelled_filter_never_leaks_another_users_notifications(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S9: `status=cancelled` respeta ownership (ni por listado ni por `alert_id` ajeno)."""
+    owner = await make_user()
+    intruder = await make_user()
+    owner_alert = await make_alert(await make_field(owner), event_type=EventType.FROST)
+    other_alert = await make_alert(await make_field(intruder), event_type=EventType.RAIN)
+    own = await _add_notification(db_session, owner_alert, status=NotificationStatus.CANCELLED)
+    await _add_notification(db_session, other_alert, status=NotificationStatus.CANCELLED)
+
+    own_page = await client.get(f"{API}?status=cancelled", headers=auth(owner))
+    intruder_page = await client.get(f"{API}?status=cancelled", headers=auth(intruder))
+    cross_filter = await client.get(
+        f"{API}?status=cancelled&alert_id={owner_alert.id}", headers=auth(intruder)
+    )
+
+    assert own_page.status_code == 200
+    assert [item["id"] for item in own_page.json()["items"]] == [own.id]
+    assert all(item["status"] == "cancelled" for item in own_page.json()["items"])
+    assert intruder_page.status_code == 200
+    assert [item["alert_id"] for item in intruder_page.json()["items"]] == [other_alert.id]
+    assert cross_filter.status_code == 200
+    assert cross_filter.json()["items"] == []
+
+
 async def test_filters_by_alert_id(
     client: AsyncClient,
     db_session: AsyncSession,

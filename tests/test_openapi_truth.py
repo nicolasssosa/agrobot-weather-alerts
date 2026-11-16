@@ -289,6 +289,15 @@ async def _probe_409(ctx: Ctx, method: str, path: str) -> Response:
         first = await _request(ctx, method, path, headers=headers, json_body=payload)
         assert first.status_code == 201, first.text
         return await _request(ctx, method, path, headers=headers, json_body=payload)
+    if (method, path) == ("patch", f"{_API}/alerts/{{alert_id}}"):
+        payload = {
+            "field_id": ctx.field.id,
+            "event_type": ctx.alert.event_type.value,
+            "threshold": 55,
+        }
+        first = await _request(ctx, "post", f"{_API}/alerts", headers=headers, json_body=payload)
+        assert first.status_code == 201, first.text
+        return await _request(ctx, method, path, headers=headers, json_body={"threshold": 55})
     raise AssertionError(f"sin probe 409 para {method} {path}")
 
 
@@ -485,7 +494,7 @@ _EXPECTED_ERROR_CODES: dict[tuple[str, str], set[int]] = {
     ("post", f"{_API}/alerts"): {401, 404, 409, 422},
     ("get", f"{_API}/alerts"): {401, 422},
     ("get", f"{_API}/alerts/{{alert_id}}"): {401, 404, 422},
-    ("patch", f"{_API}/alerts/{{alert_id}}"): {401, 404, 422},
+    ("patch", f"{_API}/alerts/{{alert_id}}"): {401, 404, 409, 422},
     ("delete", f"{_API}/alerts/{{alert_id}}"): {401, 404, 422},
     ("get", f"{_API}/notifications"): {401, 422},
 }
@@ -514,7 +523,8 @@ async def test_codes_absent_from_the_contract_are_not_returned(ctx: Ctx) -> None
     assert unknown_user.status_code == 401
     assert "404" not in _responses("post", f"{_API}/fields")
 
-    # PATCH /alerts no declara 409: intentar cambiar la clave (campo, evento) es 422.
+    # PATCH /alerts declara 409 (colisión de umbral) pero la clave (campo, evento) sigue
+    # siendo no editable y responde 422 por `extra="forbid"`.
     patch_key = await _request(
         ctx,
         "patch",
@@ -523,7 +533,7 @@ async def test_codes_absent_from_the_contract_are_not_returned(ctx: Ctx) -> None
         json_body={"field_id": ctx.other_field.id},
     )
     assert patch_key.status_code == 422
-    assert "409" not in _responses("patch", f"{_API}/alerts/{{alert_id}}")
+    assert "409" in _responses("patch", f"{_API}/alerts/{{alert_id}}")
 
 
 # --- Try it out: ejemplos documentados ---------------------------------------

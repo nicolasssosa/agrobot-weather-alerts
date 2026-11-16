@@ -54,12 +54,16 @@ def _compiled_sql(*, literal_binds: bool = False) -> str:
 # --- Forma del SQL (CR-1, CR-2) ------------------------------------------
 
 
-def test_active_filter_is_a_bare_boolean_so_the_partial_index_applies() -> None:
-    """`WHERE alerts.is_active` (no `IS true`) es lo que matchea el predicado del índice
-    parcial `ix_alerts_active_field_event`."""
+def test_active_filter_is_a_bare_boolean_and_excludes_deleted_alerts() -> None:
+    """El predicado matchea el índice parcial `... WHERE is_active AND deleted_at IS NULL`.
+
+    `WHERE alerts.is_active` (no `IS true`) es lo que habilita el índice; `deleted_at IS NULL`
+    excluye las alertas borradas lógicamente (S9).
+    """
     sql = _compiled_sql()
 
     assert "alerts.is_active" in sql
+    assert "alerts.deleted_at IS NULL" in sql
     assert "IS TRUE" not in sql.upper()
 
 
@@ -94,6 +98,11 @@ async def test_planner_uses_the_partial_index(
     for field in fields[:8]:
         for event_type in EventType:
             await make_alert(field, event_type=event_type, threshold=50, is_active=False)
+    # Alertas borradas: tampoco pertenecen al índice parcial (S9).
+    for event_type in EventType:
+        deleted = await make_alert(fields[0], event_type=event_type, threshold=60)
+        deleted.deleted_at = FIXED_AT
+    await db_session.flush()
     active_field = fields[8]
     await make_alert(active_field, event_type=EventType.FROST, threshold=50)
     await make_forecast(
@@ -162,6 +171,25 @@ async def test_inactive_alert_does_not_create_notification(
 ) -> None:
     field = await make_field()
     await make_alert(field, event_type=EventType.FROST, threshold=70, is_active=False)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=100)
+
+    created = await evaluate_alerts(db_session, today=TODAY)
+
+    assert created == 0
+    assert await _notifications(db_session) == []
+
+
+async def test_soft_deleted_alert_does_not_create_notification(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """S9: una alerta borrada lógicamente no se evalúa aunque siga `is_active`."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    alert.deleted_at = FIXED_AT
+    await db_session.flush()
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=100)
 
     created = await evaluate_alerts(db_session, today=TODAY)
@@ -585,14 +613,84 @@ async def test_reactivation_notifies_only_days_not_yet_notified(
     ]
 
 
-async def test_deleted_alert_loses_its_notifications_and_a_new_alert_notifies_again(
+async def test_several_thresholds_for_the_same_field_and_event_only_fire_the_crossed_ones(
     db_session: AsyncSession,
     make_field: MakeField,
     make_alert: MakeAlert,
     make_forecast: MakeForecast,
 ) -> None:
-    """Borrar la alerta cascadea sus notificaciones; una alerta nueva sobre el mismo
-    (campo, evento) vuelve a notificar esos días."""
+    """D5/S9: 30 (atención) / 60 / 90 (crítico) con probabilidad 70 → dos avisos, no tres.
+
+    Cada alerta conserva su propio `threshold` en el snapshot, así el usuario recibe un aviso
+    por cada nivel superado y ninguno por el nivel que todavía no se alcanzó.
+    """
+    field = await make_field()
+    thresholds = [30, 60, 90]
+    alerts = {
+        threshold: await make_alert(field, event_type=EventType.FROST, threshold=threshold)
+        for threshold in thresholds
+    }
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=70)
+
+    created = await evaluate_alerts(db_session, today=TODAY)
+
+    assert created == 2
+    notifications = await _notifications(db_session)
+    assert {notification.alert_id for notification in notifications} == {
+        alerts[30].id,
+        alerts[60].id,
+    }
+    assert {(n.alert_id, n.threshold) for n in notifications} == {
+        (alerts[30].id, 30),
+        (alerts[60].id, 60),
+    }
+    # Re-ejecutar no agrega el nivel 90 ni duplica los otros dos.
+    assert await evaluate_alerts(db_session, today=TODAY) == 0
+
+
+async def test_reactivation_after_a_cancelled_pending_does_not_recreate_the_day(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Comportamiento observado (posible deuda de producto, QA-1).
+
+    Al pausar la alerta, el dispatcher cancela la notificación pendiente; al reactivarla, el
+    dedupe `UNIQUE (alert_id, forecast_date)` la deja cancelada y el evaluador NO crea un
+    reemplazo para ese día. El día queda sin aviso aunque la alerta vuelva a estar activa.
+    """
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=80)
+    assert await evaluate_alerts(db_session, today=TODAY) == 1
+    [notification] = await _notifications(db_session, alert_id=alert.id)
+
+    # Pausa + lo que hace el dispatcher en el claim (D12): pending -> cancelled.
+    alert.is_active = False
+    notification.status = NotificationStatus.CANCELLED
+    notification.last_error = "alert_inactive"
+    await db_session.flush()
+    assert await evaluate_alerts(db_session, today=TODAY) == 0
+
+    alert.is_active = True
+    await db_session.flush()
+    assert await evaluate_alerts(db_session, today=TODAY) == 0
+
+    [still_cancelled] = await _notifications(db_session, alert_id=alert.id)
+    assert still_cancelled.id == notification.id
+    assert still_cancelled.status == NotificationStatus.CANCELLED
+    assert still_cancelled.last_error == "alert_inactive"
+
+
+async def test_soft_deleted_alert_keeps_its_history_and_a_new_alert_notifies_again(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Borrar lógicamente conserva el historial; una alerta nueva sobre el mismo
+    (campo, evento, umbral) vuelve a notificar esos días (S9/D11)."""
     field = await make_field()
     alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
     for offset in range(2):
@@ -606,16 +704,17 @@ async def test_deleted_alert_loses_its_notifications_and_a_new_alert_notifies_ag
     assert await evaluate_alerts(db_session, today=TODAY) == 2
     assert len(await _notifications(db_session)) == 2
 
-    # DELETE de Core, como en `delete_alert`: el cascade lo resuelve Postgres.
-    await db_session.execute(delete(Alert).where(Alert.id == alert.id))
+    alert.deleted_at = FIXED_AT
     await db_session.flush()
-    assert await _notifications(db_session) == []
+    # El borrado lógico no toca las notificaciones y el evaluador ya no evalúa la alerta.
+    assert len(await _notifications(db_session)) == 2
+    assert await evaluate_alerts(db_session, today=TODAY) == 0
 
     new_alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
     assert await evaluate_alerts(db_session, today=TODAY) == 2
     notifications = await _notifications(db_session)
-    assert {n.alert_id for n in notifications} == {new_alert.id}
-    assert len(notifications) == 2
+    assert {n.alert_id for n in notifications} == {alert.id, new_alert.id}
+    assert len(notifications) == 4
 
 
 # --- Volumen ---------------------------------------------------------------

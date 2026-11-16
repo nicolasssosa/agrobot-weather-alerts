@@ -1,16 +1,17 @@
 """Modelo `Alert` (tabla `alerts`). Ver docs/DATA_MODEL.md §alerts."""
 
+from datetime import datetime
 from typing import TYPE_CHECKING
 
 from sqlalchemy import (
     BigInteger,
     Boolean,
     CheckConstraint,
+    DateTime,
     ForeignKey,
     Identity,
     Index,
     SmallInteger,
-    UniqueConstraint,
     text,
     true,
 )
@@ -30,13 +31,20 @@ class Alert(Base, TimestampMixin):
 
     __tablename__ = "alerts"
     __table_args__ = (
-        UniqueConstraint("field_id", "event_type"),
+        Index(
+            "uq_alerts_field_event_threshold_alive",
+            "field_id",
+            "event_type",
+            "threshold",
+            unique=True,
+            postgresql_where=text("deleted_at IS NULL"),
+        ),
         CheckConstraint("threshold BETWEEN 1 AND 100", name="threshold_range"),
         Index(
             "ix_alerts_active_field_event",
             "field_id",
             "event_type",
-            postgresql_where=text("is_active"),
+            postgresql_where=text("is_active AND deleted_at IS NULL"),
         ),
     )
 
@@ -58,6 +66,7 @@ class Alert(Base, TimestampMixin):
     )
     threshold: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     is_active: Mapped[bool] = mapped_column(Boolean, server_default=true(), nullable=False)
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
     field: Mapped["Field"] = relationship(back_populates="alerts", lazy="raise")
     notifications: Mapped[list["Notification"]] = relationship(
