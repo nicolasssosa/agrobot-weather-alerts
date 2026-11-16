@@ -30,7 +30,7 @@ FROM alerts a
 JOIN weather_forecasts wf
   ON wf.field_id = a.field_id
  AND wf.event_type = a.event_type
-WHERE a.is_active
+WHERE a.is_active            -- literal así (no `IS true`): habilita el índice parcial ix_alerts_active_field_event
   AND wf.forecast_date >= :today                      -- todos los días futuros (incluye hoy)
   AND wf.probability   >= a.threshold                 -- "a partir de" => >=
 ON CONFLICT (alert_id, forecast_date) DO NOTHING
@@ -40,7 +40,10 @@ RETURNING id;
 Implementación: con SQLAlchemy Core
 (`sqlalchemy.dialects.postgresql.insert(Notification).from_select([...], select_stmt)
 .on_conflict_do_nothing(index_elements=["alert_id", "forecast_date"]).returning(Notification.id)`),
-Devolver `len(result.all())`. **No commitea.** Loguear `alerts_evaluated created=<n>`.
+Contar **sin materializar** las filas: envolver el insert en un CTE y contar en SQL
+(`WITH ins AS (INSERT … RETURNING 1) SELECT count(*) FROM ins`; en SQLAlchemy
+`select(func.count()).select_from(insert_stmt.cte("ins"))`). Sigue siendo una sola sentencia. Nunca
+`len(result.all())`: con un backlog grande trae cientos de MB a memoria (S5 CR-2). **No commitea.** Loguear `alerts_evaluated created=<n>`.
 
 Reglas de negocio (cubiertas por tests):
 1. `probability >= threshold` dispara; `probability < threshold` no.

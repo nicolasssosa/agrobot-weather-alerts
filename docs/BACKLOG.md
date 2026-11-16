@@ -53,7 +53,7 @@ Archivos: `app/schemas/alert.py`, `app/services/alerts.py`, `app/api/routers/ale
 - [ ] Follow-up S2 SEC-4 (autorizado tocar `app/core/errors.py`): handler global de `RequestValidationError` que sanee `input` de los errores (surrogates UTF-16, NaN/Infinity) para que todo 422 sea JSON serializable; tests con surrogate suelto en `name` de users, fields y un payload de alerts.
 - [ ] Follow-up S2 CR-dup: mover `_is_unique_violation` a un único módulo compartido (ej. `app/services/_db_errors.py`) y usarlo en users, fields y alerts.
 
-## S5 — Evaluador de alertas · RF-05, RF-06, RF-08, RNF-03, D1, D2
+## S5 — Evaluador de alertas · RF-05, RF-06, RF-08, RNF-03, D1, D2 · ✅
 Archivos: `app/jobs/evaluator.py`, `tests/jobs/test_evaluator.py`.
 - [ ] Un único `INSERT ... SELECT ... ON CONFLICT DO NOTHING RETURNING` (nada de loops en Python).
 - [ ] Todos los casos de `TESTING.md` §test_evaluator (borde `==`, inactiva, pasado, hoy, futuro lejano, otro evento/campo, idempotencia).
@@ -101,3 +101,6 @@ Archivos: `.github/workflows/ci.yml`.
 | S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | ✅ resuelto en S4 |
 | S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
 | S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | README §Próximos pasos |
+| S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | README §Próximos pasos |
+| S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
+| S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
