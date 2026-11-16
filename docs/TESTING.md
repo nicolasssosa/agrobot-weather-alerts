@@ -1,0 +1,108 @@
+# Testing
+
+## Cómo corren
+
+- Postgres real (no SQLite: usamos `ON CONFLICT`, `FOR UPDATE SKIP LOCKED`, índices parciales).
+  `make db-up` levanta la base; `agrobot_test` se crea en el init del contenedor.
+  > Si el volumen ya existía sin esa base: `docker compose exec db psql -U postgres -c "CREATE DATABASE agrobot_test"`.
+- `tests/conftest.py` (ya implementado, no modificar salvo para agregar factories):
+  - aplica `alembic downgrade base` + `upgrade head` una vez por sesión → **las migraciones se testean**;
+  - fixture `db_session`: transacción por test con rollback al final;
+  - fixture `client`: `httpx.AsyncClient` contra la app con la sesión inyectada;
+  - `FakeNotifier(fail_times=n)` + fixture `fake_notifier`.
+- `asyncio_mode = "auto"`: los tests son `async def test_...` sin decorador.
+- Para jobs, llamar a las funciones con `db_session` directamente y pasar `today`/`now` fijos
+  (nunca depender del reloj real).
+
+## Factories (T11) — agregar a `tests/conftest.py`
+
+Fixtures que devuelven funciones async; cada una hace `session.add(obj)` + `await session.flush()` y
+devuelve el objeto. Valores por defecto únicos con un contador (`itertools.count()`).
+
+```python
+@pytest.fixture
+def make_user(db_session):
+    async def _make(**kw) -> User:
+        n = next(_seq)
+        user = User(
+            phone_number=kw.get("phone_number", f"+54911{n:08d}"), name=kw.get("name", f"User {n}")
+        )
+        db_session.add(user)
+        await db_session.flush()
+        return user
+
+    return _make
+```
+Análogamente:
+- `make_field(user=None, **kw)` → crea user si no se pasa; `name=f"Field {n}"`, lat `-34.6`, lon `-58.4`.
+- `make_forecast(field, *, forecast_date, event_type, probability, source="mock")` → `fetched_at=now(UTC)`.
+- `make_alert(field, *, event_type=EventType.FROST, threshold=70, is_active=True)`.
+- Helper `auth(user) -> dict[str, str]` que devuelve `{"X-User-Id": str(user.id)}`.
+
+## Casos mínimos requeridos
+
+### `tests/test_migrations.py`
+- `alembic check` no detecta diferencias entre modelos y la base migrada
+  (usar `alembic.command.check` con el `Config` apuntando a `TEST_DATABASE_URL`; correrlo en un
+  test **sync** porque `env.py` usa `asyncio.run`).
+
+### `tests/api/test_health.py`
+- `GET /health` → 200 `{"status": "ok"}`.
+
+### `tests/api/test_users.py`
+- crea usuario → 201; teléfono duplicado → 409; teléfono inválido → 422.
+- `GET /users/me` sin header → 401; con header de user inexistente → 401; ok → 200.
+
+### `tests/api/test_fields.py`
+- crear → 201 y aparece en el listado; nombre duplicado (mismo user) → 409;
+  mismo nombre para otro user → 201; latitud 91 → 422.
+- `GET /fields/{id}` de otro usuario → 404.
+
+### `tests/api/test_forecasts.py`
+- devuelve forecasts del campo ordenados por fecha; filtra por `event_type` y rango;
+  `date_from > date_to` → 422; campo ajeno → 404.
+
+### `tests/api/test_alerts.py`
+- crear → 201 (`is_active` true); duplicado (campo, evento) → 409; campo ajeno → 404;
+  `threshold` 0 y 101 → 422; `event_type` inválido → 422; campo extra → 422.
+- listado con filtros (`field_id`, `event_type`, `is_active`) y paginación (`limit`/`offset`).
+- PATCH threshold / is_active → 200; PATCH `{}` → 422; PATCH alerta ajena → 404.
+- DELETE → 204 y luego GET → 404; DELETE borra en cascada sus notificaciones.
+
+### `tests/api/test_notifications.py`
+- solo lista notificaciones del usuario autenticado; filtro por `status` y `alert_id`.
+
+### `tests/jobs/test_evaluator.py`  (el más importante)
+- probabilidad == umbral → crea notificación (snapshot de probability/threshold/event_type correcto).
+- probabilidad < umbral → no crea.
+- alerta inactiva → no crea.
+- fecha de ayer → no crea; fecha de hoy → crea; fecha lejana (hoy + 30) → crea.
+- otro `event_type` u otro campo → no crea.
+- correr dos veces → segunda vez devuelve 0 y hay una sola fila.
+- varias alertas/días → cuenta correcta.
+
+### `tests/jobs/test_dispatcher.py`
+- pendiente → `sent`, `sent_at` seteado, `attempts == 1`, el FakeNotifier recibió el texto exacto y
+  el teléfono del dueño.
+- notifier falla una vez → sigue `pending`, `attempts == 1`, `last_error` seteado,
+  `next_attempt_at == now + backoff_base`; con `now` posterior se envía.
+- falla `max_attempts` veces → `failed`.
+- `next_attempt_at` en el futuro → no se toca.
+- notifier lento (`asyncio.sleep` > timeout) → cuenta como fallo (no cuelga).
+- respeta `batch_size`.
+- `build_message_text` → string exacto de docs/JOBS.md.
+
+### `tests/jobs/test_worker.py`
+- `run_cycle` end-to-end con forecasts + alertas → notificaciones `sent`.
+  Como `run_cycle` usa un `sessionmaker`, pasar uno ligado a la conexión del test:
+  `async_sessionmaker(bind=db_session.bind, expire_on_commit=False, join_transaction_mode="create_savepoint")`.
+- `run_forever` con `stop_event` seteado tras el primer ciclo termina sin error;
+  si `run_cycle` lanza, el loop continúa (monkeypatch).
+
+### `tests/weather/test_ingestion.py`
+- `MockWeatherProvider` es determinístico y devuelve `days × len(EventType)` puntos en 0..100.
+- `ingest_forecasts` inserta y, al re-ejecutarse con otra semilla, actualiza (upsert) sin duplicar.
+
+### Concurrencia (opcional, suma puntos)
+- Dos `dispatch_pending` concurrentes en **conexiones distintas** (no usar `db_session`; crear
+  engine propio y limpiar al final) no envían la misma notificación dos veces.
