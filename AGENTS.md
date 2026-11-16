@@ -52,6 +52,10 @@ make check            # ruff + mypy + pytest (definition of done)
 11. Borrá los docstrings `TODO(Sx)` de los stubs que implementes y reemplazalos por docstrings
     reales y breves.
 12. **No hagas commit, push ni PR**: eso lo hace el orquestador después de las reviews.
+13. Si corregís un bug reportado por QA (`QA-n`), sacá el `@pytest.mark.xfail(... "QA-n" ...)` de su
+    test: es `strict`, así que el test fallará como XPASS hasta que lo saques.
+
+Tu rol específico (permisos, contexto y formato de entrega) está en `.agents/<rol>.md`.
 
 ## Estilo
 
@@ -61,17 +65,7 @@ make check            # ruff + mypy + pytest (definition of done)
 - Funciones chicas, nombres explícitos, sin código muerto ni prints.
 - `make fmt` antes de terminar.
 
-## Reporte final (obligatorio)
+## Entrega
 
-Al terminar, respondé con:
-```
-## Historia: Sx
-## Archivos tocados
-- path — qué hiciste
-## Criterios de aceptación
-- [x] ... (uno por criterio, con el test que lo cubre)
-## Resultado de `make check`
-<últimas líneas: N passed, ruff/mypy ok>
-## Dudas / desvíos
-- ...
-```
+Respondé con el contrato de salida de tu rol (`.agents/coder.md` → `CODER_REPORT`,
+`.agents/qa.md` → `QA_REPORT`).

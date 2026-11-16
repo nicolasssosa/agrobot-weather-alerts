@@ -49,7 +49,7 @@ Detalle en [`docs/JOBS.md`](docs/JOBS.md) y [`docs/DATA_MODEL.md`](docs/DATA_MOD
 | [API](docs/API.md) | Endpoints y contratos |
 | [JOBS](docs/JOBS.md) | Evaluador, dispatcher, worker, ingesta mock |
 | [TESTING](docs/TESTING.md) | Estrategia y casos de test |
-| [PROCESS](docs/PROCESS.md) | Proceso multi-agente (PM, coder, QA, reviewers) |
+| [PROCESS](docs/PROCESS.md) · [.agents](.agents/README.md) | Proceso SDLC y equipo de agentes (modelo, permisos y prompt por rol) |
 
 ## Decisiones principales
 
