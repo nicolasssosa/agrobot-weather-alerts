@@ -2,7 +2,8 @@
 role: security-reviewer
 provider: claudeAgent
 model: claude-opus-5-5
-options: { effort: high }
+options: { effort: medium }
+# effort high descartado por costo de tokens (decisión del usuario, 2026-11-16).
 writes: []                    # solo lectura
 reads:
   - docs/REQUIREMENTS.md       # RNF-08

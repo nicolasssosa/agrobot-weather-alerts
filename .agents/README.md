@@ -11,8 +11,8 @@ El orquestador (T3 Code) lee el archivo del rol y lanza el agente con esos pará
 | PM / Orquestador | [pm.md](pm.md) | claudeAgent / `claude-opus-5-5` | default | `docs/`, `.agents/`, `README.md`, git/PRs | backlog, PRs, merge |
 | Coder | [coder.md](coder.md) | opencode / `opencode/deepseek-v4.1-flash-free` | `high` | archivos de la historia | `CODER_REPORT` |
 | QA | [qa.md](qa.md) | opencode / `opencode/deepseek-v4.1-flash-free` | `high` | solo `tests/` | `QA_REPORT` (JSON) |
-| Code Reviewer | [code-reviewer.md](code-reviewer.md) | claudeAgent / `claude-opus-5-5` | `medium` | nada (solo lectura) | `REVIEW` (JSON) |
-| Security Reviewer | [security-reviewer.md](security-reviewer.md) | claudeAgent / `claude-opus-5-5` | `high` | nada (solo lectura) | `REVIEW` (JSON) |
+| Code Reviewer | [code-reviewer.md](code-reviewer.md) | opencode / `opencode/glm-5.3-flash-free` | `high` | nada (solo lectura) | `REVIEW` (JSON) |
+| Security Reviewer | [security-reviewer.md](security-reviewer.md) | claudeAgent / `claude-opus-5-5` | `medium` | nada (solo lectura) | `REVIEW` (JSON) |
 
 ## Pipeline por historia
 
@@ -38,8 +38,10 @@ pide cambiar un contrato documentado.
 
 - **Separación de poderes:** quien escribe no aprueba. Los reviewers no tienen permisos de escritura;
   QA no puede tocar `app/` (así no "arregla" el código para que pase su propio test).
-- **Modelos por costo/valor:** generación de código en volumen → modelo rápido y barato (DeepSeek
-  Flash); juicio (review y seguridad) → el modelo más fuerte (Opus).
+- **Modelos por costo/valor:** generación de código, QA y code review → modelos rápidos y baratos
+  (DeepSeek V4.1 Flash, GLM 5.3 Flash; un modelo distinto al del coder revisa su código).
+  Seguridad → Opus (effort medium), donde un error cuesta más. Nada corre con Opus effort high
+  por costo de tokens. Cambiar un modelo = editar el frontmatter del rol.
 - **Contexto mínimo y explícito:** cada rol tiene una lista `reads` acotada. Los reviewers miran el
   **diff**, no el repo entero. Menos tokens y menos alucinaciones.
 - **Salidas estructuradas:** los reportes llevan un bloque JSON con schema fijo → el orquestador decide

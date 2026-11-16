@@ -10,10 +10,10 @@ Sx — <título> (docs/BACKLOG.md)
 ## QA (DeepSeek V4.1 Flash)
 <tabla criterio → test → estado>
 
-## Code review (Opus 5.5 medium)
+## Code review (GLM 5.3 Flash)
 Veredicto: APPROVE / REQUEST_CHANGES · Rondas: n
 
-## Security review (Opus 5.5)
+## Security review (Opus 5.5 medium)
 Veredicto: APPROVE / REQUEST_CHANGES
 
 ## Verificación

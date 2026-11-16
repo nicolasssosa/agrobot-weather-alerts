@@ -1,8 +1,10 @@
 ---
 role: code-reviewer
-provider: claudeAgent
-model: claude-opus-5-5
-options: { effort: medium }
+provider: opencode
+model: opencode/glm-5.3-flash-free
+options: { variant: high }
+# Antes: claudeAgent / claude-opus-5-5 effort medium. Cambiado por costo de tokens (decisión del usuario,
+# 2026-11-16). Volver a Opus medium si las reviews de GLM no detectan problemas reales.
 writes: []                    # solo lectura: puede correr comandos (pytest, git, psql), no editar
 reads:
   - docs/BACKLOG.md            # §{story_id}
