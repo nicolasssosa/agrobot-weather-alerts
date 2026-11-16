@@ -1,7 +1,66 @@
-"""Modelo `Alert` (tabla `alerts`).
+"""Modelo `Alert` (tabla `alerts`). Ver docs/DATA_MODEL.md §alerts."""
 
-TODO(S1): implementar EXACTAMENTE según docs/DATA_MODEL.md §alerts
-(columnas, tipos, nullability, CHECKs, UNIQUEs, índices, FKs con ondelete).
-Usar SQLAlchemy 2.0 tipado: `Mapped[...]` + `mapped_column(...)`, heredar de
-`Base` (y `TimestampMixin` si la tabla tiene created_at/updated_at).
-"""
+from typing import TYPE_CHECKING
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    ForeignKey,
+    Identity,
+    Index,
+    SmallInteger,
+    UniqueConstraint,
+    text,
+    true,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from sqlalchemy.types import Enum as SAEnum
+
+from app.models.base import Base, TimestampMixin
+from app.models.enums import EventType
+
+if TYPE_CHECKING:
+    from app.models.field import Field
+    from app.models.notification import Notification
+
+
+class Alert(Base, TimestampMixin):
+    """Configuración "avisame cuando `event_type` en el campo sea >= `threshold`"."""
+
+    __tablename__ = "alerts"
+    __table_args__ = (
+        UniqueConstraint("field_id", "event_type"),
+        CheckConstraint("threshold BETWEEN 1 AND 100", name="threshold_range"),
+        Index(
+            "ix_alerts_active_field_event",
+            "field_id",
+            "event_type",
+            postgresql_where=text("is_active"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(), primary_key=True)
+    field_id: Mapped[int] = mapped_column(
+        BigInteger, ForeignKey("fields.id", ondelete="CASCADE"), nullable=False
+    )
+    event_type: Mapped[EventType] = mapped_column(
+        SAEnum(
+            EventType,
+            native_enum=False,
+            length=32,
+            validate_strings=True,
+            values_callable=lambda e: [m.value for m in e],
+            create_constraint=True,
+            name="event_type",
+        ),
+        nullable=False,
+    )
+    threshold: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    is_active: Mapped[bool] = mapped_column(Boolean, server_default=true(), nullable=False)
+
+    field: Mapped["Field"] = relationship(back_populates="alerts", lazy="raise")
+    notifications: Mapped[list["Notification"]] = relationship(
+        back_populates="alert",
+        lazy="raise",
+    )
