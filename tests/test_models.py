@@ -514,3 +514,56 @@ async def test_factories_flush_rows_with_unique_defaults(
     assert forecast.source == "mock"
     assert alert.id is not None
     assert alert.is_active is True
+
+
+# --- Migración 0002: hardening (S2) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    "phone_number",
+    [
+        "5491122334455",  # sin `+`
+        "+0123456789",  # código de país empieza con 0
+        "+1234567",  # 7 dígitos: por debajo del mínimo E.164
+        "+1234567890123456",  # 16 dígitos: por encima del máximo E.164
+        "telefono",
+    ],
+)
+async def test_phone_number_must_be_e164_in_the_database(
+    db_session: AsyncSession, phone_number: str
+) -> None:
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            db_session.add(User(phone_number=phone_number, name="Bad Phone"))
+            await db_session.flush()
+
+
+async def test_e164_boundary_phone_numbers_are_accepted(make_user: MakeUser) -> None:
+    shortest = await make_user(phone_number="+12345678")  # 8 dígitos
+    longest = await make_user(phone_number="+123456789012345")  # 15 dígitos
+
+    assert shortest.id is not None
+    assert longest.id is not None
+
+
+async def test_last_error_of_1000_characters_is_accepted(
+    db_session: AsyncSession, make_field: MakeField, make_alert: MakeAlert
+) -> None:
+    alert = await make_alert(await make_field())
+    notification = await _make_notification(db_session, alert)
+    notification.last_error = "x" * 1000
+    await db_session.flush()
+
+    assert notification.last_error is not None
+    assert len(notification.last_error) == 1000
+
+
+async def test_last_error_longer_than_1000_characters_is_rejected(
+    db_session: AsyncSession, make_field: MakeField, make_alert: MakeAlert
+) -> None:
+    alert = await make_alert(await make_field())
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            notification = await _make_notification(db_session, alert)
+            notification.last_error = "x" * 1001
+            await db_session.flush()

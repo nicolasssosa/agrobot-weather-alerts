@@ -23,7 +23,7 @@ Archivos: `app/models/{user,field,weather,alert,notification}.py`, `app/models/_
 - [ ] Factories `make_user/make_field/make_forecast/make_alert` + helper `auth()`.
 - [ ] Tests de constraints: probability 101 → IntegrityError; alerta duplicada (campo, evento) → IntegrityError; notificación duplicada (alerta, día) → IntegrityError; borrar field cascadea a alerts/forecasts/notifications.
 
-## S2 — Users, Fields y Health API + hardening de esquema · RF-01, RF-11, RNF-06, RNF-08
+## S2 — Users, Fields y Health API + hardening de esquema · RF-01, RF-11, RNF-06, RNF-08 · ✅
 Archivos: `app/schemas/{common,user,field}.py`, `app/api/deps.py`, `app/services/{users,fields}.py`,
 `app/api/routers/{health,users,fields}.py`, `tests/api/test_{health,users,fields}.py`,
 `migrations/versions/*_0002_constraints_hardening.py`, `app/models/{user,notification}.py`
@@ -88,7 +88,11 @@ Archivos: `.github/workflows/ci.yml`.
 
 | Origen | Severidad | Descripción | Destino sugerido |
 |--------|-----------|-------------|------------------|
-| S1 SEC-2 | minor | CHECK E.164 en `users.phone_number` en la DB (hoy solo lo valida Pydantic; variantes del número esquivan el UNIQUE) | **S2** (migración 0002) |
-| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | **S2** (CHECK, migración 0002); enmascarado de PII en S6 |
+| S1 SEC-2 | minor | CHECK E.164 en `users.phone_number` en la DB (hoy solo lo valida Pydantic; variantes del número esquivan el UNIQUE) | ✅ resuelto en S2 (migración 0002) |
+| S1 SEC-1 | minor | Tope de 1000 caracteres en `notifications.last_error` a nivel DB + enmascarado de PII en el error | ✅ CHECK en S2 (0002); enmascarado de PII pendiente en S6 |
 | S1 CR-2 | nit | Derivar la lista de valores del CHECK de `event_type` de `EventType` en vez de repetirla | próxima migración |
 | S1 CR-1 | nit | Migración: nombres de PK/UQ/FK explícitos vs. CHECK en forma base (inconsistencia sin impacto) | — |
+| S2 SEC-4 | minor | Surrogate UTF-16 suelto en un string → el 422 de FastAPI no serializa → 500. Fix: handler global de `RequestValidationError` que sanee `input` (cubre también NaN/surrogates en schemas futuros) | **S4** (app/core/errors.py, con OK del PM) |
+| S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | README §Próximos pasos |
+| S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | documentar en API.md §Autenticación |
+| S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | consolidar en S4 (alerts también lo necesita) |

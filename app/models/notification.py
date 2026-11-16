@@ -39,6 +39,10 @@ class Notification(Base, TimestampMixin):
         CheckConstraint("probability BETWEEN 0 AND 100", name="probability_range"),
         CheckConstraint("threshold BETWEEN 1 AND 100", name="threshold_range"),
         CheckConstraint("attempts >= 0", name="attempts_non_negative"),
+        CheckConstraint(
+            "last_error IS NULL OR char_length(last_error) <= 1000",
+            name="last_error_length",
+        ),
         Index(
             "ix_notifications_pending_due",
             "next_attempt_at",

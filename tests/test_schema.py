@@ -113,9 +113,11 @@ EXPECTED_CHECKS = {
     ("alerts", "ck_alerts_threshold_range"),
     ("notifications", "ck_notifications_attempts_non_negative"),
     ("notifications", "ck_notifications_event_type"),
+    ("notifications", "ck_notifications_last_error_length"),
     ("notifications", "ck_notifications_notification_status"),
     ("notifications", "ck_notifications_probability_range"),
     ("notifications", "ck_notifications_threshold_range"),
+    ("users", "ck_users_phone_number_e164"),
 }
 
 EXPECTED_INDEXES = {
@@ -336,11 +338,38 @@ def test_relationships_are_lazy_raise_without_orm_delete_cascade() -> None:
             assert "delete-orphan" not in relationship.cascade
 
 
-def test_initial_migration_is_revision_0001_without_down_revision() -> None:
+async def test_migration_0002_check_constraints_are_in_the_catalog(
+    db_session: AsyncSession,
+) -> None:
+    rows = (
+        await db_session.execute(
+            text(
+                """
+                SELECT conname, pg_get_constraintdef(oid)
+                FROM pg_constraint
+                WHERE conname IN (
+                    'ck_users_phone_number_e164', 'ck_notifications_last_error_length'
+                )
+                """
+            )
+        )
+    ).all()
+    definitions = dict(rows)
+
+    assert "phone_number" in definitions["ck_users_phone_number_e164"]
+    assert "[1-9]" in definitions["ck_users_phone_number_e164"]
+    assert "last_error" in definitions["ck_notifications_last_error_length"]
+    assert "1000" in definitions["ck_notifications_last_error_length"]
+
+
+def test_migration_chain_is_0001_then_0002() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0001"
-    revision = script.get_revision("0001")
-    assert revision is not None
-    assert revision.down_revision is None
+    assert script.get_current_head() == "0002"
+    initial = script.get_revision("0001")
+    assert initial is not None
+    assert initial.down_revision is None
+    hardening = script.get_revision("0002")
+    assert hardening is not None
+    assert hardening.down_revision == "0001"
