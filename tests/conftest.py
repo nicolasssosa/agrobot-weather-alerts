@@ -155,6 +155,10 @@ def make_field(db_session: AsyncSession, make_user: MakeUser) -> MakeField:
     return _make
 
 
+#: Corrida fija por defecto de los pronósticos de test: nunca el reloj real (S11).
+FIXED_ISSUED_AT = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+
+
 @pytest.fixture
 def make_forecast(db_session: AsyncSession) -> MakeForecast:
     async def _make(
@@ -164,6 +168,7 @@ def make_forecast(db_session: AsyncSession) -> MakeForecast:
         event_type: EventType,
         probability: int,
         source: str = "mock",
+        issued_at: datetime | None = None,
     ) -> WeatherForecast:
         forecast = WeatherForecast(
             field_id=field.id,
@@ -171,6 +176,7 @@ def make_forecast(db_session: AsyncSession) -> MakeForecast:
             event_type=event_type,
             probability=probability,
             source=source,
+            issued_at=issued_at if issued_at is not None else FIXED_ISSUED_AT,
             fetched_at=datetime.now(UTC),
         )
         db_session.add(forecast)

@@ -174,6 +174,9 @@ Constraints / índices:
 - `weather_forecasts.issued_at TIMESTAMPTZ`: se agrega nullable, se completa con `fetched_at` para
   las filas existentes y se pasa a `NOT NULL`.
 - `downgrade()`: elimina la columna.
+- En producción con tablas grandes: backfill por lotes de ids con commits intermedios y `NOT NULL`
+  vía `CHECK (issued_at IS NOT NULL) NOT VALID` → `VALIDATE CONSTRAINT` → `SET NOT NULL`, para no
+  bloquear la tabla (con el volumen del challenge la versión directa tarda segundos).
 
 ## idempotency_keys (S10, migración 0004)
 

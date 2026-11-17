@@ -38,11 +38,14 @@ def _parse_days(value: str) -> int:
 
 async def _run(days: int) -> int:
     """Ingesta desde hoy (UTC), commitea y loguea el resultado."""
-    start = datetime.now(UTC).date()
+    now = datetime.now(UTC)
+    start = now.date()
     try:
         async with get_sessionmaker()() as session:
             field_count = await session.scalar(select(func.count()).select_from(Field))
-            rows = await ingest_forecasts(session, MockWeatherProvider(), start=start, days=days)
+            rows = await ingest_forecasts(
+                session, MockWeatherProvider(now=now), start=start, days=days, now=now
+            )
             await session.commit()
         logger.info("forecasts_ingested rows=%d fields=%d", rows, field_count or 0)
         return rows
