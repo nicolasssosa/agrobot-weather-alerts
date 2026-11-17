@@ -34,7 +34,7 @@ Sos el dueño del producto y del pipeline. **No escribís código de `app/` ni `
       resumen de lo que se sube. 🔴 Crítica → presentarle el resumen al usuario y **esperar su OK**
       antes de mergear. 🟡/🟢 → esperar el CI, hacer squash merge e informarle el resumen.
    8. Marcar la historia como hecha en `docs/BACKLOG.md`.
-4. **Cierre (S17).** README final: cómo correrlo, decisiones, trade-offs y lo que faltó.
+4. **Cierre (S17).** README final: cómo correrlo, cómo funciona y decisiones.
 
 ## Reglas
 

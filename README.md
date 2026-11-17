@@ -45,9 +45,6 @@ pytest · uv · Docker · GitHub Actions.
 - [Configuración](#configuración)
 - [Estructura del repo](#estructura-del-repo)
 - [Decisiones principales](#decisiones-principales)
-- [Trade-offs](#trade-offs)
-- [Limitaciones conocidas](#limitaciones-conocidas)
-- [Próximos pasos](#próximos-pasos)
 - [CI, GitHub Pages y proceso](#ci-github-pages-y-proceso)
 - [Documentación](#documentación)
 
@@ -557,61 +554,6 @@ El detalle y las alternativas descartadas están en
 réplicas de API no deben ser N evaluadores), un deploy de la API no corta envíos, y Postgres ya da
 cola (`SKIP LOCKED`), exclusión (advisory locks) e idempotencia (`ON CONFLICT`) sin sumar Redis ni
 Celery.
-
----
-
-## Trade-offs
-
-| Elegimos | En lugar de | Ganamos | Pagamos |
-|----------|-------------|---------|---------|
-| Postgres como cola | Redis / RabbitMQ / Celery | Una sola pieza de infra; encolar y cambiar estado en la misma transacción | Throughput acotado por la base; polling cada N segundos en vez de push |
-| Evaluación set-based en SQL | Loop en Python por alerta | Escala con el tamaño de la base, no con round-trips | SQL más complejo; por eso existe la función pura de referencia y los tests de equivalencia |
-| Un evaluador a la vez (advisory lock) | Evaluación particionada entre réplicas | Sin episodios duplicados ni carreras con los PATCH | La evaluación no escala horizontalmente (el despacho sí) |
-| At-least-once | Exactly-once | Simple y sin estado en el proveedor | Un duplicado posible si el proceso muere entre enviar y registrar |
-| Digest por usuario | Un mensaje por notificación | Menos ruido en WhatsApp, menos costo por mensaje | Un fallo de envío afecta a todo el grupo (cada notificación conserva su propio contador) |
-| Sin bypass del silencio para alertas urgentes | Dejar pasar las críticas | Regla simple y predecible para el usuario | Una helada inminente puede llegar al terminar el silencio |
-| Pronóstico por campo | Grilla de ubicaciones compartida | Modelo simple, sin geoespacial | Pronósticos duplicados para campos vecinos |
-| Auth simulada por header | Auth real | Foco en el dominio | No apto para exponer públicamente tal cual |
-
----
-
-## Limitaciones conocidas
-
-Hallazgos `minor`/`nit` de las reviews que se aceptaron sin corregir (todos con impacto acotado):
-
-- **Entrega at-least-once:** si el worker muere después de enviar y antes de registrar el
-  resultado, la notificación se reenvía al vencer el lease.
-- **Pausa durante una evaluación en curso:** una corrida que ya tomó su snapshot puede generar el
-  aviso de una alerta recién pausada; la re-validación al enviar lo cancela si el dispatcher lo ve
-  pausado.
-- **DELETE concurrente con el evaluador:** puede abortar ese ciclo de evaluación por FK; el
-  siguiente ciclo lo corrige solo.
-- **Dos PATCH simultáneos sobre la misma alerta** pueden perder un re-armado (el re-aviso llega
-  recién cuando el pronóstico baja del margen) o hacer uno de más.
-- **Si el rollback tras `evaluation_failed` también falla** (conexión caída), ese ciclo no despacha;
-  el siguiente sí.
-- **Seed:** reutiliza un usuario existente con el teléfono demo y no es seguro con dos corridas
-  concurrentes (script de demo one-shot).
-- **Sin retención:** `weather_forecasts`, `alert_day_states`, `notifications` e `idempotency_keys`
-  crecen sin purga (los índices para purgar ya existen).
-
----
-
-## Próximos pasos
-
-| Prioridad | Qué | Por qué |
-|-----------|-----|---------|
-| Alta | Adaptador WhatsApp (Cloud API / BSP) implementando `Notifier`, con `notification_id` como clave de idempotencia | Es el canal real; con la clave, la entrega pasa a ser efectivamente exactly-once |
-| Alta | Auth real (identidad del gateway de WhatsApp o JWT) y sacar el signup público | `POST /users` público permite enumerar teléfonos vía 409 |
-| Alta | Rate limiting por usuario e IP | Protección básica de la API |
-| Media | Job de retención (pronósticos y estados de días pasados, claves vencidas, historial viejo) | Tamaño de la base acotado |
-| Media | Métricas (Prometheus/OpenTelemetry): duración del ciclo, cola pendiente, tasa de `failed`, edad del pronóstico más fresco | Hoy la observabilidad son logs `key=value` y `/health` |
-| Media | Particionar la evaluación por rango de campos | Escalar la evaluación horizontalmente |
-| Media | Tope de rango en `GET /fields/{id}/forecasts` | Consultas acotadas |
-| Baja | Grilla de ubicaciones compartida para pronósticos | Evitar duplicados entre campos vecinos |
-| Baja | Enmascarado de teléfonos genérico (cualquier secuencia de ≥ 8 dígitos) y HMAC en los logs de idempotencia | Hoy está optimizado para números argentinos |
-| Baja | Excepción del silencio para alertas críticas (opt-in del usuario) | Hoy el silencio no tiene excepciones |
-| Baja | Deploy (contenedores en ECS/Cloud Run + Postgres administrado, migraciones como job previo) | Alcance actual: solo CI |
 
 ---
 
