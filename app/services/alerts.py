@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import ConflictError, NotFoundError
-from app.models import Alert, EventType, Field, Notification, NotificationStatus
+from app.jobs.evaluator import EVALUATOR_LOCK_KEY
+from app.models import Alert, AlertDayState, EventType, Field, Notification, NotificationStatus
 from app.schemas.alert import AlertCreate, AlertUpdate
 from app.schemas.common import BIGINT_MAX
 from app.services._db_errors import is_unique_violation
@@ -119,6 +120,48 @@ async def get_alert(session: AsyncSession, user_id: int, alert_id: int) -> Alert
     return alert
 
 
+def _requires_rearm(alert: Alert, changes: dict[str, object]) -> bool:
+    """¿El PATCH re-evalúa la alerta desde cero? (docs/JOBS.md §Episodios, S12b).
+
+    Solo si el `threshold` cambia a otro valor o si `is_active` pasa de `false` a `true`.
+    Pausar (o mandar el mismo umbral / `is_active` que ya era `true`) no toca el estado.
+    """
+    threshold_changed = "threshold" in changes and changes["threshold"] != alert.threshold
+    reactivated = changes.get("is_active") is True and not alert.is_active
+    return threshold_changed or reactivated
+
+
+async def _rearm_alert(session: AsyncSession, alert_id: int) -> None:
+    """Re-arma los días de la alerta y cancela sus notificaciones `pending` no arrendadas.
+
+    En la misma transacción del UPDATE de la alerta y en este orden (JOBS.md §Episodios):
+    `alert_day_states.armed = true` (= `reset` en `app/jobs/episodes.py`) y, después,
+    `pending -> cancelled` con `last_error = 'alert_reset'`. Como en el DELETE de S9, las
+    arrendadas (`next_attempt_at` en el futuro) no se tocan: el dispatcher registra su
+    resultado real.
+    """
+    await session.execute(
+        update(AlertDayState)
+        .where(AlertDayState.alert_id == alert_id)
+        .values(armed=True, updated_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
+    await session.execute(
+        update(Notification)
+        .where(
+            Notification.alert_id == alert_id,
+            Notification.status == NotificationStatus.PENDING,
+            Notification.next_attempt_at <= func.now(),
+        )
+        .values(
+            status=NotificationStatus.CANCELLED,
+            last_error="alert_reset",
+            updated_at=func.now(),
+        )
+        .execution_options(synchronize_session=False)
+    )
+
+
 async def update_alert(
     session: AsyncSession, user_id: int, alert_id: int, data: AlertUpdate
 ) -> Alert:
@@ -129,15 +172,34 @@ async def update_alert(
     UPDATE afecta 0 filas y se responde 404 (nunca se modifica una alerta ya borrada).
     Cambiar el `threshold` a uno que ya usa otra alerta viva del mismo (campo, evento)
     viola el índice único parcial -> 409.
+
+    Si el PATCH cambia el umbral o reactiva la alerta (`is_active` false -> true), sus días
+    se re-arman y sus notificaciones `pending` no arrendadas pasan a `cancelled`
+    (`alert_reset`), en la misma transacción (S12b, D1). El próximo ciclo re-avisa los días
+    que siguen arriba del umbral vigente.
+
+    Antes de leer la alerta toma `pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)`
+    (S12b SEC-1/CR-1): el PATCH espera a que termine una evaluación en curso y el evaluador
+    (lock exclusivo) espera a los PATCH abiertos, así ninguno ve el umbral de la otra
+    transacción ni re-arma después de que el otro canceló. Al ser compartido, dos PATCH
+    concurrentes no se bloquean entre sí. `AlertUpdate` solo expone `threshold` e
+    `is_active`, así que todo PATCH toma el lock.
     """
-    # Valida ownership y existencia (404) antes de escribir.
-    await get_alert(session, user_id, alert_id)
+    changes = data.model_dump(exclude_unset=True)
+    # Paso 0 de docs/JOBS.md §Episodios ("Re-armado por cambio de alerta"): el lock va
+    # **antes** de leer/actualizar la alerta, para que snapshot, re-armado y cancelación
+    # sean atómicos respecto de la evaluación.
+    await session.execute(select(func.pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)))
+    # Valida ownership y existencia (404) antes de escribir; trae los valores previos que
+    # deciden si corresponde re-armar.
+    current = await get_alert(session, user_id, alert_id)
+    rearm = _requires_rearm(current, changes)
     try:
         updated = (
             await session.execute(
                 update(Alert)
                 .where(Alert.id == alert_id, Alert.deleted_at.is_(None))
-                .values(**data.model_dump(exclude_unset=True))
+                .values(**changes)
                 .returning(Alert)
                 .execution_options(synchronize_session=False, populate_existing=True)
             )
@@ -145,6 +207,8 @@ async def update_alert(
         if updated is None:
             await session.rollback()
             raise NotFoundError("Alert not found")
+        if rearm:
+            await _rearm_alert(session, alert_id)
         await session.commit()
     except IntegrityError as exc:
         await session.rollback()

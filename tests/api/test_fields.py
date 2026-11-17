@@ -692,6 +692,7 @@ async def test_a_legacy_alias_accepted_by_the_api_is_usable_by_the_evaluator(
         horizon_days=7,
         max_forecast_age_hours=24,
         future_tolerance_minutes=60,
+        rearm_margin=10,
     )
 
     assert created == 1

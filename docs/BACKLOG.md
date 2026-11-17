@@ -118,16 +118,28 @@ Archivos: `app/schemas/common.py`, `app/api/routers/alerts.py`, `app/api/routers
 - [x] `offset` acotado a 0..10000 (`offset=10001` → 422).
 - [x] Los filtros `field_id`/`alert_id` siguen rechazando valores fuera de BIGINT con 422, sin publicar `maximum` en el schema OpenAPI (ningún parámetro de la API publica un `maximum` mayor a 10000).
 
-## S12b — Re-aviso por episodio · D1
-- [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa.
-- [ ] **Reactivar** una alerta (`is_active` false → true) también re-evalúa (QA-1 de S9).
-- [ ] Sigue siendo set-based en SQL; la regla de transición se documenta y se testea también como función pura de referencia (tests de equivalencia).
+## S12b — Re-aviso por episodio · RF-08, D1
+Archivos: `migrations/versions/20261117_0008_alert_episodes.py` (nuevo), `app/models/alert_day_state.py`
+(nuevo), `app/models/__init__.py`, `app/models/notification.py`, `app/jobs/episodes.py` (nuevo),
+`app/jobs/evaluator.py`, `app/jobs/worker.py`, `app/core/config.py` (solo `rearm_margin`),
+`.env.example`, `app/services/alerts.py`, `app/schemas/notification.py`, `docs/openapi.json`, tests.
+Contrato: DATA_MODEL.md §alert_day_states y §Migración 0008, JOBS.md §Evaluador y §Episodios,
+API.md §PATCH alerts y §notifications.
+- [ ] Migración 0008 (tabla `alert_day_states`, `notifications.episode`, UNIQUE nuevo, backfill, downgrade que falla con episodios > 1); `alembic check` limpio.
+- [ ] `app/jobs/episodes.py`: `DayState`, `INITIAL_STATE`, `rearm_level`, `step`, `reset` exactos según JOBS.md, con tests unitarios de cada fila de la tabla de transición y del borde de `rearm_level` (incluido el mínimo 1).
+- [ ] Evaluador por episodio: lock de evaluación (`pg_advisory_xact_lock`), re-armado y disparo set-based según JOBS.md; log `alerts_evaluated created=<n> rearmed=<m>`. Se mantienen ventana local, horizonte, frescura, zonas inválidas y los warnings de S11/S12a.
+- [ ] Re-aviso en cada cruce hacia arriba (episodio 2, 3…); sin re-aviso mientras sigue arriba ni dentro de la banda de histéresis; re-ejecutar el ciclo no duplica.
+- [ ] `REARM_MARGIN` (`Settings.rearm_margin`, default 10, 0..99) en config, `.env.example` y pasado por el worker.
+- [ ] PATCH que cambia el umbral o **reactiva** (`is_active` false → true; QA-1 de S9) re-arma y cancela las `pending` no arrendadas con `alert_reset`; el siguiente ciclo re-avisa. Un PATCH sin esos cambios no re-arma ni cancela.
+- [ ] Tests de equivalencia: secuencias determinísticas (semilla fija) de probabilidades por ciclo, con cambios de umbral y pausa/reactivación intercalados, corridas con el evaluador SQL y con `step`/`reset`: mismas notificaciones (día, episodio) y mismo estado final.
+- [ ] Test de concurrencia: dos evaluaciones en conexiones separadas sobre los mismos datos no generan episodios duplicados.
+- [ ] `NotificationRead.episode` en la API y en `docs/openapi.json`.
 
 ## S13 — Envío agrupado por usuario + horario de silencio · D15
 - [ ] Un mensaje por usuario y ciclo con todas sus notificaciones; cada notificación conserva su estado individual. Horario de silencio configurable: se difiere el envío hasta que termine.
 
 ## S14 — Operación · D16
-- [ ] Advisory lock del evaluador (una réplica evalúa por vez); `statement_timeout`/`lock_timeout`; cuotas por usuario; notificaciones `failed` reintentables; job de retención (pronósticos pasados, claves de idempotencia vencidas); límite de tamaño de request y de cantidad de errores en el 422 (follow-ups S4).
+- [ ] `statement_timeout`/`lock_timeout`; cuotas por usuario; notificaciones `failed` reintentables; job de retención (pronósticos pasados, `alert_day_states` de días pasados, claves de idempotencia vencidas); límite de tamaño de request y de cantidad de errores en el 422 (follow-ups S4).
 
 ## S15 — Observabilidad
 - [ ] Logs JSON estructurados con `request_id`; métricas Prometheus (`/metrics`); `GET /health/live` y `/health/ready` (DB + heartbeat del worker).
@@ -190,3 +202,4 @@ Follow-ups:
 | S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | **S15** (logs) |
 | S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | S17 |
 | S16 CR-1 | minor | El primer deploy de Pages requiere Pages habilitado con source "GitHub Actions" (el `GITHUB_TOKEN` no puede habilitarlo) | paso único al hacer público el repo |
+| S12b CR-2 | nit | Tests de lock/carrera de S12b: si una regresión deja un PATCH colgado, el cleanup puede bloquearse en vez de fallar (agregar `statement_timeout` en el cleanup o cancelar la task) | S17 (S16 ya mergeada) |

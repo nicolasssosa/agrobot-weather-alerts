@@ -15,7 +15,14 @@ from sqlalchemy import CheckConstraint, text
 from sqlalchemy import inspect as sa_inspect
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Alert, Base, Field, Notification, User, WeatherForecast
+from app.models import (
+    Alert,
+    Base,
+    Field,
+    Notification,
+    User,
+    WeatherForecast,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -79,6 +86,17 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
         ("sent_at", "timestamp with time zone", "YES", None, None, None),
         ("created_at", "timestamp with time zone", "NO", None, None, None),
         ("updated_at", "timestamp with time zone", "NO", None, None, None),
+        # `0008` agrega la columna al final (ADD COLUMN): el orden físico es el de la migración.
+        ("episode", "integer", "NO", None, 32, 0),
+    ],
+    "alert_day_states": [
+        ("id", "bigint", "NO", None, 64, 0),
+        ("alert_id", "bigint", "NO", None, 64, 0),
+        ("forecast_date", "date", "NO", None, None, None),
+        ("episode", "integer", "NO", None, 32, 0),
+        ("armed", "boolean", "NO", None, None, None),
+        ("created_at", "timestamp with time zone", "NO", None, None, None),
+        ("updated_at", "timestamp with time zone", "NO", None, None, None),
     ],
     "idempotency_keys": [
         ("id", "bigint", "NO", None, 64, 0),
@@ -99,7 +117,9 @@ EXPECTED_UNIQUES: dict[str, set[frozenset[str]]] = {
     "weather_forecasts": {frozenset({"field_id", "forecast_date", "event_type"})},
     # La unicidad de alerts pasó a un índice único parcial en `0003` (no es un constraint).
     "alerts": set(),
-    "notifications": {frozenset({"alert_id", "forecast_date"})},
+    # `0008`: el episodio entra en la clave (un día puede avisarse varias veces).
+    "notifications": {frozenset({"alert_id", "forecast_date", "episode"})},
+    "alert_day_states": {frozenset({"alert_id", "forecast_date"})},
     # `0006`: solo `POST /alerts` guarda claves; `user_id` es NOT NULL y el UNIQUE ya no
     # necesita `NULLS NOT DISTINCT`.
     "idempotency_keys": {frozenset({"user_id", "scope", "key"})},
@@ -129,6 +149,13 @@ EXPECTED_FKS = {
         "c",
         ("alert_id",),
     ),
+    (
+        "alert_day_states",
+        "fk_alert_day_states_alert_id_alerts",
+        "alerts",
+        "c",
+        ("alert_id",),
+    ),
 }
 
 # Nombres generados por la naming convention (`ck_<tabla>_<name>`), ver docs/DATA_MODEL.md.
@@ -140,11 +167,13 @@ EXPECTED_CHECKS = {
     ("alerts", "ck_alerts_event_type"),
     ("alerts", "ck_alerts_threshold_range"),
     ("notifications", "ck_notifications_attempts_non_negative"),
+    ("notifications", "ck_notifications_episode_positive"),
     ("notifications", "ck_notifications_event_type"),
     ("notifications", "ck_notifications_last_error_length"),
     ("notifications", "ck_notifications_notification_status"),
     ("notifications", "ck_notifications_probability_range"),
     ("notifications", "ck_notifications_threshold_range"),
+    ("alert_day_states", "ck_alert_day_states_episode_positive"),
     ("users", "ck_users_phone_number_e164"),
 }
 
@@ -162,9 +191,13 @@ EXPECTED_INDEXES = {
     },
     "notifications": {
         "pk_notifications",
-        "uq_notifications_alert_id_forecast_date",
+        "uq_notifications_alert_id_forecast_date_episode",
         "ix_notifications_alert_id_created_at",
         "ix_notifications_pending_due",
+    },
+    "alert_day_states": {
+        "pk_alert_day_states",
+        "uq_alert_day_states_alert_id_forecast_date",
     },
     "idempotency_keys": {
         "pk_idempotency_keys",
@@ -215,6 +248,7 @@ async def test_primary_keys_are_bigint_identity_columns(db_session: AsyncSession
         )
     ).all()
     assert [tuple(row) for row in rows] == [
+        ("alert_day_states", "id", "bigint", "BY DEFAULT"),
         ("alerts", "id", "bigint", "BY DEFAULT"),
         ("fields", "id", "bigint", "BY DEFAULT"),
         ("idempotency_keys", "id", "bigint", "BY DEFAULT"),
@@ -332,7 +366,14 @@ async def test_required_column_defaults_match_data_model(db_session: AsyncSessio
     ).all()
     defaults = {(table, column): default for table, column, default in rows}
 
-    timestamped_tables = ["users", "fields", "weather_forecasts", "alerts", "notifications"]
+    timestamped_tables = [
+        "users",
+        "fields",
+        "weather_forecasts",
+        "alerts",
+        "notifications",
+        "alert_day_states",
+    ]
     for table in timestamped_tables:
         assert defaults[(table, "created_at")] == "now()"
         assert defaults[(table, "updated_at")] == "now()"
@@ -340,6 +381,7 @@ async def test_required_column_defaults_match_data_model(db_session: AsyncSessio
     assert defaults[("alerts", "is_active")] == "true"
     assert defaults[("fields", "timezone")].startswith("'America/Argentina/Buenos_Aires'")
     assert defaults[("notifications", "status")].startswith("'pending'")
+    assert defaults[("notifications", "episode")] == "1"
     assert defaults[("notifications", "attempts")] == "0"
     assert defaults[("notifications", "next_attempt_at")] == "now()"
     assert defaults[("notifications", "last_error")] is None
@@ -432,11 +474,11 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_through_0007() -> None:
+def test_migration_chain_is_0001_through_0008() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0007"
+    assert script.get_current_head() == "0008"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
@@ -458,3 +500,6 @@ def test_migration_chain_is_0001_through_0007() -> None:
     field_timezone = script.get_revision("0007")
     assert field_timezone is not None
     assert field_timezone.down_revision == "0006"
+    alert_episodes = script.get_revision("0008")
+    assert alert_episodes is not None
+    assert alert_episodes.down_revision == "0007"

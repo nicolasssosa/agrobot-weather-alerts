@@ -16,16 +16,50 @@ from sqlalchemy.pool import NullPool
 
 from app.core.db import get_session
 from app.core.errors import ConflictError
+from app.jobs.evaluator import evaluate_alerts
 from app.main import create_app
-from app.models import Alert, EventType, Field, Notification, NotificationStatus, User
+from app.models import (
+    Alert,
+    AlertDayState,
+    EventType,
+    Field,
+    Notification,
+    NotificationStatus,
+    User,
+)
 from app.schemas.alert import AlertCreate
 from app.schemas.common import BIGINT_MAX
 from app.services import alerts as alerts_service
 from app.services.alerts import create_alert
-from tests.conftest import TEST_DATABASE_URL, ApiClient, MakeAlert, MakeField, MakeUser, auth
+from tests.conftest import (
+    TEST_DATABASE_URL,
+    ApiClient,
+    MakeAlert,
+    MakeField,
+    MakeForecast,
+    MakeUser,
+    auth,
+)
 
 API = "/api/v1/alerts"
 OLD_UPDATED_AT = datetime(2020, 1, 1, tzinfo=UTC)
+TODAY = date(2026, 11, 16)
+NOW = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+REARM_MARGIN = 10
+#: Instante fijo "en el futuro": un lease vigente (nunca se lee el reloj real).
+LEASED_UNTIL = datetime(2099, 1, 1, tzinfo=UTC)
+
+
+async def _evaluate(session: AsyncSession) -> int:
+    """Corre el evaluador con `now` y ventana fijos (nunca el reloj real)."""
+    return await evaluate_alerts(
+        session,
+        now=NOW,
+        horizon_days=0,
+        max_forecast_age_hours=24,
+        future_tolerance_minutes=60,
+        rearm_margin=REARM_MARGIN,
+    )
 
 
 async def test_create_alert_returns_201_with_is_active_true(
@@ -595,6 +629,346 @@ async def test_patch_updates_updated_at(
     # `now()` es transaction_timestamp: en la misma transacción el valor nuevo coincide con
     # created_at. Lo que prueba el test es que el `onupdate` disparó y pisó el valor viejo.
     assert alert.updated_at > OLD_UPDATED_AT
+
+
+# --- Re-armado por PATCH (S12b, D1) ----------------------------------------
+
+
+async def _day_state(
+    session: AsyncSession, alert_id: int, forecast_date: date
+) -> AlertDayState | None:
+    return (
+        await session.execute(
+            select(AlertDayState).where(
+                AlertDayState.alert_id == alert_id,
+                AlertDayState.forecast_date == forecast_date,
+            )
+        )
+    ).scalar_one_or_none()
+
+
+async def test_patch_threshold_change_rearms_and_cancels_pending(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Cambiar el umbral re-arma los días y cancela las `pending` no arrendadas."""
+    user = await make_user()
+    alert = await make_alert(await make_field(user=user), event_type=EventType.FROST, threshold=70)
+    due_day, leased_day, sent_day = (
+        date(2026, 11, 20),
+        date(2026, 11, 21),
+        date(2026, 11, 22),
+    )
+    for day in (due_day, leased_day, sent_day):
+        db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=1, armed=False))
+    due = Notification(
+        alert_id=alert.id,
+        forecast_date=due_day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    leased = Notification(
+        alert_id=alert.id,
+        forecast_date=leased_day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+        next_attempt_at=LEASED_UNTIL,
+    )
+    sent = Notification(
+        alert_id=alert.id,
+        forecast_date=sent_day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+        status=NotificationStatus.SENT,
+        attempts=1,
+        sent_at=datetime(2026, 11, 16, 12, 0, tzinfo=UTC),
+    )
+    db_session.add_all([due, leased, sent])
+    await db_session.flush()
+
+    response = await client.patch(f"{API}/{alert.id}", json={"threshold": 80}, headers=auth(user))
+
+    assert response.status_code == 200
+    assert response.json()["threshold"] == 80
+    for day in (due_day, leased_day):
+        state = await _day_state(db_session, alert.id, day)
+        assert state is not None
+        assert (state.episode, state.armed) == (1, True)
+    await db_session.refresh(due)
+    await db_session.refresh(leased)
+    await db_session.refresh(sent)
+    assert due.status == NotificationStatus.CANCELLED
+    assert due.last_error == "alert_reset"
+    # Arrendada: el dispatcher registra su resultado real, no se cancela.
+    assert leased.status == NotificationStatus.PENDING
+    assert leased.last_error is None
+    assert sent.status == NotificationStatus.SENT
+
+
+async def test_patch_reactivation_rearms_and_cancels_pending(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """`is_active` false -> true re-arma y cancela las `pending` no arrendadas (QA-1 de S9)."""
+    user = await make_user()
+    alert = await make_alert(
+        await make_field(user=user),
+        event_type=EventType.FROST,
+        threshold=70,
+        is_active=False,
+    )
+    day = date(2026, 11, 20)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=2, armed=False))
+    pending = Notification(
+        alert_id=alert.id,
+        forecast_date=day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+
+    response = await client.patch(f"{API}/{alert.id}", json={"is_active": True}, headers=auth(user))
+
+    assert response.status_code == 200
+    assert response.json()["is_active"] is True
+    state = await _day_state(db_session, alert.id, day)
+    assert state is not None
+    assert (state.episode, state.armed) == (2, True)
+    await db_session.refresh(pending)
+    assert pending.status == NotificationStatus.CANCELLED
+    assert pending.last_error == "alert_reset"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"is_active": False},  # pausar no re-arma
+        {"is_active": True},  # ya estaba activa: no-op
+        {"threshold": 70},  # mismo umbral: no-op
+    ],
+)
+async def test_patch_that_does_not_rearm_keeps_the_state_and_pending(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    payload: dict[str, object],
+) -> None:
+    """Sin cambio de umbral ni reactivación, el estado y las pendientes no se tocan."""
+    user = await make_user()
+    alert = await make_alert(
+        await make_field(user=user),
+        event_type=EventType.FROST,
+        threshold=70,
+    )
+    day = date(2026, 11, 20)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=1, armed=False))
+    pending = Notification(
+        alert_id=alert.id,
+        forecast_date=day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+
+    response = await client.patch(f"{API}/{alert.id}", json=payload, headers=auth(user))
+
+    assert response.status_code == 200
+    state = await _day_state(db_session, alert.id, day)
+    assert state is not None
+    assert (state.episode, state.armed) == (1, False)
+    await db_session.refresh(pending)
+    assert pending.status == NotificationStatus.PENDING
+    assert pending.last_error is None
+
+
+async def test_a_threshold_change_renotifies_the_day_in_the_next_cycle(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """El PATCH re-arma y el ciclo siguiente crea el episodio 2 para el mismo día."""
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=75
+    )
+
+    assert await _evaluate(db_session) == 1
+
+    response = await client.patch(f"{API}/{alert.id}", json={"threshold": 80}, headers=auth(user))
+    assert response.status_code == 200
+
+    forecast.probability = 85
+    await db_session.flush()
+    created = await _evaluate(db_session)
+
+    assert created == 1
+    episodes = (
+        await db_session.execute(
+            select(Notification.episode, Notification.probability, Notification.threshold)
+            .where(Notification.alert_id == alert.id)
+            .order_by(Notification.episode)
+        )
+    ).all()
+    assert [tuple(row) for row in episodes] == [(1, 75, 70), (2, 85, 80)]
+
+
+async def test_a_reactivation_renotifies_the_day_in_the_next_cycle(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Reactivar por PATCH re-arma: el ciclo siguiente vuelve a avisar el mismo día (QA-1 S9)."""
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=80)
+    assert await _evaluate(db_session) == 1
+
+    assert (
+        await client.patch(f"{API}/{alert.id}", json={"is_active": False}, headers=auth(user))
+    ).status_code == 200
+    assert await _evaluate(db_session) == 0
+    assert (
+        await client.patch(f"{API}/{alert.id}", json={"is_active": True}, headers=auth(user))
+    ).status_code == 200
+
+    assert await _evaluate(db_session) == 1
+    episodes = (
+        (
+            await db_session.execute(
+                select(Notification.episode)
+                .where(Notification.alert_id == alert.id)
+                .order_by(Notification.episode)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert episodes == [1, 2]
+    # Re-ejecutar el ciclo no agrega nada.
+    assert await _evaluate(db_session) == 0
+
+
+async def test_patch_without_rearm_does_not_renotify_the_day(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Un PATCH con el mismo umbral no re-arma, así que el día no se re-avisa."""
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=90)
+    assert await _evaluate(db_session) == 1
+
+    # Mismo umbral: 200 sin re-armado.
+    assert (
+        await client.patch(f"{API}/{alert.id}", json={"threshold": 70}, headers=auth(user))
+    ).status_code == 200
+    assert await _evaluate(db_session) == 0
+
+
+async def test_patch_changing_the_threshold_and_pausing_at_once_rearms_and_cancels(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """El cambio de umbral basta para re-armar aunque el PATCH también pause la alerta.
+
+    `is_active` false no re-arma por sí solo, pero no cancela el efecto del umbral: es la
+    misma transacción y el orden documentado (estado -> notificaciones).
+    """
+    user = await make_user()
+    alert = await make_alert(await make_field(user=user), event_type=EventType.FROST, threshold=70)
+    day = date(2026, 11, 20)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=3, armed=False))
+    pending = Notification(
+        alert_id=alert.id,
+        forecast_date=day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+
+    response = await client.patch(
+        f"{API}/{alert.id}", json={"threshold": 80, "is_active": False}, headers=auth(user)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["threshold"] == 80
+    assert response.json()["is_active"] is False
+    state = await _day_state(db_session, alert.id, day)
+    assert state is not None
+    assert (state.episode, state.armed) == (3, True)
+    await db_session.refresh(pending)
+    assert pending.status == NotificationStatus.CANCELLED
+    assert pending.last_error == "alert_reset"
+
+
+async def test_patch_of_another_users_alert_does_not_rearm_or_cancel(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Ownership: un PATCH ajeno da 404 y no toca el estado ni las pendientes del dueño."""
+    owner = await make_user()
+    intruder = await make_user()
+    alert = await make_alert(await make_field(user=owner), event_type=EventType.FROST, threshold=70)
+    day = date(2026, 11, 20)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=1, armed=False))
+    pending = Notification(
+        alert_id=alert.id,
+        forecast_date=day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+
+    response = await client.patch(
+        f"{API}/{alert.id}", json={"threshold": 80}, headers=auth(intruder)
+    )
+
+    assert response.status_code == 404
+    state = await _day_state(db_session, alert.id, day)
+    assert state is not None
+    assert (state.episode, state.armed) == (1, False)
+    await db_session.refresh(pending)
+    assert pending.status == NotificationStatus.PENDING
+    assert pending.last_error is None
 
 
 @pytest.mark.parametrize(

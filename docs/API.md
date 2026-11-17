@@ -134,6 +134,12 @@ con un `model_validator`):
 ```
 `field_id` y `event_type` no son editables (crear otra alerta). 200 `AlertRead` | 404.
 
+**Re-evaluación desde cero (S12b, D1):** si el PATCH cambia el `threshold` a otro valor o reactiva
+la alerta (`is_active` de `false` a `true`), sus días se re-arman y sus notificaciones `pending` no
+arrendadas pasan a `cancelled` (`last_error = 'alert_reset'`, no expuesto). En el próximo ciclo el
+evaluador vuelve a avisar los días cuyo pronóstico esté arriba del umbral vigente (JOBS.md
+§Episodios). El response no cambia.
+
 ### `DELETE /api/v1/alerts/{alert_id}` → 204 sin body | 404
 **Borrado lógico e idempotente:** marca `deleted_at`; repetir el DELETE sobre una alerta propia ya
 borrada también devuelve 204. 404 solo si no existe o es de otro usuario. Las notificaciones
@@ -153,10 +159,12 @@ para un mensaje que salió.
 ### `GET /api/v1/notifications` → 200 `Page[NotificationRead]`
 Filtros opcionales: `status` (`pending|sent|failed|cancelled`), `alert_id`.
 ```json
-{"id": 10, "alert_id": 1, "forecast_date": "2026-11-18", "event_type": "frost",
+{"id": 10, "alert_id": 1, "forecast_date": "2026-11-18", "episode": 1, "event_type": "frost",
  "probability": 85, "threshold": 70, "status": "sent", "attempts": 1,
  "sent_at": "...", "created_at": "..."}
 ```
+`episode` (S12b): número de aviso de esa alerta para ese día (1 = primer cruce del umbral; 2 = el
+pronóstico bajó, volvió a subir y se avisó de nuevo).
 (`last_error` y `next_attempt_at` no se exponen: son internos.)
 
 ---

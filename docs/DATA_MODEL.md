@@ -11,6 +11,8 @@ users 1───N fields 1───N weather_forecasts
                │
                N
             alerts 1───N notifications
+               │
+               1───N alert_day_states
 ```
 
 ## Convenciones
@@ -152,6 +154,7 @@ Guarda un **snapshot** de los valores que dispararon la alerta (el forecast pued
 | event_type      | VARCHAR(32) | no   |           | snapshot, CHECK enum `event_type`                         |
 | probability     | SMALLINT    | no   |           | snapshot, CHECK 0..100 (name=`probability_range`)         |
 | threshold       | SMALLINT    | no   |           | snapshot del umbral al momento de disparar, CHECK 1..100 (name=`threshold_range`) |
+| episode         | INTEGER     | no   | 1         | número de episodio del (alerta, día) que la generó (S12b, D1). CHECK `episode >= 1` (name=`episode_positive`) |
 | status          | VARCHAR(16) | no   | 'pending' | CHECK enum `notification_status`                          |
 | attempts        | SMALLINT    | no   | 0         | CHECK `attempts >= 0` (name=`attempts_non_negative`)      |
 | last_error      | TEXT        | sí   |           | último error del notifier; CHECK `last_error IS NULL OR char_length(last_error) <= 1000` (name=`last_error_length`, migración `0002`) |
@@ -161,13 +164,50 @@ Guarda un **snapshot** de los valores que dispararon la alerta (el forecast pued
 | updated_at      | TIMESTAMPTZ | no   |           |                                                           |
 
 Constraints / índices:
-- `UNIQUE (alert_id, forecast_date)` → **idempotencia / deduplicación**: como máximo una
-  notificación por alerta por día pronosticado, aunque el job corra N veces o en N réplicas.
+- `UNIQUE (alert_id, forecast_date, episode)` (S12b, migración 0008) → **idempotencia /
+  deduplicación**: como máximo una notificación por alerta, día pronosticado y episodio, aunque el
+  job corra N veces o en N réplicas.
 - Índice parcial `ix_notifications_pending_due` en `(next_attempt_at) WHERE status = 'pending'`
   (cola del dispatcher; queda chico porque solo indexa pendientes).
 - Índice `ix_notifications_alert_id_created_at` en `(alert_id, created_at)` (listado por usuario).
-  El UNIQUE `(alert_id, forecast_date)` ya cubre búsquedas por `alert_id`, así que este es opcional;
-  incluirlo.
+  El UNIQUE `(alert_id, forecast_date, episode)` ya cubre búsquedas por `alert_id`, así que este es
+  opcional; incluirlo.
+
+## alert_day_states (S12b, D1)
+
+Estado de episodio por (alerta, día pronosticado). Lo escribe el evaluador y lo re-arma el service
+de alertas. **No hay fila = armada, episodio 0** (nunca disparó para ese día).
+
+| columna       | tipo        | null | default | notas                                                     |
+|---------------|-------------|------|---------|-----------------------------------------------------------|
+| id            | BIGINT      | no   | identity| PK                                                        |
+| alert_id      | BIGINT      | no   |         | FK → alerts.id ON DELETE CASCADE                          |
+| forecast_date | DATE        | no   |         | día pronosticado                                          |
+| episode       | INTEGER     | no   |         | último episodio disparado; CHECK `episode >= 1` (name=`episode_positive`) |
+| armed         | BOOLEAN     | no   |         | `false` = disparó y sigue arriba (no se repite); `true` = el próximo cruce hacia arriba dispara el episodio `episode + 1` |
+| created_at    | TIMESTAMPTZ | no   | now()   |                                                           |
+| updated_at    | TIMESTAMPTZ | no   | now()   |                                                           |
+
+Constraints / índices: `UNIQUE (alert_id, forecast_date)` (target del upsert del evaluador; cubre
+las búsquedas por `alert_id` del re-armado). Modelo: `app/models/alert_day_state.py`, clase
+`AlertDayState`.
+
+> Las filas de días pasados no se borran; la purga entra en el job de retención (S14).
+
+## Migración 0008 — episodios de notificación (S12b)
+
+- `revision = "0008"`, `down_revision = "0007"`.
+- Crea `alert_day_states` (tabla de arriba).
+- `notifications.episode INTEGER NOT NULL DEFAULT 1` + CHECK `episode_positive`; las filas
+  existentes quedan en episodio 1.
+- Drop `uq_notifications_alert_id_forecast_date`; create `UNIQUE (alert_id, forecast_date, episode)`
+  (nombre por naming convention: `uq_notifications_alert_id_forecast_date_episode`).
+- **Backfill:** una fila en `alert_day_states` por cada (alert_id, forecast_date) que ya tiene
+  notificaciones, con `episode = max(episode)` y `armed = false`. Así el despliegue no re-avisa días
+  ya notificados: se comportan como un episodio en curso.
+- `downgrade()`: si existe alguna notificación con `episode > 1`, falla con un mensaje claro (no
+  borra datos en silencio); si no, recrea el UNIQUE `(alert_id, forecast_date)`, elimina la columna
+  y la tabla.
 
 ## Migración 0007 — zona horaria por campo (S12a)
 

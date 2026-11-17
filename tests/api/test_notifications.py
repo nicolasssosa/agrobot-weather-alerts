@@ -26,6 +26,7 @@ async def _add_notification(
     forecast_date: date = FORECAST_DATE,
     status: NotificationStatus = NotificationStatus.PENDING,
     probability: int = 85,
+    episode: int = 1,
 ) -> Notification:
     notification = Notification(
         alert_id=alert.id,
@@ -33,6 +34,7 @@ async def _add_notification(
         event_type=alert.event_type,
         probability=probability,
         threshold=alert.threshold,
+        episode=episode,
         status=status,
         attempts=0,
         next_attempt_at=NEXT_ATTEMPT_AT,
@@ -260,6 +262,28 @@ async def test_orders_by_created_at_desc_then_id_desc(
     ]
 
 
+async def test_the_history_exposes_every_episode_of_the_same_day(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S12b: un día re-avisado aparece una vez por episodio, con su número (D1)."""
+    user = await make_user()
+    alert = await make_alert(await make_field(user), event_type=EventType.FROST)
+    await _add_notification(db_session, alert, episode=1)
+    await _add_notification(db_session, alert, episode=2)
+
+    response = await client.get(f"{API}?alert_id={alert.id}", headers=auth(user))
+
+    assert response.status_code == 200
+    assert [item["episode"] for item in response.json()["items"]] == [2, 1]
+    assert {item["forecast_date"] for item in response.json()["items"]} == {
+        FORECAST_DATE.isoformat()
+    }
+
+
 async def test_is_paginated(
     client: AsyncClient,
     db_session: AsyncSession,
@@ -386,6 +410,7 @@ async def test_read_exposes_only_the_documented_fields(
         "id",
         "alert_id",
         "forecast_date",
+        "episode",
         "event_type",
         "probability",
         "threshold",
@@ -395,6 +420,7 @@ async def test_read_exposes_only_the_documented_fields(
         "created_at",
     }
     assert item["id"] == notification.id
+    assert item["episode"] == 1
     assert item["event_type"] == "heat_wave"
     assert item["status"] == "failed"
     assert item["sent_at"] is None

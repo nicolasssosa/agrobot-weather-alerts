@@ -76,3 +76,25 @@ def test_alert_horizon_days_rejects_out_of_range_values(value: object) -> None:
 def test_alert_horizon_days_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("ALERT_HORIZON_DAYS", "0")
     assert Settings().alert_horizon_days == 0
+
+
+def test_rearm_margin_defaults_to_10() -> None:
+    """D1: margen de histéresis por defecto de 10 puntos (S12b)."""
+    assert Settings().rearm_margin == 10
+
+
+@pytest.mark.parametrize("value", [0, 1, 10, 98, 99])
+def test_rearm_margin_accepts_the_documented_range(value: int) -> None:
+    """0..99 inclusive: 0 deja la banda vacía y 99 es el máximo (siempre queda nivel 1)."""
+    assert Settings(rearm_margin=value).rearm_margin == value
+
+
+@pytest.mark.parametrize("value", [-1, 100, 1000, "abc", "10.5"])
+def test_rearm_margin_rejects_out_of_range_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(rearm_margin=value)  # type: ignore[arg-type]
+
+
+def test_rearm_margin_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("REARM_MARGIN", "25")
+    assert Settings().rearm_margin == 25

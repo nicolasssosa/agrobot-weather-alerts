@@ -23,6 +23,7 @@ from tests.conftest import MakeAlert, MakeField, MakeForecast, MakeUser
 
 MAX_AGE_HOURS = 24
 FUTURE_TOLERANCE_MINUTES = 60
+REARM_MARGIN = 10
 
 
 def _at(year: int, month: int, day: int, hour: int, minute: int = 0) -> datetime:
@@ -44,6 +45,7 @@ def _evaluate(
         horizon_days=horizon_days,
         max_forecast_age_hours=max_forecast_age_hours,
         future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+        rearm_margin=REARM_MARGIN,
     )
 
 

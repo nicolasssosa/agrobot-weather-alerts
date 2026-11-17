@@ -82,6 +82,7 @@ async def _make_notification(
     sent_at: datetime | None = None,
     last_error: str | None = None,
     probability: int = 85,
+    episode: int = 1,
     forecast_probability: int | None = None,
     forecast_issued_at: datetime | None = NOW,
 ) -> Notification:
@@ -121,6 +122,7 @@ async def _make_notification(
         event_type=alert.event_type,
         probability=probability,
         threshold=alert.threshold,
+        episode=episode,
         status=status,
         attempts=attempts,
         next_attempt_at=next_attempt_at,
@@ -1294,6 +1296,59 @@ async def test_the_current_forecast_probability_below_the_threshold_cancels(
     assert notification.status == NotificationStatus.CANCELLED
     assert notification.last_error == "below_current_threshold"
     assert notification.sent_at is None
+
+
+async def test_a_second_episode_below_the_current_threshold_is_cancelled(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S12b: el episodio no cambia la re-validación del claim.
+
+    Una notificación de episodio 2 se cancela igual que la 1 si el pronóstico vigente (o el
+    umbral actual) ya no corresponde, y una de episodio 2 que sigue arriba se envía.
+    """
+    alert = await make_alert(await make_field(), threshold=70)
+    cancelled = await _make_notification(
+        db_session, alert, probability=95, episode=2, forecast_probability=60
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert notifier.calls == 0
+    await db_session.refresh(cancelled)
+    assert cancelled.status == NotificationStatus.CANCELLED
+    assert cancelled.episode == 2
+    assert cancelled.last_error == "below_current_threshold"
+
+
+async def test_a_second_episode_above_the_current_threshold_is_sent(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S12b: un aviso del episodio 2 con el pronóstico vigente sobre el umbral se envía."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session,
+        alert,
+        probability=95,
+        episode=2,
+        forecast_probability=85,
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert [message.notification_id for message in notifier.sent] == [notification.id]
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert notification.episode == 2
 
 
 async def test_the_current_forecast_probability_above_the_threshold_is_sent(

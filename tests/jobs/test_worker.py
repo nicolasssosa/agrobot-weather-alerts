@@ -358,7 +358,13 @@ async def test_run_cycle_does_not_dispatch_when_evaluate_alerts_raises(
     dispatched: list[int] = []
 
     async def failing_evaluate(  # type: ignore[no-untyped-def]
-        session, *, now, horizon_days, max_forecast_age_hours, future_tolerance_minutes
+        session,
+        *,
+        now,
+        horizon_days,
+        max_forecast_age_hours,
+        future_tolerance_minutes,
+        rearm_margin,
     ):
         raise RuntimeError("evaluation down")
 
@@ -875,6 +881,7 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
         max_forecast_age_hours=6,
         forecast_future_tolerance_minutes=30,
         alert_horizon_days=3,
+        rearm_margin=15,
     )
 
     await run_cycle(
@@ -890,6 +897,7 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
         "horizon_days": 3,
         "max_forecast_age_hours": 6,
         "future_tolerance_minutes": 30,
+        "rearm_margin": 15,
     }
 
 

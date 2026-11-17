@@ -7,7 +7,7 @@ cualquier test; acá se verifica que el esquema migrado y los modelos no diverge
 import asyncio
 import os
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -140,6 +140,188 @@ def test_migration_0007_upgrade_and_downgrade_are_clean() -> None:
 
     command.downgrade(cfg, "0006")
     command.upgrade(cfg, "head")
+
+
+def test_migration_0008_upgrade_and_downgrade_are_clean() -> None:
+    """La migración `0008` se revierte y se vuelve a aplicar sin errores (S12b)."""
+    cfg = _config()
+
+    command.downgrade(cfg, "0007")
+    command.upgrade(cfg, "head")
+
+
+def test_migration_0008_backfills_day_states_for_already_notified_days() -> None:
+    """`0008`: un día ya notificado queda desarmado en episodio 1 (no se re-avisa)."""
+    cfg = _config()
+    phone_number = f"+54{uuid.uuid4().int % 10**12:012d}"
+    first_day = date(2026, 11, 20)
+    second_day = date(2026, 11, 21)
+    cancelled_day = date(2026, 11, 22)
+
+    async def _insert_legacy_rows() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                user_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO users (phone_number, name)"
+                            " VALUES (:phone, 'Episodes backfill probe') RETURNING id"
+                        ),
+                        {"phone": phone_number},
+                    )
+                ).scalar_one()
+                field_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO fields (user_id, name, latitude, longitude)"
+                            " VALUES (:user_id, 'Probe', -34.6, -58.4) RETURNING id"
+                        ),
+                        {"user_id": user_id},
+                    )
+                ).scalar_one()
+                alert_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO alerts (field_id, event_type, threshold)"
+                            " VALUES (:field_id, 'frost', 70) RETURNING id"
+                        ),
+                        {"field_id": field_id},
+                    )
+                ).scalar_one()
+                # Antes de `0008` la clave es (alert_id, forecast_date) y no hay `episode`.
+                await conn.execute(
+                    text(
+                        "INSERT INTO notifications"
+                        " (alert_id, forecast_date, event_type, probability, threshold, status)"
+                        " VALUES (:alert_id, :first_day, 'frost', 90, 70, 'pending'),"
+                        "        (:alert_id, :second_day, 'frost', 85, 70, 'pending'),"
+                        "        (:alert_id, :cancelled_day, 'frost', 80, 70, 'cancelled')"
+                    ),
+                    {
+                        "alert_id": alert_id,
+                        "first_day": first_day,
+                        "second_day": second_day,
+                        "cancelled_day": cancelled_day,
+                    },
+                )
+        finally:
+            await engine.dispose()
+
+    async def _day_states() -> list[tuple[date, int, bool]]:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.connect() as conn:
+                rows = (
+                    await conn.execute(
+                        text(
+                            "SELECT s.forecast_date, s.episode, s.armed"
+                            " FROM alert_day_states s"
+                            " JOIN alerts a ON a.id = s.alert_id"
+                            " JOIN fields f ON f.id = a.field_id"
+                            " JOIN users u ON u.id = f.user_id"
+                            " WHERE u.phone_number = :phone"
+                            " ORDER BY s.forecast_date"
+                        ),
+                        {"phone": phone_number},
+                    )
+                ).all()
+                return [(row.forecast_date, row.episode, row.armed) for row in rows]
+        finally:
+            await engine.dispose()
+
+    async def _cleanup() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM users WHERE phone_number = :phone"),
+                    {"phone": phone_number},
+                )
+        finally:
+            await engine.dispose()
+
+    command.downgrade(cfg, "0007")
+    try:
+        asyncio.run(_insert_legacy_rows())
+        command.upgrade(cfg, "head")
+        assert asyncio.run(_day_states()) == [
+            (first_day, 1, False),
+            (second_day, 1, False),
+            # El backfill cubre también las notificaciones canceladas: el día existió.
+            (cancelled_day, 1, False),
+        ]
+    finally:
+        # La base tiene que quedar en `head` para el resto de la suite.
+        command.upgrade(cfg, "head")
+        asyncio.run(_cleanup())
+
+
+def test_migration_0008_downgrade_refuses_to_discard_renotified_days() -> None:
+    """Con alguna notificación de episodio > 1, el downgrade falla con un mensaje claro."""
+    cfg = _config()
+    phone_number = f"+54{uuid.uuid4().int % 10**12:012d}"
+
+    async def _insert_episode_two() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                user_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO users (phone_number, name)"
+                            " VALUES (:phone, 'Episodes downgrade probe') RETURNING id"
+                        ),
+                        {"phone": phone_number},
+                    )
+                ).scalar_one()
+                field_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO fields (user_id, name, latitude, longitude)"
+                            " VALUES (:user_id, 'Probe', -34.6, -58.4) RETURNING id"
+                        ),
+                        {"user_id": user_id},
+                    )
+                ).scalar_one()
+                alert_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO alerts (field_id, event_type, threshold)"
+                            " VALUES (:field_id, 'frost', 70) RETURNING id"
+                        ),
+                        {"field_id": field_id},
+                    )
+                ).scalar_one()
+                await conn.execute(
+                    text(
+                        "INSERT INTO notifications"
+                        " (alert_id, forecast_date, event_type, probability, threshold, episode)"
+                        " VALUES (:alert_id, DATE '2026-11-20', 'frost', 90, 70, 1),"
+                        "        (:alert_id, DATE '2026-11-20', 'frost', 95, 70, 2)"
+                    ),
+                    {"alert_id": alert_id},
+                )
+        finally:
+            await engine.dispose()
+
+    async def _cleanup() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM users WHERE phone_number = :phone"),
+                    {"phone": phone_number},
+                )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(_insert_episode_two())
+    try:
+        with pytest.raises(RuntimeError, match="Downgrade de la migración 0008 bloqueado"):
+            command.downgrade(cfg, "0007")
+    finally:
+        asyncio.run(_cleanup())
 
 
 def test_migration_0007_backfills_timezone_for_existing_rows_and_downgrade_drops_it() -> None:

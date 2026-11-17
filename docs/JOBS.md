@@ -19,11 +19,13 @@ idempotentes y seguros con varias réplicas del worker en paralelo.
 ```python
 async def evaluate_alerts(
     session: AsyncSession, *, now: datetime, horizon_days: int, max_forecast_age_hours: int,
-    future_tolerance_minutes: int,
+    future_tolerance_minutes: int, rearm_margin: int,
 ) -> int
 ```
 
-Una sola sentencia set-based (nada de traer filas a Python y loopear):
+Set-based (nada de traer filas a Python y loopear). Desde S12b (D1) la evaluación es **por
+episodio**; ver §Episodios más abajo. El `SELECT` de candidatos (alerta × pronóstico en la ventana)
+es el de siempre; lo que cambia es qué se hace con él. Antes de S12b era esta sentencia:
 
 ```sql
 INSERT INTO notifications
@@ -58,13 +60,114 @@ puede calcular `AT TIME ZONE` (que lanza error con una zona desconocida) antes d
 El `CASE` sí garantiza el orden por fila: con una zona desconocida da `NULL`, la comparación da
 falso y el resto de los campos se evalúa igual. Una zona desconocida nunca aborta el ciclo.
 
-Implementación: con SQLAlchemy Core
-(`sqlalchemy.dialects.postgresql.insert(Notification).from_select([...], select_stmt)
-.on_conflict_do_nothing(index_elements=["alert_id", "forecast_date"]).returning(Notification.id)`),
+Implementación: con SQLAlchemy Core (`select()`, `update()`, `postgresql.insert`, CTEs).
 Contar **sin materializar** las filas: envolver el insert en un CTE y contar en SQL
 (`WITH ins AS (INSERT … RETURNING 1) SELECT count(*) FROM ins`; en SQLAlchemy
-`select(func.count()).select_from(insert_stmt.cte("ins"))`). Sigue siendo una sola sentencia. Nunca
-`len(result.all())`: con un backlog grande trae cientos de MB a memoria (S5 CR-2). **No commitea.** Loguear `alerts_evaluated created=<n>`.
+`select(func.count()).select_from(insert_stmt.cte("ins"))`). Nunca `len(result.all())`: con un
+backlog grande trae cientos de MB a memoria (S5 CR-2). **No commitea.** Loguear
+`alerts_evaluated created=<n> rearmed=<m>`.
+
+### Episodios (S12b, D1)
+
+Estado por (alerta, día) en `alert_day_states` (DATA_MODEL.md). Sin fila = armada, episodio 0.
+
+**Regla de transición** (una por ciclo y por (alerta, día), con la probabilidad del pronóstico
+vigente y el umbral actual de la alerta):
+
+| estado | condición | nuevo estado | ¿notifica? |
+|--------|-----------|--------------|------------|
+| armada, episodio `e` | `probability >= threshold` | disparada, episodio `e + 1` | **sí** (episodio `e + 1`) |
+| disparada, episodio `e` | `probability < rearm_level` | armada, episodio `e` | no |
+| cualquier otro caso | — | sin cambios | no |
+
+`rearm_level = max(threshold - rearm_margin, 1)` (`REARM_MARGIN`, default 10, rango 0..99). Entre
+`rearm_level` y `threshold - 1` está la banda de histéresis: una probabilidad que oscila ahí no
+re-arma ni dispara. Con umbral 70 y margen 10: dispara en ≥ 70, re-arma en < 60.
+
+**Función pura de referencia** — `app/jobs/episodes.py` (la usan los tests de equivalencia):
+
+```python
+@dataclass(frozen=True, slots=True)
+class DayState:
+    episode: int  # 0 = nunca disparó
+    armed: bool
+
+
+INITIAL_STATE = DayState(episode=0, armed=True)
+
+
+def rearm_level(threshold: int, rearm_margin: int) -> int: ...
+def step(
+    state: DayState, *, probability: int, threshold: int, rearm_margin: int
+) -> tuple[DayState, bool]:
+    ...
+    # (nuevo estado, ¿notifica?) según la tabla de arriba
+
+
+def reset(state: DayState) -> DayState:
+    ...
+    # re-armado por cambio de umbral o reactivación: DayState(state.episode, armed=True)
+```
+
+**Algoritmo SQL**, todo en la transacción del llamador:
+
+0. **Lock de evaluación:** `SELECT pg_advisory_xact_lock(:key)` con una constante del módulo
+   (`EVALUATOR_LOCK_KEY`). Una sola réplica evalúa por vez; la otra espera y, como sus sentencias
+   siguientes toman un snapshot nuevo, ve lo que la primera commiteó. Sin el lock, dos réplicas con
+   snapshots distintos podrían re-armar y volver a disparar el mismo día (episodio duplicado). Se
+   libera solo al terminar la transacción (commit/rollback del worker).
+1. **Re-armado** (una sentencia): `UPDATE alert_day_states s SET armed = true, updated_at = now()
+   FROM (candidatos) c WHERE s.alert_id = c.alert_id AND s.forecast_date = c.forecast_date
+   AND NOT s.armed AND c.probability < GREATEST(c.threshold - :rearm_margin, 1)`. `candidatos` =
+   el mismo `SELECT` de alerta × pronóstico de arriba (alertas activas, no borradas, zona conocida,
+   ventana local, frescura) **sin** la condición `probability >= threshold`. Cuenta → `rearmed`.
+2. **Disparo** (una sentencia, CTEs encadenados):
+   ```sql
+   WITH fired AS (
+     INSERT INTO alert_day_states (alert_id, forecast_date, episode, armed)
+     SELECT c.alert_id, c.forecast_date, 1, false FROM candidatos c
+     WHERE c.probability >= c.threshold
+     ON CONFLICT (alert_id, forecast_date)
+       DO UPDATE SET episode = alert_day_states.episode + 1, armed = false, updated_at = now()
+       WHERE alert_day_states.armed
+     RETURNING alert_id, forecast_date, episode
+   ), ins AS (
+     INSERT INTO notifications
+       (alert_id, forecast_date, episode, event_type, probability, threshold, status, next_attempt_at)
+     SELECT f.alert_id, f.forecast_date, f.episode, c.event_type, c.probability, c.threshold,
+            'pending', now()
+     FROM fired f JOIN candidatos c USING (alert_id, forecast_date)
+     ON CONFLICT (alert_id, forecast_date, episode) DO NOTHING
+     RETURNING 1
+   )
+   SELECT count(*) FROM ins;
+   ```
+   El `WHERE alert_day_states.armed` del `DO UPDATE` es lo que hace que un día que sigue arriba no
+   vuelva a disparar. El `ON CONFLICT DO NOTHING` de `notifications` es la red de seguridad de
+   idempotencia. Cuenta → `created`.
+
+Re-armado y disparo no pueden aplicar al mismo (alerta, día) en un ciclo (las condiciones son
+excluyentes con la misma probabilidad), así que un ciclo hace a lo sumo una transición por
+(alerta, día), igual que `step`. Los días fuera de la ventana, con pronóstico viejo o de alertas
+inactivas no cambian de estado.
+
+**Re-armado por cambio de alerta** (`app/services/alerts.py`, `update_alert`): si el PATCH cambia
+el `threshold` a un valor distinto o pasa `is_active` de `false` a `true`, en la **misma
+transacción** del UPDATE de la alerta y en este orden:
+0. `SELECT pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)` (S12b SEC-1/CR-1), **antes** del UPDATE
+   de la alerta. Los PATCH no se bloquean entre sí (lock compartido); solo esperan a una evaluación
+   en curso, y el evaluador (lock exclusivo) espera a los PATCH abiertos. Así una evaluación nunca
+   ve un umbral viejo con un estado ya re-armado, ni re-arma después de que el PATCH canceló, y no
+   hay deadlock entre los dos sobre `alert_day_states`. La espera es corta: el worker commitea
+   apenas termina de evaluar, antes de despachar.
+1. `UPDATE alert_day_states SET armed = true, updated_at = now() WHERE alert_id = :id` (= `reset`).
+2. Las notificaciones `pending` **no arrendadas** de la alerta (`next_attempt_at <= now()`, misma
+   regla que el DELETE de S9) pasan a `cancelled` con `last_error = 'alert_reset'`.
+
+El próximo ciclo vuelve a evaluar la alerta desde cero con el umbral actual: si el pronóstico está
+arriba, dispara un episodio nuevo. Un PATCH que no cambia ninguno de los dos (mismo umbral,
+`is_active` que ya era `true`, o pausar) no re-arma ni cancela. Pausar no toca el estado: mientras la
+alerta está inactiva el evaluador no la mira.
 
 Reglas de negocio (cubiertas por tests):
 1. `probability >= threshold` dispara; `probability < threshold` no.
@@ -73,9 +176,12 @@ Reglas de negocio (cubiertas por tests):
    `[hoy_local, hoy_local + ALERT_HORIZON_DAYS)` (default 7; `0` = sin límite). Ejemplo: a las 22:00
    de Buenos Aires (01:00 UTC del día siguiente) "hoy" sigue siendo el día local.
 4. Solo matchea mismo campo y mismo `event_type`.
-5. Correr dos veces no duplica (`UNIQUE (alert_id, forecast_date)`).
-6. Si la probabilidad baja y vuelve a subir para el mismo día, **no** se re-notifica (limitación
-   documentada en README).
+5. Correr dos veces no duplica: un día que sigue arriba no vuelve a disparar (`armed = false`) y
+   `UNIQUE (alert_id, forecast_date, episode)` es la red de seguridad.
+6. **Por episodio** (S12b, D1): si la probabilidad baja de `rearm_level` y vuelve a llegar al
+   umbral para el mismo día, se notifica de nuevo (episodio siguiente). Bajar sin pasar de
+   `rearm_level` (banda de histéresis) y volver a subir **no** re-notifica. Cambiar el umbral o
+   reactivar la alerta la re-evalúa desde cero (§Episodios).
 7. **Pronósticos desactualizados no disparan** (S11, D14): solo se evalúan pronósticos con
    `issued_at >= now - max_forecast_age_hours` (`MAX_FORECAST_AGE_HOURS`, default 24). Si para
    alertas activas hay pronósticos en la ventana que quedaron afuera por viejos, se loguea un
@@ -181,7 +287,7 @@ async def run_cycle(
 ) -> CycleResult
 ```
 1. `now = now or datetime.now(UTC)`.
-2. `async with sessionmaker() as s:` → `created = await evaluate_alerts(s, today=now.date())` → `await s.commit()`.
+2. `async with sessionmaker() as s:` → `created = await evaluate_alerts(s, now=now, ..., rearm_margin=settings.rearm_margin)` → `await s.commit()`.
 3. Despachar en lotes hasta vaciar la cola vencida: llamar
    `dispatch_pending(sessionmaker, notifier, ...)` (maneja sus propias transacciones) mientras el
    lote haya venido lleno (`sent + retried + failed == batch_size`), **con un `now` fresco
