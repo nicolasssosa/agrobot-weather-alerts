@@ -202,3 +202,4 @@ Follow-ups:
 | S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | **S15** (logs) |
 | S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | S17 |
 | S16 CR-1 | minor | El primer deploy de Pages requiere Pages habilitado con source "GitHub Actions" (el `GITHUB_TOKEN` no puede habilitarlo) | paso único al hacer público el repo |
+| S12b CR-2 | nit | Tests de lock/carrera de S12b: si una regresión deja un PATCH colgado, el cleanup puede bloquearse en vez de fallar (agregar `statement_timeout` en el cleanup o cancelar la task) | S17 (S16 ya mergeada) |
