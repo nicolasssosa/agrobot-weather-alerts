@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config import get_settings
 from app.core.errors import ConflictError, NotFoundError
+from app.jobs.evaluator import EVALUATOR_LOCK_KEY
 from app.models import Alert, AlertDayState, EventType, Field, Notification, NotificationStatus
 from app.schemas.alert import AlertCreate, AlertUpdate
 from app.schemas.common import BIGINT_MAX
@@ -176,11 +177,22 @@ async def update_alert(
     se re-arman y sus notificaciones `pending` no arrendadas pasan a `cancelled`
     (`alert_reset`), en la misma transacción (S12b, D1). El próximo ciclo re-avisa los días
     que siguen arriba del umbral vigente.
+
+    Antes de leer la alerta toma `pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)`
+    (S12b SEC-1/CR-1): el PATCH espera a que termine una evaluación en curso y el evaluador
+    (lock exclusivo) espera a los PATCH abiertos, así ninguno ve el umbral de la otra
+    transacción ni re-arma después de que el otro canceló. Al ser compartido, dos PATCH
+    concurrentes no se bloquean entre sí. `AlertUpdate` solo expone `threshold` e
+    `is_active`, así que todo PATCH toma el lock.
     """
+    changes = data.model_dump(exclude_unset=True)
+    # Paso 0 de docs/JOBS.md §Episodios ("Re-armado por cambio de alerta"): el lock va
+    # **antes** de leer/actualizar la alerta, para que snapshot, re-armado y cancelación
+    # sean atómicos respecto de la evaluación.
+    await session.execute(select(func.pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)))
     # Valida ownership y existencia (404) antes de escribir; trae los valores previos que
     # deciden si corresponde re-armar.
     current = await get_alert(session, user_id, alert_id)
-    changes = data.model_dump(exclude_unset=True)
     rearm = _requires_rearm(current, changes)
     try:
         updated = (

@@ -15,7 +15,12 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.dialects import postgresql
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import NullPool
 
 from app.jobs.episodes import INITIAL_STATE, DayState, reset, step
@@ -1346,6 +1351,248 @@ async def test_the_evaluation_takes_the_advisory_lock(
             ).scalar_one()
         assert free is False
     finally:
+        await engine.dispose()
+
+
+# --- Lock del PATCH contra el evaluador (S12b SEC-1/CR-1) -------------------
+
+#: Tiempo máximo para probar que una tarea **está** bloqueada. No es una fuente de verdad:
+#: el bloqueo se prueba con que la tarea recién termina al liberarse el lock.
+BLOCKED_TIMEOUT = 0.2
+
+
+async def _cleanup_owner(engine: AsyncEngine, user_id: int | None) -> None:
+    """Borra el usuario del escenario (cascada) y libera el engine."""
+    if user_id is not None:
+        async with engine.begin() as conn:
+            await conn.execute(delete(User).where(User.id == user_id))
+    await engine.dispose()
+
+
+async def _seed_lock_scenario(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    alerts: list[tuple[EventType, int, int]] | None = None,
+) -> tuple[int, int, list[int]]:
+    """Commitea un usuario con un campo y sus alertas/pronósticos.
+
+    `alerts` = `(event_type, threshold, probability)`. Devuelve `(user_id, field_id,
+    alert_ids)` ya commiteados: las conexiones del test y del PATCH los ven.
+    """
+    suffix = uuid.uuid4().hex
+    plans = alerts if alerts is not None else [(EventType.FROST, 70, 80)]
+    async with session_factory() as setup:
+        user = User(
+            phone_number=f"+54911{uuid.uuid4().int % 10**8:08d}",
+            name=f"Lock scenario {suffix}",
+        )
+        setup.add(user)
+        await setup.flush()
+        field = Field(
+            user_id=user.id,
+            name=f"Lock field {suffix}",
+            latitude=Decimal("-34.6"),
+            longitude=Decimal("-58.4"),
+        )
+        setup.add(field)
+        await setup.flush()
+        alert_ids: list[int] = []
+        for event_type, threshold, probability in plans:
+            alert = Alert(
+                field_id=field.id,
+                event_type=event_type,
+                threshold=threshold,
+                is_active=True,
+            )
+            setup.add(alert)
+            await setup.flush()
+            alert_ids.append(alert.id)
+            setup.add(
+                WeatherForecast(
+                    field_id=field.id,
+                    forecast_date=TODAY,
+                    event_type=event_type,
+                    probability=probability,
+                    source="mock",
+                    issued_at=FIXED_AT,
+                    fetched_at=FIXED_AT,
+                )
+            )
+        user_id, field_id = user.id, field.id
+        await setup.commit()
+    return user_id, field_id, alert_ids
+
+
+async def _patch_threshold(
+    session_factory: async_sessionmaker[AsyncSession],
+    *,
+    user_id: int,
+    alert_id: int,
+    threshold: int,
+) -> Alert:
+    """PATCH de umbral con su propia conexión y transacción (como el router)."""
+    async with session_factory() as session:
+        return await update_alert(session, user_id, alert_id, AlertUpdate(threshold=threshold))
+
+
+async def test_patch_waits_for_the_evaluator_lock() -> None:
+    """Con el lock exclusivo del evaluador abierto, el PATCH espera y termina al liberarse."""
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    try:
+        user_id, _, (alert_id,) = await _seed_lock_scenario(session_factory)
+        async with engine.connect() as holder:
+            # Simula una evaluación en curso: lock exclusivo sin commitear.
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": EVALUATOR_LOCK_KEY}
+            )
+            patch = asyncio.create_task(
+                _patch_threshold(session_factory, user_id=user_id, alert_id=alert_id, threshold=90)
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(patch), timeout=BLOCKED_TIMEOUT)
+            assert not patch.done()
+            # Al liberarse (commit/rollback del worker) el PATCH continúa y aplica el cambio.
+            await holder.rollback()
+        updated = await asyncio.wait_for(patch, timeout=5)
+        assert updated.threshold == 90
+    finally:
+        await _cleanup_owner(engine, user_id)
+
+
+async def test_two_concurrent_patches_of_different_alerts_do_not_block() -> None:
+    """El lock es compartido: un PATCH en vuelo no bloquea el PATCH de otra alerta."""
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    try:
+        user_id, _, (first_id, second_id) = await _seed_lock_scenario(
+            session_factory,
+            alerts=[(EventType.FROST, 70, 80), (EventType.RAIN, 70, 80)],
+        )
+        async with engine.connect() as holder:
+            # Como un PATCH a la primera alerta que todavía no commiteó.
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:key)"),
+                {"key": EVALUATOR_LOCK_KEY},
+            )
+            updated = await asyncio.wait_for(
+                _patch_threshold(
+                    session_factory, user_id=user_id, alert_id=second_id, threshold=90
+                ),
+                timeout=5,
+            )
+            assert updated.id == second_id
+            assert updated.threshold == 90
+            # La transacción del primer PATCH sigue abierta: no hubo bloqueo mutuo.
+            assert holder.in_transaction()
+            await holder.rollback()
+        async with session_factory() as check:
+            untouched = (
+                await check.execute(select(Alert.threshold).where(Alert.id == first_id))
+            ).scalar_one()
+        assert untouched == 70
+    finally:
+        await _cleanup_owner(engine, user_id)
+
+
+async def test_threshold_patch_racing_an_evaluation_leaves_a_coherent_state() -> None:
+    """SEC-1: evaluación y PATCH de umbral concurrentes dejan un estado coherente.
+
+    Orden A (evaluación en vuelo): el evaluador dispara con el umbral viejo (70) y no
+    commitea; el PATCH del umbral 90 espera el lock exclusivo y, al liberarse, re-arma y
+    cancela la notificación. Nunca queda una `pending` con el umbral viejo.
+
+    Orden B (PATCH primero): el evaluador ve el umbral nuevo (90) y el 80% no dispara.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_ids: list[int] = []
+    try:
+        # --- Orden A: el evaluador dispara y el PATCH llega mientras no commiteó.
+        user_a, _, (alert_a,) = await _seed_lock_scenario(session_factory)
+        user_ids.append(user_a)
+        async with session_factory() as evaluator:
+            # Lock exclusivo + episodio 1 insertado, todo sin commitear.
+            assert await _evaluate(evaluator) == 1
+            patch = asyncio.create_task(
+                _patch_threshold(session_factory, user_id=user_a, alert_id=alert_a, threshold=90)
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(patch), timeout=BLOCKED_TIMEOUT)
+            assert not patch.done()
+            await evaluator.commit()
+        updated_a = await asyncio.wait_for(patch, timeout=5)
+        assert updated_a.threshold == 90
+
+        async with session_factory() as check:
+            notifications = (
+                await check.execute(
+                    select(
+                        Notification.status,
+                        Notification.threshold,
+                        Notification.episode,
+                        Notification.last_error,
+                    ).where(Notification.alert_id == alert_a)
+                )
+            ).all()
+            states = (
+                await check.execute(
+                    select(AlertDayState.episode, AlertDayState.armed).where(
+                        AlertDayState.alert_id == alert_a
+                    )
+                )
+            ).all()
+            stale_pending = (
+                await check.execute(
+                    select(func.count())
+                    .select_from(Notification)
+                    .where(
+                        Notification.alert_id == alert_a,
+                        Notification.status == NotificationStatus.PENDING,
+                        Notification.threshold != 90,
+                    )
+                )
+            ).scalar_one()
+        # El aviso salió con el umbral viejo, pero el re-armado lo canceló (sin duplicados).
+        assert [tuple(row) for row in notifications] == [
+            (NotificationStatus.CANCELLED, 70, 1, "alert_reset")
+        ]
+        # El día quedó re-armado: el próximo ciclo re-avisa con el umbral vigente.
+        assert [tuple(row) for row in states] == [(1, True)]
+        assert stale_pending == 0
+
+        # --- Orden B: el PATCH commitea antes de la evaluación.
+        user_b, _, (alert_b,) = await _seed_lock_scenario(session_factory)
+        user_ids.append(user_b)
+        updated_b = await _patch_threshold(
+            session_factory, user_id=user_b, alert_id=alert_b, threshold=90
+        )
+        assert updated_b.threshold == 90
+        assert await _evaluate_and_commit(session_factory, now=NOW) == 0
+        async with session_factory() as check:
+            notifications_b = (
+                await check.execute(
+                    select(func.count())
+                    .select_from(Notification)
+                    .where(Notification.alert_id == alert_b)
+                )
+            ).scalar_one()
+            states_b = (
+                await check.execute(
+                    select(func.count())
+                    .select_from(AlertDayState)
+                    .where(AlertDayState.alert_id == alert_b)
+                )
+            ).scalar_one()
+        assert notifications_b == 0
+        assert states_b == 0
+    finally:
+        for owner in user_ids:
+            if owner is not None:
+                async with engine.begin() as conn:
+                    await conn.execute(delete(User).where(User.id == owner))
         await engine.dispose()
 
 
