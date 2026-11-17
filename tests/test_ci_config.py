@@ -21,9 +21,12 @@ PYPROJECT_PATH = ROOT / "pyproject.toml"
 UV_LOCK_PATH = ROOT / "uv.lock"
 MAKEFILE_PATH = ROOT / "Makefile"
 GITIGNORE_PATH = ROOT / ".gitignore"
+DEPENDABOT_PATH = ROOT / ".github" / "dependabot.yml"
 
-#: `owner/repo@vN`: pinneo por versión mayor, como pide el criterio de S16.
-PINNED_ACTION = re.compile(r"^[\w.-]+/[\w.-]+@v\d+$")
+#: `owner/repo@<sha de 40>`: pinneo por commit (S16 SEC-1, resuelto en S17).
+PINNED_ACTION = re.compile(r"^[\w.-]+/[\w.-]+@[0-9a-f]{40}$")
+#: Línea `uses:` cruda con la versión exacta en el comentario: `owner/repo@<sha> # vX.Y.Z`.
+PINNED_ACTION_LINE = re.compile(r"uses: [\w.-]+/[\w.-]+@[0-9a-f]{40} # v\d+\.\d+\.\d+$")
 #: Versión exacta `x.y.z` (sin rangos ni prefijos `^`/`~`).
 EXACT_VERSION = re.compile(r"^\d+\.\d+\.\d+$")
 
@@ -281,13 +284,36 @@ def test_pages_deploy_uses_the_github_pages_environment_and_never_cancels(
 # --- Acciones pinneadas ------------------------------------------------------
 
 
-def test_every_action_is_pinned_by_major_version(workflow: dict[str, Any]) -> None:
-    """Criterio: acciones pinneadas por versión mayor (`@vN`)."""
+def test_every_action_is_pinned_by_commit_sha(workflow: dict[str, Any]) -> None:
+    """S16 SEC-1: cada acción pinneada por SHA de commit (un tag movido no cambia lo que corre)."""
     uses = _workflow_uses(workflow)
 
     assert uses, "el workflow no usa ninguna acción"
     for uses_value in uses:
-        assert PINNED_ACTION.match(uses_value), f"acción sin pinneo por versión mayor: {uses_value}"
+        assert PINNED_ACTION.match(uses_value), f"acción sin pinneo por SHA: {uses_value}"
+
+
+def test_every_pinned_action_documents_its_exact_version() -> None:
+    """S16 SEC-1: cada `uses:` lleva la versión exacta en un comentario (`# vX.Y.Z`)."""
+    lines = [
+        line.strip()
+        for line in WORKFLOW_PATH.read_text(encoding="utf-8").splitlines()
+        if "uses:" in line
+    ]
+
+    assert lines, "el workflow no usa ninguna acción"
+    for line in lines:
+        assert PINNED_ACTION_LINE.search(line), f"acción sin versión en comentario: {line}"
+
+
+def test_dependabot_updates_github_actions() -> None:
+    """S16 SEC-1: Dependabot mantiene al día los SHA pinneados de las acciones."""
+    config = _load_yaml(DEPENDABOT_PATH)
+    ecosystems = {update["package-ecosystem"]: update for update in config["updates"]}
+
+    assert config["version"] == 2
+    assert "github-actions" in ecosystems
+    assert ecosystems["github-actions"]["directory"] == "/"
 
 
 # --- site/index.html ---------------------------------------------------------

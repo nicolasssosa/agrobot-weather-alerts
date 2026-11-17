@@ -1,6 +1,6 @@
 # Requerimientos — Sistema de Alertas Climáticas
 
-Owner: PM · Estado: **Aprobado para desarrollo** (pendiente de sign-off del usuario) · 2026-11-16
+Owner: PM · Estado: **Implementado** (S1–S17) · 2026-11-17
 
 ## 1. Contexto
 

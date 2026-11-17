@@ -1,0 +1,13 @@
+# Actualizaciones de las acciones de GitHub Actions (pinneadas por SHA en ci.yml).
+# Dependabot abre un PR semanal que mueve el SHA y el comentario de versión juntos.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: ci

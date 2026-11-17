@@ -1,4 +1,4 @@
-.PHONY: install db-up db-down migrate migration seed ingest api worker jobs-once openapi test cov lint fmt typecheck check up down
+.PHONY: demo install db-up db-down migrate migration seed ingest api worker jobs-once openapi test cov lint fmt typecheck check up down
 
 install:        ## Instala dependencias (incluye dev)
 	uv sync
@@ -51,6 +51,17 @@ typecheck:
 	uv run mypy app
 
 check: lint typecheck test   ## Definition of done local
+
+API_URL ?= http://localhost:8000
+
+demo:           ## Demo en un comando: stack en Docker + seed + un ciclo del job + notificaciones enviadas
+	docker compose up --build -d --wait api worker
+	docker compose exec -T api python -m app.scripts.seed
+	docker compose exec -T worker python -m app.jobs.worker --once
+	@echo "--- Notificaciones enviadas a Ana (X-User-Id: 1):"
+	@curl -sf "$(API_URL)/api/v1/notifications?status=sent&limit=5" -H "X-User-Id: 1"
+	@echo
+	@echo "--- Swagger UI: $(API_URL)/docs · logs del worker: docker compose logs -f worker"
 
 up:             ## Stack completo (db + migrate + api + worker)
 	docker compose up --build
