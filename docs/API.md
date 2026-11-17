@@ -25,30 +25,29 @@ Ejecuta `SELECT 1` contra la base.
 - 200 `{"status": "ok"}`
 - 503 `{"status": "unavailable"}` si la query falla (capturar la excepción, loguearla).
 
-## Idempotency-Key (S10)
+## Idempotency-Key en `POST /alerts`
 
-`POST /api/v1/users`, `POST /api/v1/fields` y `POST /api/v1/alerts` aceptan el header opcional
-`Idempotency-Key` (1–255 caracteres ASCII imprimibles, sin espacios; si no cumple → 422
-`{"detail": "Invalid Idempotency-Key"}`). Pensado para clientes que reintentan, como el gateway
-de WhatsApp ante un corte de red.
+`POST /api/v1/alerts` **exige** el header `Idempotency-Key` (1–255 caracteres ASCII imprimibles, sin
+espacios). Crear una alerta es la operación que el gateway de WhatsApp reintenta ante un corte de
+red: con la clave, el reintento nunca crea una alerta duplicada y recibe la respuesta original.
 
 | Caso | Respuesta |
 |------|-----------|
+| Sin header | 422 `{"detail": "Idempotency-Key header is required"}` |
+| Formato inválido | 422 `{"detail": "Invalid Idempotency-Key"}` |
 | Primera vez con la clave | Se ejecuta normalmente; si responde 2xx se guarda la respuesta |
-| Misma clave + mismo body (dentro de la vigencia) | **La misma respuesta guardada** (status y body), sin volver a ejecutar; header `Idempotent-Replayed: true` |
+| Misma clave + mismo body (dentro de la vigencia) | **La misma respuesta guardada**, byte a byte, sin volver a ejecutar; header `Idempotent-Replayed: true` |
 | Misma clave + body distinto | 422 `{"detail": "Idempotency-Key reused with a different request"}` |
 | Dos requests simultáneos con la misma clave | Se serializan: uno ejecuta, el otro recibe el replay |
 | La operación falla (404/409/422) | No se guarda la clave: el cliente puede corregir y reintentar con la misma |
 | Clave vencida (`IDEMPOTENCY_TTL_HOURS`, default 24) | Se trata como nueva |
 
-La clave es por usuario (`X-User-Id`) y por endpoint: la misma clave en otro endpoint o de otro
-usuario es independiente. En `POST /users` (sin autenticación) el alcance es el endpoint **más el
-contenido del body**: nadie puede ocupar la clave de otro cliente con un body distinto (en `/users`,
-misma clave + otro body se trata como una clave nueva, no como 422).
-El replay devuelve **exactamente los mismos bytes** que la respuesta original.
+La clave es por usuario (`X-User-Id`): la misma clave de otro usuario es independiente.
 Usá claves **aleatorias e impredecibles** (por ejemplo un UUID v4).
 "Mismo body" se compara sobre el request ya validado y normalizado (no importan espacios ni el
 orden de las claves del JSON).
+`POST /users` y `POST /fields` no usan `Idempotency-Key`: sus duplicados ya los resuelve la
+unicidad natural (teléfono; nombre de campo por usuario) con 409.
 
 ## users
 
@@ -161,7 +160,7 @@ curl -s -X POST localhost:8000/api/v1/users -H 'content-type: application/json' 
   -d '{"phone_number":"+5491100000001","name":"Ana"}'
 curl -s -X POST localhost:8000/api/v1/fields -H 'X-User-Id: 1' -H 'content-type: application/json' \
   -d '{"name":"Lote Norte","latitude":-34.6,"longitude":-58.4}'
-curl -s -X POST localhost:8000/api/v1/alerts -H 'X-User-Id: 1' -H 'content-type: application/json' \
+curl -s -X POST localhost:8000/api/v1/alerts -H 'X-User-Id: 1' -H "Idempotency-Key: $(uuidgen)" -H 'content-type: application/json' \
   -d '{"field_id":1,"event_type":"frost","threshold":60}'
 make ingest && make jobs-once
 curl -s 'localhost:8000/api/v1/notifications?status=sent' -H 'X-User-Id: 1'

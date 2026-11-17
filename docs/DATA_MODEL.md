@@ -178,23 +178,24 @@ Constraints / índices:
   vía `CHECK (issued_at IS NOT NULL) NOT VALID` → `VALIDATE CONSTRAINT` → `SET NOT NULL`, para no
   bloquear la tabla (con el volumen del challenge la versión directa tarda segundos).
 
-## idempotency_keys (S10, migración 0004)
+## idempotency_keys (S10 migración 0004, S11b migración 0006)
 
-Respuestas guardadas de los POST con `Idempotency-Key` (ver API.md §Idempotency-Key).
+Respuestas guardadas de `POST /alerts` (ver API.md §Idempotency-Key en `POST /alerts`).
 
 | columna        | tipo         | null | notas                                                       |
 |----------------|--------------|------|-------------------------------------------------------------|
 | id             | BIGINT       | no   | PK identity                                                 |
-| user_id        | BIGINT       | sí   | FK → users.id ON DELETE CASCADE; NULL en `POST /users`      |
+| user_id        | BIGINT       | no   | FK → users.id ON DELETE CASCADE                             |
 | scope          | VARCHAR(64)  | no   | método + ruta, ej. `POST /api/v1/alerts`                    |
 | key            | VARCHAR(255) | no   | valor del header                                            |
 | request_hash   | CHAR(64)     | no   | SHA-256 del body validado y normalizado                     |
 | status_code    | SMALLINT     | no   | status de la respuesta guardada                             |
-| response_body  | TEXT         | no   | body serializado tal cual se respondió (replay byte a byte). En `POST /users` guarda solo `{"id": …}` (sin PII): el replay reconstruye la respuesta leyendo el usuario; si ya no existe, la clave se trata como nueva |
+| response_body  | TEXT         | no   | body serializado tal cual se respondió (replay byte a byte) |
 | created_at     | TIMESTAMPTZ  | no   | default now()                                               |
 | expires_at     | TIMESTAMPTZ  | no   | `created_at + IDEMPOTENCY_TTL_HOURS`                        |
 
-- `UNIQUE (user_id, scope, key) NULLS NOT DISTINCT` (PostgreSQL ≥ 15).
+- `UNIQUE (user_id, scope, key)`.
+- Migración 0006: borra las filas que no sean de `POST /api/v1/alerts`, pasa `user_id` a `NOT NULL` y recrea el UNIQUE sin `NULLS NOT DISTINCT`. `downgrade()` revierte la estructura (las filas borradas no se recuperan: son respuestas cacheadas, no datos de negocio).
 - Índice en `expires_at` (purga en S14).
 
 ## Migración 0003 — alertas: borrado lógico y varios umbrales (S9)

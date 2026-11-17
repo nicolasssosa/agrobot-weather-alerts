@@ -75,7 +75,7 @@ una notificación cuando los pronósticos almacenados superen ese umbral.
 | D10 | Entrega | At-least-once (puede duplicarse solo si el proceso muere entre el envío y el commit). | Idempotency key en el proveedor. |
 | D11 | Borrado de alertas | **Lógico** (`deleted_at`): DELETE idempotente, el historial de notificaciones se conserva y las pendientes se cancelan (S9). | Borrado físico (pierde el historial). |
 | D12 | Validación al enviar | El dispatcher re-verifica contra la alerta **actual** antes de enviar (activa, no borrada, probabilidad ≥ umbral vigente); si ya no corresponde, la notificación queda `cancelled` (S9). | — |
-| D13 | Reintentos de clientes | Header `Idempotency-Key` en los POST: misma clave + mismo body → misma respuesta; misma clave + otro body → 422; vigencia 24 h (S10). | — |
+| D13 | Reintentos de clientes | Header `Idempotency-Key` **obligatorio en `POST /alerts`**: misma clave + mismo body → misma respuesta; misma clave + otro body → 422; vigencia 24 h (S10, S11b). `users` y `fields` resuelven duplicados por unicidad natural (409). | Clave opcional en todos los POST. |
 | D14 | Pronósticos desactualizados | Cada pronóstico guarda `issued_at` del proveedor; un dato más viejo nunca pisa a uno más nuevo; el evaluador ignora pronósticos con más de `MAX_FORECAST_AGE_HOURS` (default 24) y lo reporta (S11). | — |
 | D15 | Envío agrupado | Un mensaje por usuario y ciclo con todas sus alertas (digest) + horario de silencio configurable (S13). | Un mensaje por notificación. |
 | D16 | Límites | Cuotas por usuario (campos, alertas por campo) configurables (S14). | — |
