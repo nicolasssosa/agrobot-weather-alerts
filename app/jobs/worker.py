@@ -64,7 +64,9 @@ async def run_cycle(
 
     1. `now` (o `clock()`) da el día a evaluar y el corte de frescura de los pronósticos; la
        evaluación corre en su propia sesión y commitea, porque el dispatcher maneja sus propias
-       transacciones.
+       transacciones. Si la evaluación falla, se loguea `evaluation_failed` con el stack, se
+       hace rollback y el ciclo **sigue al despacho** con `created = 0` (S14a CR-2): una
+       evaluación rota no frena el envío de lo que ya está pendiente.
     2. Se despacha en lotes mientras el lote vuelva lleno (`users == batch_size`, S13: el lote
        mide usuarios/mensajes, no notificaciones). Cada llamada obtiene un `now` **fresco** de
        `clock()`: el lease se calcula desde el momento real del claim.
@@ -81,15 +83,23 @@ async def run_cycle(
     cycle_now = now if now is not None else clock()
 
     async with sessionmaker() as session:
-        created = await evaluate_alerts(
-            session,
-            now=cycle_now,
-            horizon_days=settings.alert_horizon_days,
-            max_forecast_age_hours=settings.max_forecast_age_hours,
-            future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
-            rearm_margin=settings.rearm_margin,
-        )
-        await session.commit()
+        try:
+            created = await evaluate_alerts(
+                session,
+                now=cycle_now,
+                horizon_days=settings.alert_horizon_days,
+                max_forecast_age_hours=settings.max_forecast_age_hours,
+                future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
+                rearm_margin=settings.rearm_margin,
+                lock_wait_ms=settings.evaluator_lock_wait_ms,
+            )
+            await session.commit()
+        except Exception:
+            # Una evaluación rota (p. ej. `statement_timeout` con muchos datos) no debe frenar
+            # el despacho de lo ya pendiente (S14a CR-2): rollback y created = 0.
+            logger.exception("evaluation_failed")
+            await session.rollback()
+            created = 0
 
     sent = retried = failed = cancelled = deferred = users = 0
     batches = 0

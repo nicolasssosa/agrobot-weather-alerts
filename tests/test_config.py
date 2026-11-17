@@ -184,3 +184,19 @@ def test_max_request_body_bytes_accepts_the_documented_range(value: int) -> None
 def test_max_request_body_bytes_rejects_out_of_range_values(value: object) -> None:
     with pytest.raises(ValidationError):
         Settings(max_request_body_bytes=value)  # type: ignore[arg-type]
+
+
+def test_evaluator_lock_wait_ms_defaults_to_10_seconds() -> None:
+    """Espera máxima por el lock de evaluación (docs/JOBS.md §Evaluador, S14a)."""
+    assert Settings().evaluator_lock_wait_ms == 10000
+
+
+@pytest.mark.parametrize("value", [100, 10000, 60000])
+def test_evaluator_lock_wait_ms_accepts_the_documented_range(value: int) -> None:
+    assert Settings(evaluator_lock_wait_ms=value).evaluator_lock_wait_ms == value
+
+
+@pytest.mark.parametrize("value", [0, 99, 60001, "abc", "200.5"])
+def test_evaluator_lock_wait_ms_rejects_out_of_range_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(evaluator_lock_wait_ms=value)  # type: ignore[arg-type]

@@ -178,22 +178,23 @@ async def update_alert(
     (`alert_reset`), en la misma transacción (S12b, D1). El próximo ciclo re-avisa los días
     que siguen arriba del umbral vigente.
 
-    Antes de leer la alerta toma `pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)`
-    (S12b SEC-1/CR-1): el PATCH espera a que termine una evaluación en curso y el evaluador
-    (lock exclusivo) espera a los PATCH abiertos, así ninguno ve el umbral de la otra
-    transacción ni re-arma después de que el otro canceló. Al ser compartido, dos PATCH
-    concurrentes no se bloquean entre sí. `AlertUpdate` solo expone `threshold` e
-    `is_active`, así que todo PATCH toma el lock.
+    Antes de actualizar toma `pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)` (S12b
+    SEC-1/CR-1), **después** de verificar que la alerta existe y es del usuario (un 404 no
+    toma el lock, S14a SEC-1) y **antes** del UPDATE: el PATCH espera a que termine una
+    evaluación en curso y el evaluador (lock exclusivo) espera a los PATCH abiertos, así
+    ninguno ve el umbral de la otra transacción ni re-arma después de que el otro canceló.
+    Al ser compartido, dos PATCH concurrentes no se bloquean entre sí; mientras el evaluador
+    espera en la cola del lock, los PATCH nuevos esperan detrás de él.
     """
     changes = data.model_dump(exclude_unset=True)
-    # Paso 0 de docs/JOBS.md §Episodios ("Re-armado por cambio de alerta"): el lock va
-    # **antes** de leer/actualizar la alerta, para que snapshot, re-armado y cancelación
-    # sean atómicos respecto de la evaluación.
-    await session.execute(select(func.pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)))
-    # Valida ownership y existencia (404) antes de escribir; trae los valores previos que
-    # deciden si corresponde re-armar.
+    # Valida ownership y existencia (404) antes de pedir el lock: un PATCH a una alerta
+    # inexistente o ajena no queda esperando detrás de una evaluación (S14a SEC-1).
     current = await get_alert(session, user_id, alert_id)
     rearm = _requires_rearm(current, changes)
+    # Paso 0 de docs/JOBS.md §Episodios ("Re-armado por cambio de alerta"): el lock va
+    # **después** de verificar la ownership y **antes** del UPDATE de la alerta, para que
+    # snapshot, re-armado y cancelación sean atómicos respecto de la evaluación.
+    await session.execute(select(func.pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)))
     try:
         updated = (
             await session.execute(

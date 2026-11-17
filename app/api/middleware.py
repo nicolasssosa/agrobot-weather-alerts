@@ -11,9 +11,9 @@ Dos caminos:
   superar el límite con el mismo 413. Exactamente el límite pasa.
 
 En el caso chunked el 413 se envía desde el wrapper de `receive` y la lectura se corta
-devolviendo `http.disconnect`. No se puede "lanzar" el error: FastAPI convierte cualquier
-excepción al parsear el body en un 400 (`"There was an error parsing the body"`). Después
-del 413 se descarta todo lo que la app intente enviar.
+devolviendo `http.disconnect`. No se puede "lanzar" el error: al cortar la lectura del body,
+FastAPI falla al parsearlo y produce su propia respuesta. Como el 413 ya salió, esa respuesta
+se descarta y el cliente ve el 413.
 """
 
 import logging

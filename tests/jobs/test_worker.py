@@ -366,46 +366,67 @@ async def test_run_cycle_accumulates_cancelled_and_keeps_draining_a_full_batch(
     )
 
 
-async def test_run_cycle_does_not_dispatch_when_evaluate_alerts_raises(
+async def test_run_cycle_dispatches_when_evaluate_alerts_raises(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    make_alert: MakeAlert,
     fake_notifier: FakeNotifier,
-    monkeypatch,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Si el evaluador falla, la excepción sube y no se despacha nada a medias."""
-    dispatched: list[int] = []
+    """S14a CR-2: una evaluación que falla se loguea con stack, se revierte y el ciclo
+    igual despacha lo que ya estaba pendiente."""
+    caplog.set_level(logging.INFO, logger="app.jobs.worker")
+    owner = await make_user()
+    field = await make_field(owner, name="Evaluación rota")
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=FORECAST_DATE,
+        event_type=EventType.FROST,
+        probability=85,
+        issued_at=EVAL_NOW,
+    )
+    # Notificación vencida de un ciclo anterior: el despacho debe sacarla igual.
+    db_session.add(
+        Notification(
+            alert_id=alert.id,
+            forecast_date=FORECAST_DATE,
+            episode=1,
+            event_type=EventType.FROST,
+            probability=85,
+            threshold=70,
+            status=NotificationStatus.PENDING,
+            next_attempt_at=EVAL_NOW - timedelta(minutes=5),
+        )
+    )
+    await db_session.flush()
 
-    async def failing_evaluate(  # type: ignore[no-untyped-def]
-        session,
-        *,
-        now,
-        horizon_days,
-        max_forecast_age_hours,
-        future_tolerance_minutes,
-        rearm_margin,
-    ):
+    async def failing_evaluate(session: AsyncSession, **kwargs: object) -> int:
+        # Emula un `statement_timeout` de la evaluación: cualquier excepción sirve.
         raise RuntimeError("evaluation down")
 
-    async def recording_dispatch(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
-        dispatched.append(1)
-        return DispatchResult(sent=0, retried=0, failed=0)
-
     monkeypatch.setattr(worker, "evaluate_alerts", failing_evaluate)
-    monkeypatch.setattr(worker, "dispatch_pending", recording_dispatch)
 
-    with pytest.raises(RuntimeError, match="evaluation down"):
-        await run_cycle(
-            test_sessionmaker,
-            fake_notifier,
-            _settings(),
-            now=EVAL_NOW,
-            clock=_clock_at(CLAIM_NOW),
-        )
+    result = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        _settings(),
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
 
-    assert dispatched == []
-    assert fake_notifier.sent == []
-    # La transacción de evaluación se revirtió: no quedó ninguna notificación.
-    assert (await db_session.scalar(select(Notification.id))) is None
+    assert result.created == 0
+    assert result.dispatch == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(fake_notifier.sent) == 1
+    [record] = [record for record in caplog.records if record.getMessage() == "evaluation_failed"]
+    assert record.levelno == logging.ERROR
+    assert record.exc_info is not None
+    statuses = (await db_session.scalars(select(Notification.status))).all()
+    assert statuses == [NotificationStatus.SENT]
 
 
 async def test_run_cycle_keeps_committed_work_when_a_later_batch_raises(
@@ -922,6 +943,7 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
         "max_forecast_age_hours": 6,
         "future_tolerance_minutes": 30,
         "rearm_margin": 15,
+        "lock_wait_ms": settings.evaluator_lock_wait_ms,
     }
 
 
@@ -979,7 +1001,7 @@ async def test_one_cycle_evaluates_each_field_with_its_own_local_today(
     assert len(fake_notifier.sent) == 2
 
 
-# --- S14a: lock de evaluación no bloqueante --------------------------------
+# --- S14a: lock de evaluación con espera acotada ---------------------------
 
 
 async def test_run_cycle_dispatches_when_the_evaluation_lock_is_busy(
@@ -992,7 +1014,7 @@ async def test_run_cycle_dispatches_when_the_evaluation_lock_is_busy(
     fake_notifier: FakeNotifier,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """S14a: si otra réplica (o un PATCH) tiene el lock, el worker no espera y despacha igual."""
+    """S14a: si el lock no se libera dentro de `evaluator_lock_wait_ms`, despacha igual."""
     caplog.set_level(logging.INFO, logger="app.jobs.evaluator")
     owner = await make_user()
     field = await make_field(owner, name="Lote bloqueado")
@@ -1018,6 +1040,7 @@ async def test_run_cycle_dispatches_when_the_evaluation_lock_is_busy(
         )
     )
     await db_session.flush()
+    settings = _settings().model_copy(update={"evaluator_lock_wait_ms": 200})
 
     engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
     try:
@@ -1029,7 +1052,7 @@ async def test_run_cycle_dispatches_when_the_evaluation_lock_is_busy(
             result = await run_cycle(
                 test_sessionmaker,
                 fake_notifier,
-                _settings(),
+                settings,
                 now=EVAL_NOW,
                 clock=_clock_at(CLAIM_NOW),
             )
@@ -1040,7 +1063,7 @@ async def test_run_cycle_dispatches_when_the_evaluation_lock_is_busy(
     assert result.created == 0
     assert result.dispatch == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert len(fake_notifier.sent) == 1
-    assert "evaluation_skipped reason=lock_busy" in [
+    assert "evaluation_skipped reason=lock_busy wait_ms=200" in [
         record.getMessage() for record in caplog.records
     ]
     statuses = (await db_session.scalars(select(Notification.status))).all()
