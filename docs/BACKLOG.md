@@ -113,6 +113,11 @@ Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.p
 - [x] El evaluador calcula "hoy" **por campo** en su zona horaria y evalúa `[hoy_local, hoy_local + ALERT_HORIZON_DAYS)` (0 = sin límite).
 - [x] Follow-ups de S11: los scripts `ingest`/`seed` usan `FORECAST_FUTURE_TOLERANCE_MINUTES` del setting (SEC-3); warning `future_forecasts count=<n> fields=<m>` cuando el evaluador excluye pronósticos con `issued_at` adelantado (SEC-4); la validación al enviar compara contra la probabilidad del **pronóstico vigente** (SEC-5).
 
+## S12c — Límites de paginación e ids en OpenAPI · ✅
+Archivos: `app/schemas/common.py`, `app/api/routers/alerts.py`, `app/api/routers/notifications.py`, `docs/openapi.json`, tests.
+- [x] `offset` acotado a 0..10000 (`offset=10001` → 422).
+- [x] Los filtros `field_id`/`alert_id` siguen rechazando valores fuera de BIGINT con 422, sin publicar `maximum` en el schema OpenAPI (ningún parámetro de la API publica un `maximum` mayor a 10000).
+
 ## S12b — Re-aviso por episodio · D1
 - [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa.
 - [ ] **Reactivar** una alerta (`is_active` false → true) también re-evalúa (QA-1 de S9).

@@ -415,7 +415,19 @@ async def test_reading_a_field_with_an_out_of_range_id_returns_404(
     assert response.json() == {"detail": "Field not found"}
 
 
-@pytest.mark.parametrize("offset", [str(BIGINT_MAX + 1), "99999999999999999999"])
+async def test_listing_with_the_maximum_offset_returns_200(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    """S12c: `offset=10000` es el tope documentado y sigue siendo válido."""
+    user = await make_user()
+
+    response = await client.get(f"{API}?offset=10000", headers=auth(user))
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "limit": 50, "offset": 10000}
+
+
+@pytest.mark.parametrize("offset", ["10001", str(BIGINT_MAX + 1), "99999999999999999999"])
 async def test_listing_with_an_out_of_range_offset_returns_422(
     client: AsyncClient, make_user: MakeUser, offset: str
 ) -> None:

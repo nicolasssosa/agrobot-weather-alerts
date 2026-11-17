@@ -17,7 +17,7 @@ from app.api.deps import (
 from app.models import Alert, EventType
 from app.schemas.alert import AlertCreate, AlertPage, AlertRead, AlertUpdate
 from app.schemas.common import (
-    BIGINT_MAX,
+    BigIntId,
     ErrorResponse,
     PaginationParams,
     protected_responses,
@@ -153,7 +153,7 @@ async def list_alerts_endpoint(
     user: CurrentUser,
     session: SessionDep,
     pagination: Annotated[PaginationParams, Depends()],
-    field_id: Annotated[int | None, Query(ge=1, le=BIGINT_MAX)] = None,
+    field_id: BigIntId | None = None,
     event_type: Annotated[EventType | None, Query()] = None,
     is_active: Annotated[bool | None, Query()] = None,
 ) -> AlertPage:
