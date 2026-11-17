@@ -562,6 +562,114 @@ async def test_an_inactive_alert_does_not_rearm_its_days(
     assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
 
 
+async def test_with_threshold_one_the_day_rearms_only_at_zero(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Umbral 1: `rearm_level` es 1, así que la banda va de 1 a `threshold - 1` = vacía.
+
+    Un día disparado solo se re-arma con probabilidad 0; con 1 sigue desarmado.
+    """
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=1)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=1
+    )
+    assert await _evaluate(db_session) == 1
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+    # Borde exacto: `probability == rearm_level` (1) no re-arma.
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+    forecast.probability = 0
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=True)
+
+    forecast.probability = 1
+    await db_session.flush()
+    assert await _evaluate(db_session) == 1
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=2, armed=False)
+
+
+async def test_a_day_outside_the_horizon_does_not_rearm(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """D1 + D2: si el día sale de la ventana no es candidato, así que no re-arma ni dispara."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    in_horizon = await make_forecast(
+        field, forecast_date=TODAY + timedelta(days=1), event_type=EventType.FROST, probability=90
+    )
+    far_day = TODAY + timedelta(days=5)
+    out_of_horizon = await make_forecast(
+        field, forecast_date=far_day, event_type=EventType.FROST, probability=90
+    )
+    # Sin límite superior (`horizon_days=0`) entran los dos días.
+    assert await _evaluate(db_session, horizon_days=0) == 2
+
+    in_horizon.probability = 0
+    out_of_horizon.probability = 0
+    await db_session.flush()
+    # Con horizonte 3 solo el día +1 está en la ventana: el lejano conserva su estado.
+    assert await _evaluate(db_session, horizon_days=3) == 0
+    assert await _day_state(db_session, alert.id, TODAY + timedelta(days=1)) == DayState(
+        episode=1, armed=True
+    )
+    assert await _day_state(db_session, alert.id, far_day) == DayState(episode=1, armed=False)
+
+
+async def test_several_thresholds_of_the_same_field_and_event_keep_independent_states(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """D1/D5: dos alertas (30 y 90) del mismo campo y evento no comparten estado de episodio."""
+    field = await make_field()
+    warning = await make_alert(field, event_type=EventType.FROST, threshold=30)
+    critical = await make_alert(field, event_type=EventType.FROST, threshold=90)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=70
+    )
+
+    assert await _evaluate(db_session) == 1
+    assert await _day_state(db_session, warning.id, TODAY) == DayState(episode=1, armed=False)
+    # La alerta crítica nunca disparó: sin fila = armada, episodio 0.
+    assert await _day_state(db_session, critical.id, TODAY) == INITIAL_STATE
+
+    forecast.probability = 95  # la de 30 sigue desarmada; la de 90 cruza por primera vez
+    await db_session.flush()
+    assert await _evaluate(db_session) == 1
+    assert await _day_state(db_session, warning.id, TODAY) == DayState(episode=1, armed=False)
+    assert await _day_state(db_session, critical.id, TODAY) == DayState(episode=1, armed=False)
+
+    forecast.probability = 10  # 10 < max(30-10, 1) y < max(90-10, 1): las dos se re-arman
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, warning.id, TODAY) == DayState(episode=1, armed=True)
+    assert await _day_state(db_session, critical.id, TODAY) == DayState(episode=1, armed=True)
+
+    forecast.probability = 40  # solo la de 30 vuelve a cruzar
+    await db_session.flush()
+    assert await _evaluate(db_session) == 1
+    assert await _day_state(db_session, warning.id, TODAY) == DayState(episode=2, armed=False)
+    assert await _day_state(db_session, critical.id, TODAY) == DayState(episode=1, armed=True)
+
+    notifications = await _notifications(db_session)
+    assert [(n.alert_id, n.episode) for n in notifications] == [
+        (warning.id, 1),
+        (warning.id, 2),
+        (critical.id, 1),
+    ]
+
+
 async def test_the_log_reports_created_and_rearmed_counts(
     db_session: AsyncSession,
     make_field: MakeField,
@@ -991,12 +1099,20 @@ async def test_soft_deleted_alert_keeps_its_history_and_a_new_alert_notifies_aga
     # El borrado lógico no toca las notificaciones y el evaluador ya no evalúa la alerta.
     assert len(await _notifications(db_session)) == 2
     assert await _evaluate(db_session) == 0
+    # Tampoco toca sus días: la alerta no está en los candidatos, así que el estado sigue
+    # desarmado (no re-arma ni dispara).
+    for offset in range(2):
+        assert await _day_state(db_session, alert.id, TODAY + timedelta(days=offset)) == DayState(
+            episode=1, armed=False
+        )
 
     new_alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
     assert await _evaluate(db_session) == 2
     notifications = await _notifications(db_session)
     assert {n.alert_id for n in notifications} == {alert.id, new_alert.id}
     assert len(notifications) == 4
+    # La alerta nueva tiene su propio estado, independiente del de la borrada.
+    assert await _day_state(db_session, new_alert.id, TODAY) == DayState(episode=1, armed=False)
 
 
 # --- Volumen ---------------------------------------------------------------

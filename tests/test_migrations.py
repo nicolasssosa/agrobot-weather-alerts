@@ -156,6 +156,7 @@ def test_migration_0008_backfills_day_states_for_already_notified_days() -> None
     phone_number = f"+54{uuid.uuid4().int % 10**12:012d}"
     first_day = date(2026, 11, 20)
     second_day = date(2026, 11, 21)
+    cancelled_day = date(2026, 11, 22)
 
     async def _insert_legacy_rows() -> None:
         engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
@@ -192,11 +193,17 @@ def test_migration_0008_backfills_day_states_for_already_notified_days() -> None
                 await conn.execute(
                     text(
                         "INSERT INTO notifications"
-                        " (alert_id, forecast_date, event_type, probability, threshold)"
-                        " VALUES (:alert_id, :first_day, 'frost', 90, 70),"
-                        "        (:alert_id, :second_day, 'frost', 85, 70)"
+                        " (alert_id, forecast_date, event_type, probability, threshold, status)"
+                        " VALUES (:alert_id, :first_day, 'frost', 90, 70, 'pending'),"
+                        "        (:alert_id, :second_day, 'frost', 85, 70, 'pending'),"
+                        "        (:alert_id, :cancelled_day, 'frost', 80, 70, 'cancelled')"
                     ),
-                    {"alert_id": alert_id, "first_day": first_day, "second_day": second_day},
+                    {
+                        "alert_id": alert_id,
+                        "first_day": first_day,
+                        "second_day": second_day,
+                        "cancelled_day": cancelled_day,
+                    },
                 )
         finally:
             await engine.dispose()
@@ -241,6 +248,8 @@ def test_migration_0008_backfills_day_states_for_already_notified_days() -> None
         assert asyncio.run(_day_states()) == [
             (first_day, 1, False),
             (second_day, 1, False),
+            # El backfill cubre también las notificaciones canceladas: el día existió.
+            (cancelled_day, 1, False),
         ]
     finally:
         # La base tiene que quedar en `head` para el resto de la suite.

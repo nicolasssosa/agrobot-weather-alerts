@@ -894,6 +894,83 @@ async def test_patch_without_rearm_does_not_renotify_the_day(
     assert await _evaluate(db_session) == 0
 
 
+async def test_patch_changing_the_threshold_and_pausing_at_once_rearms_and_cancels(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """El cambio de umbral basta para re-armar aunque el PATCH también pause la alerta.
+
+    `is_active` false no re-arma por sí solo, pero no cancela el efecto del umbral: es la
+    misma transacción y el orden documentado (estado -> notificaciones).
+    """
+    user = await make_user()
+    alert = await make_alert(await make_field(user=user), event_type=EventType.FROST, threshold=70)
+    day = date(2026, 11, 20)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=3, armed=False))
+    pending = Notification(
+        alert_id=alert.id,
+        forecast_date=day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+
+    response = await client.patch(
+        f"{API}/{alert.id}", json={"threshold": 80, "is_active": False}, headers=auth(user)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["threshold"] == 80
+    assert response.json()["is_active"] is False
+    state = await _day_state(db_session, alert.id, day)
+    assert state is not None
+    assert (state.episode, state.armed) == (3, True)
+    await db_session.refresh(pending)
+    assert pending.status == NotificationStatus.CANCELLED
+    assert pending.last_error == "alert_reset"
+
+
+async def test_patch_of_another_users_alert_does_not_rearm_or_cancel(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Ownership: un PATCH ajeno da 404 y no toca el estado ni las pendientes del dueño."""
+    owner = await make_user()
+    intruder = await make_user()
+    alert = await make_alert(await make_field(user=owner), event_type=EventType.FROST, threshold=70)
+    day = date(2026, 11, 20)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=day, episode=1, armed=False))
+    pending = Notification(
+        alert_id=alert.id,
+        forecast_date=day,
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+    )
+    db_session.add(pending)
+    await db_session.flush()
+
+    response = await client.patch(
+        f"{API}/{alert.id}", json={"threshold": 80}, headers=auth(intruder)
+    )
+
+    assert response.status_code == 404
+    state = await _day_state(db_session, alert.id, day)
+    assert state is not None
+    assert (state.episode, state.armed) == (1, False)
+    await db_session.refresh(pending)
+    assert pending.status == NotificationStatus.PENDING
+    assert pending.last_error is None
+
+
 @pytest.mark.parametrize(
     "payload",
     [
