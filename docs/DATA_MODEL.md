@@ -198,7 +198,7 @@ Constraints / índices: `UNIQUE (alert_id, forecast_date)` (target del upsert de
 las búsquedas por `alert_id` del re-armado). Modelo: `app/models/alert_day_state.py`, clase
 `AlertDayState`.
 
-> Las filas de días pasados no se borran; la purga entra en el job de retención (S14).
+> Las filas de días pasados no se borran (no hay job de retención).
 
 ## Migración 0009 — horario de silencio por usuario (S13)
 
@@ -263,7 +263,7 @@ Respuestas guardadas de `POST /alerts` (ver API.md §Idempotency-Key en `POST /a
 
 - `UNIQUE (user_id, scope, key)`.
 - Migración 0006: borra las filas que no sean de `POST /api/v1/alerts`, pasa `user_id` a `NOT NULL` y recrea el UNIQUE sin `NULLS NOT DISTINCT`. `downgrade()` revierte la estructura (las filas borradas no se recuperan: son respuestas cacheadas, no datos de negocio).
-- Índice en `expires_at` (purga en S14).
+- Índice en `expires_at` (permite una purga de claves vencidas; hoy no hay job de retención).
 
 ## Migración 0003 — alertas: borrado lógico y varios umbrales (S9)
 

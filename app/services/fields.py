@@ -9,16 +9,20 @@ from decimal import Decimal
 from time import monotonic
 from typing import Final
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.config import get_settings
 from app.core.errors import ConflictError, DomainError, NotFoundError
-from app.models import Field
+from app.models import Field, User
 from app.schemas.common import BIGINT_MAX
 from app.schemas.field import FieldCreate
 from app.services._db_errors import is_unique_violation
 from app.services.timezones import PG_TIMEZONE_NAMES
+
+#: Detalle del 409 por cuota de campos (docs/API.md §fields, "Límite", S14a).
+FIELD_LIMIT_DETAIL: Final = "Field limit reached for this user"
 
 #: TTL del caché por proceso del set de zonas (la tz database cambia con cada release de
 #: Postgres/OS: 5 minutos son suficientes para no consultar en cada request).
@@ -57,18 +61,43 @@ async def is_supported_timezone(session: AsyncSession, timezone: str) -> bool:
     return timezone in _timezone_names
 
 
+async def _fields_in_use(session: AsyncSession, user_id: int) -> int:
+    """Serializa por usuario el conteo y el INSERT de campos (S14a, D16).
+
+    `SELECT ... FROM users WHERE id = :user_id FOR NO KEY UPDATE` deja la fila del usuario
+    bloqueada hasta el commit/rollback de esta transacción: dos creaciones concurrentes con un
+    solo lugar libre se ordenan y la segunda cuenta el campo de la primera. `FOR NO KEY UPDATE`
+    (no `FOR UPDATE`) no bloquea los INSERT de `fields` que validan la FK. Un usuario
+    inexistente no bloquea nada: el INSERT falla con la FK, como antes.
+    """
+    await session.execute(select(User.id).where(User.id == user_id).with_for_update(key_share=True))
+    return (
+        await session.execute(
+            select(func.count()).select_from(Field).where(Field.user_id == user_id)
+        )
+    ).scalar_one()
+
+
 async def create_field(session: AsyncSession, user_id: int, data: FieldCreate) -> Field:
     """Crea un campo del usuario. Nombre duplicado -> `ConflictError`.
 
     Valida la zona contra `pg_timezone_names` antes de insertar: si Postgres no la conoce,
     `InvalidTimezoneError` (422). La unicidad se detecta con `flush()` (sqlstate 23505), no
     con el commit.
+
+    Cuota (S14a, D16): con `MAX_FIELDS_PER_USER` campos, el siguiente -> 409
+    `Field limit reached for this user`. Se chequea **antes** que el nombre duplicado y el
+    conteo se serializa con el INSERT bloqueando la fila del usuario (`FOR NO KEY UPDATE`).
     """
     if not await is_supported_timezone(session, data.timezone):
         raise InvalidTimezoneError(
             f"Invalid timezone {data.timezone!r}: it is not a timezone recognized by PostgreSQL "
             "(pg_timezone_names)"
         )
+    if await _fields_in_use(session, user_id) >= get_settings().max_fields_per_user:
+        # Sin rollback explícito: la transacción del llamador se revierte al cerrar la sesión
+        # (el 409 no debe descartar trabajo previo del mismo request).
+        raise ConflictError(FIELD_LIMIT_DETAIL)
     field = Field(
         user_id=user_id,
         name=data.name,

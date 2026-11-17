@@ -323,12 +323,12 @@ async def test_a_deeply_nested_body_returns_a_bounded_422(
     assert "<truncated>" in json.dumps(detail)
 
 
-async def test_a_one_megabyte_input_returns_a_small_422(
-    client: AsyncClient, make_user: MakeUser
-) -> None:
-    # SEC-2: el `input` de 1 MB se trunca a 200 caracteres; el body del 422 queda chico.
+async def test_a_large_input_returns_a_small_422(client: AsyncClient, make_user: MakeUser) -> None:
+    # SEC-2: el `input` gigante se trunca a 200 caracteres; el body del 422 queda chico.
+    # S14a: el body se mantiene por debajo de `MAX_REQUEST_BODY_BYTES` (65536), así el
+    # middleware de tamaño no responde 413 antes de llegar a la validación.
     user = await make_user()
-    huge_threshold = "9" * (1024 * 1024)
+    huge_threshold = "9" * 60_000
 
     response = await client.post(
         ALERTS,

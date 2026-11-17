@@ -10,9 +10,14 @@ Desde S12b (D1) la evaluación es **por episodio**: `alert_day_states` guarda, p
 llega al umbral dispara el episodio siguiente; un día disparado se re-arma cuando la
 probabilidad baja de `max(threshold - REARM_MARGIN, 1)`; entre esos dos valores está la
 banda de histéresis. `UNIQUE (alert_id, forecast_date, episode)` es la red de seguridad de
-idempotencia. Antes de evaluar se toma `pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)`: una
-sola réplica evalúa por vez, así dos snapshots distintos no re-arman y disparan el mismo
-día (episodio duplicado).
+idempotencia. Antes de evaluar se pide `pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)` **en cola**
+(bloqueante) con una espera acotada: una sola réplica evalúa por vez, así dos snapshots
+distintos no re-arman y disparan el mismo día (episodio duplicado). La espera (S14a SEC-1) es
+lo que impide que un flujo constante de PATCH con el lock compartido abierto deje al
+evaluador sin turno: su pedido exclusivo encolado hace esperar a los `lock_shared` nuevos.
+Si la espera vence (otra evaluación o un PATCH abierto más que `lock_wait_ms`), no evalúa,
+devuelve 0 y loguea `evaluation_skipped reason=lock_busy wait_ms=<n>` (warning), así el worker
+sigue al despacho del mismo ciclo.
 
 Desde S12a (D9) el "hoy" es **local de cada campo**: `(:now AT TIME ZONE fields.timezone)::date`,
 con `now` un `TIMESTAMPTZ` en UTC. Se evalúa `[hoy_local, hoy_local + horizon_days)`; el
@@ -58,6 +63,7 @@ from sqlalchemy import (
     update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnExpressionArgument
 from sqlalchemy.sql.selectable import CTE
@@ -76,6 +82,13 @@ logger = logging.getLogger(__name__)
 
 #: Clave del lock de evaluación (`pg_advisory_xact_lock`): una réplica evalúa por vez.
 EVALUATOR_LOCK_KEY: int = 202611170008
+
+#: Espera por defecto del lock de evaluación si el llamador no la pasa (S14a). Es el mismo
+#: default que `Settings.evaluator_lock_wait_ms`; el worker siempre pasa el valor configurado.
+DEFAULT_LOCK_WAIT_MS: int = 10000
+
+#: sqlstate de `lock_timeout` vencido (docs/JOBS.md §Evaluador paso 0, S14a).
+_LOCK_NOT_AVAILABLE_SQLSTATE = "55P03"
 
 #: Columnas del INSERT ... SELECT de notificaciones, en el mismo orden que el `select`.
 _INSERT_COLUMNS = (
@@ -409,6 +422,62 @@ def _build_invalid_timezone_statement() -> Select[tuple[int]]:
     )
 
 
+def _is_lock_not_available(exc: DBAPIError) -> bool:
+    """¿El error es un `lock_timeout` vencido (sqlstate 55P03)?
+
+    asyncpg expone `sqlstate` en `orig` (o en su `__cause__`) y otras versiones de DBAPI usan
+    `pgcode`: se aceptan las dos formas, igual que `app/core/errors.py`.
+    """
+    orig = exc.orig
+    for candidate in (orig, getattr(orig, "__cause__", None)):
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if sqlstate is not None:
+            return str(sqlstate) == _LOCK_NOT_AVAILABLE_SQLSTATE
+    return False
+
+
+async def _lock_timeout(session: AsyncSession) -> str:
+    """`lock_timeout` vigente de la conexión (valor del GUC: `0`, `5s`, ...)."""
+    value: str = (await session.execute(select(func.current_setting("lock_timeout")))).scalar_one()
+    return value
+
+
+async def _set_lock_timeout(session: AsyncSession, value: str) -> None:
+    """Fija `lock_timeout` solo para lo que resta de la transacción (`SET LOCAL`)."""
+    await session.execute(select(func.set_config("lock_timeout", value, True)))
+
+
+async def _take_evaluation_lock(session: AsyncSession, *, lock_wait_ms: int) -> bool:
+    """Toma el lock de evaluación **en cola**, con una espera acotada (S14a, JOBS.md paso 0).
+
+    `pg_advisory_xact_lock` espera en vez de rendirse de una: mientras el pedido exclusivo
+    está encolado, los `pg_advisory_xact_lock_shared` nuevos de los PATCH esperan detrás, así
+    un flujo constante de PATCH no deja al evaluador sin turno (S14a SEC-1).
+
+    La espera se acota con `lock_timeout` **solo para esa sentencia**, dentro de un savepoint:
+    si vence (sqlstate 55P03), el rollback del savepoint descarta la sentencia y su GUC local,
+    se restaura el `lock_timeout` de la conexión y la transacción sigue usable.
+
+    Devuelve `True` si el lock quedó tomado y `False` si la espera venció.
+    """
+    previous = await _lock_timeout(session)
+    try:
+        async with session.begin_nested():
+            await _set_lock_timeout(session, str(lock_wait_ms))
+            await session.execute(select(func.pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)))
+    except DBAPIError as exc:
+        if not _is_lock_not_available(exc):
+            raise
+        # El savepoint ya hizo rollback (la sentencia y su GUC local se descartaron): se deja
+        # el `lock_timeout` de la conexión como estaba y la transacción sigue usable.
+        await _set_lock_timeout(session, previous)
+        logger.warning("evaluation_skipped reason=lock_busy wait_ms=%d", lock_wait_ms)
+        return False
+    # El `SET LOCAL` sobrevive al release del savepoint: se devuelve el valor de la conexión.
+    await _set_lock_timeout(session, previous)
+    return True
+
+
 async def evaluate_alerts(
     session: AsyncSession,
     *,
@@ -417,6 +486,7 @@ async def evaluate_alerts(
     max_forecast_age_hours: int,
     future_tolerance_minutes: int,
     rearm_margin: int,
+    lock_wait_ms: int = DEFAULT_LOCK_WAIT_MS,
 ) -> int:
     """Crea las notificaciones pendientes que disparan las alertas activas.
 
@@ -434,6 +504,12 @@ async def evaluate_alerts(
     que dos réplicas no generen episodios duplicados. `UNIQUE (alert_id, forecast_date,
     episode)` es la red de seguridad de idempotencia.
 
+    El lock se pide en cola con una espera máxima de `lock_wait_ms` (S14a SEC-1). Si vence
+    (otra réplica evaluando o un PATCH de alerta abierto con el lock compartido más que eso)
+    devuelve 0 sin tocar nada y loguea `evaluation_skipped reason=lock_busy wait_ms=<n>`
+    (warning); la sesión queda usable y el `lock_timeout` vuelve al de la conexión. La
+    evaluación se hace en el ciclo siguiente y el worker sigue al despacho del mismo ciclo.
+
     Matchea por campo y tipo de evento y solo pronósticos dentro de la ventana de frescura
     (`issued_at >= now - max_forecast_age_hours`, borde incluido). Un `issued_at` posterior a
     `now + future_tolerance_minutes` tampoco se evalúa (S11 SEC-1).
@@ -447,8 +523,11 @@ async def evaluate_alerts(
     notificaciones nuevas, contada por Postgres dentro de la misma sentencia (sin
     materializar el `RETURNING` en Python).
     """
-    # Una sola réplica evalúa por vez: la otra espera y su snapshot ve lo ya commiteado.
-    await session.execute(select(func.pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)))
+    # Una sola réplica evalúa por vez. Se espera en la cola un máximo de `lock_wait_ms`
+    # (S14a SEC-1): si otra evaluación o un PATCH lo tiene tomado más que eso, el ciclo se
+    # saltea y el worker sigue al despacho.
+    if not await _take_evaluation_lock(session, lock_wait_ms=lock_wait_ms):
+        return 0
 
     rearmed: int = (
         await session.execute(

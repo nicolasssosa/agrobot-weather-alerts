@@ -155,13 +155,24 @@ usuario y horario de silencio y §Worker.
 - [x] Los tests existentes del dispatcher y el worker siguen verdes (se ajustan solo los que asumían un mensaje por notificación para un mismo usuario; justificarlo en el reporte).
 - [x] OpenAPI regenerado (`make openapi`) y test de contrato verde.
 
-## S14 — Operación · D16
-- [ ] `statement_timeout`/`lock_timeout`; cuotas por usuario; notificaciones `failed` reintentables; job de retención (pronósticos pasados, `alert_day_states` de días pasados, claves de idempotencia vencidas); límite de tamaño de request y de cantidad de errores en el 422 (follow-ups S4).
+## S14a — Límites operativos · D16, RNF-04 · ✅
+Archivos: `app/core/config.py` (settings nuevos), `app/core/db.py` (`build_engine` + timeouts),
+`app/core/errors.py` (tope de errores del 422 y handler 503), `app/api/middleware.py` (nuevo),
+`app/main.py` (solo registrar el middleware), `app/services/fields.py`, `app/api/routers/fields.py`
+(solo el texto del 409 en `responses=`), `app/jobs/evaluator.py` (lock con espera acotada),
+`app/services/alerts.py` (orden del lock compartido), `app/jobs/worker.py` (evaluación fallida no frena el despacho),
+`.env.example`, `docs/openapi.json` (si cambia), tests.
+Contrato: API.md §Convenciones y §fields, JOBS.md §Evaluador (paso 0).
+- [x] Timeouts de DB: `DB_STATEMENT_TIMEOUT_MS` (default 30000) y `DB_LOCK_TIMEOUT_MS` (default 5000), 0 = sin límite, aplicados a **todas** las conexiones del engine de la app (API y worker) como `server_settings` de asyncpg desde `build_engine(settings)`; `get_engine()` lo usa. Las migraciones (`migrations/env.py`) no cambian. Test: una conexión de `build_engine` devuelve los valores configurados en `SHOW statement_timeout` / `SHOW lock_timeout`; con 0 no hay límite.
+- [x] API: un error de Postgres por `lock_timeout` (sqlstate `55P03`) o `statement_timeout` (`57014`) → **503** `{"detail": "Database busy, try again later"}` con header `Retry-After: 1` y log `db_timeout sqlstate=<s> path=<path>` (warning). Cualquier otro error de DB sigue como hasta ahora. Test con un lock retenido desde otra conexión.
+- [x] Evaluador: el lock de evaluación se pide **en cola** (`pg_advisory_xact_lock`, bloqueante) con una espera acotada a `EVALUATOR_LOCK_WAIT_MS` (default 10000, rango 100..60000) dentro de un savepoint; si vence, no evalúa, devuelve 0 y loguea `evaluation_skipped reason=lock_busy wait_ms=<n>` (**warning**). El `lock_timeout` del resto de la transacción vuelve al valor de la conexión. Los PATCH de alertas toman `pg_advisory_xact_lock_shared` **después** de verificar la ownership (un 404 no toma el lock) y antes del UPDATE (S14a SEC-1).
+- [x] Worker: si la evaluación falla (excepción, incluido un `statement_timeout`), `run_cycle` loguea `evaluation_failed` con el stack, hace rollback y **sigue al despacho** del mismo ciclo (S14a CR-2).
+- [x] Cuota de campos: `MAX_FIELDS_PER_USER` (default 20, rango 1..1000). Crear el campo número N+1 → 409 `Field limit reached for this user`. La cuenta y el insert se serializan por usuario (`SELECT ... FROM users WHERE id = :user_id FOR NO KEY UPDATE` antes de contar): dos creaciones concurrentes con un solo lugar libre → una 201 y una 409. El límite se chequea **antes** que el nombre duplicado.
+- [x] Tamaño de request: middleware ASGI puro (no `BaseHTTPMiddleware`) con `MAX_REQUEST_BODY_BYTES` (default 65536, rango 1024..1048576). `Content-Length` mayor al límite → 413 `{"detail": "Request body too large"}` sin leer el body; sin `Content-Length` (chunked) corta al superar el límite con el mismo 413. Exactamente el límite → pasa. Log `request_body_too_large path=<path> limit=<n>` (warning).
+- [x] 422 acotado: como máximo 20 errores en `detail` (los primeros, en el orden de FastAPI); si hay más, se agrega un último elemento `{"loc": [], "msg": "<n> more errors omitted", "type": "too_many_errors"}` con `n` = cantidad omitida. Con 20 o menos, la respuesta no cambia.
+- [x] Settings nuevos en `config.py` y `.env.example`. OpenAPI regenerado si cambia algún texto; test de contrato verde.
 
-## S15 — Observabilidad
-- [ ] Logs JSON estructurados con `request_id`; métricas Prometheus (`/metrics`); `GET /health/live` y `/health/ready` (DB + heartbeat del worker).
-
-## S16 — CI (GitHub Actions) + pre-commit + cobertura + GitHub Pages · RNF-07
+## S16 — CI (GitHub Actions) + pre-commit + cobertura + GitHub Pages · RNF-07 · ✅
 Archivos: `.github/workflows/ci.yml` (nuevo), `site/index.html` (nuevo), `.pre-commit-config.yaml` (nuevo),
 `pyproject.toml` + `uv.lock` (dependencia dev `pytest-cov` y config de cobertura), `Makefile` (target `cov`),
 `.gitignore` (salidas de cobertura), `app/jobs/worker.py` (SEC-3), `app/scripts/seed.py` (SEC-5),
@@ -206,8 +217,8 @@ Follow-ups:
 | S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | ✅ documentado en API.md §Convenciones |
 | S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | ✅ resuelto en S4 |
 | S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
-| S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | README §Próximos pasos |
-| S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | README §Próximos pasos |
+| S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | **S14a** |
+| S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | **S14a** (`MAX_FIELDS_PER_USER`; el horizonte ya está en S12a) |
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
 | S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
 | S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |
@@ -216,7 +227,9 @@ Follow-ups:
 | S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S16** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
 | S9 CR-2 | nit | Migración 0003 transaccional (bloquea escrituras mientras crea el índice); en producción con tablas grandes usar `CONCURRENTLY` / `NOT VALID` (documentado en DATA_MODEL) | — |
-| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | **S15** (logs) |
+| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | README §Próximos pasos |
 | S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | S17 |
 | S16 CR-1 | minor | El primer deploy de Pages requiere Pages habilitado con source "GitHub Actions" (el `GITHUB_TOKEN` no puede habilitarlo) | paso único al hacer público el repo |
 | S12b CR-2 | nit | Tests de lock/carrera de S12b: si una regresión deja un PATCH colgado, el cleanup puede bloquearse en vez de fallar (agregar `statement_timeout` en el cleanup o cancelar la task) | S17 (S16 ya mergeada) |
+| S14a CR-4 | minor | `update_alert` decide el re-armado con la lectura previa al lock compartido: dos PATCH simultáneos sobre la misma alerta pueden perder un re-armado (re-aviso perdido hasta que la probabilidad baje del margen) o hacer uno de más. Fix: releer la alerta con `FOR UPDATE` bajo el lock | README §Limitaciones |
+| S14a CR-5 | nit | Si el `rollback()` del worker tras `evaluation_failed` lanza (conexión caída), ese ciclo no despacha. Fix: proteger el rollback con su propio try/except | README §Limitaciones |

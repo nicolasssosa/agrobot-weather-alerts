@@ -22,6 +22,7 @@ from app.schemas.notification import NotificationPage, NotificationRead
 from app.schemas.user import UserCreate, UserRead, UserUpdate
 from app.scripts.export_openapi import OPENAPI_PATH, render_openapi
 from app.services.alerts import ALERT_LIMIT_DETAIL
+from app.services.fields import FIELD_LIMIT_DETAIL
 
 _HTTP_METHODS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 
@@ -164,6 +165,19 @@ def test_post_alerts_409_documents_the_per_field_limit() -> None:
     # El ejemplo sigue siendo el de unicidad (el contrato existente no cambia).
     assert responses["409"]["content"]["application/json"]["example"] == {
         "detail": "An alert with this field, event type and threshold already exists"
+    }
+
+
+def test_post_fields_409_documents_the_per_user_limit() -> None:
+    """S14a: el 409 de POST /fields también cubre la cuota de campos por usuario."""
+    responses = _spec()["paths"]["/api/v1/fields"]["post"]["responses"]
+
+    description = responses["409"]["description"]
+    assert FIELD_LIMIT_DETAIL in description
+    assert "MAX_FIELDS_PER_USER" in description
+    # El ejemplo sigue siendo el de unicidad (el contrato existente no cambia).
+    assert responses["409"]["content"]["application/json"]["example"] == {
+        "detail": "Field name already exists"
     }
 
 

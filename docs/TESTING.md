@@ -64,6 +64,20 @@ Análogamente:
 - crear → 201 y aparece en el listado; nombre duplicado (mismo user) → 409;
   mismo nombre para otro user → 201; latitud 91 → 422.
 - `GET /fields/{id}` de otro usuario → 404.
+- límite (S14a): con `MAX_FIELDS_PER_USER` campos el siguiente → 409 `Field limit reached for this user`
+  (también si el nombre está duplicado); otro usuario no se ve afectado; dos creaciones concurrentes
+  en conexiones separadas con un solo lugar libre → una 201 y una 409.
+
+### `tests/api/test_limits.py` (S14a)
+- body de `MAX_REQUEST_BODY_BYTES + 1` → 413 con el detail exacto; exactamente el límite → no es 413;
+  body chunked (sin `Content-Length`) mayor al límite → 413.
+- payload con más de 20 errores de validación → 422 con 21 elementos y el último `too_many_errors`
+  con la cantidad omitida correcta; con 20 o menos → sin elemento extra.
+- lock retenido desde otra conexión + `lock_timeout` corto → 503, detail exacto y `Retry-After: 1`.
+
+### `tests/core/test_db.py` (S14a)
+- una conexión de `build_engine(settings)` muestra `statement_timeout` y `lock_timeout` configurados;
+  con 0 → sin límite (`0`).
 
 ### `tests/api/test_forecasts.py`
 - devuelve forecasts del campo ordenados por fecha; filtra por `event_type` y rango;
@@ -89,6 +103,13 @@ Análogamente:
 - varias alertas/días → cuenta correcta.
 - episodios (S12b): arriba → abajo de `rearm_level` → arriba crea el episodio 2; quedarse arriba no
   repite; bajar dentro de la banda de histéresis y volver no repite; pronóstico viejo no re-arma.
+- lock tomado por otra conexión más que `EVALUATOR_LOCK_WAIT_MS` (S14a) → devuelve 0, no crea ni
+  re-arma nada y loguea `evaluation_skipped reason=lock_busy` (warning); el worker igual despacha
+  en ese ciclo; después del skip la sesión sigue usable y el `lock_timeout` vuelve al de la conexión.
+- lock tomado y liberado antes de vencer la espera → evalúa normalmente.
+- con el evaluador encolado, un `lock_shared` nuevo (PATCH) espera detrás de él (no lo adelanta).
+- PATCH de una alerta inexistente o ajena → 404 sin tomar el lock compartido.
+- worker: la evaluación lanza → `evaluation_failed`, y el ciclo igual despacha.
 - equivalencia SQL vs. `app/jobs/episodes.step` en secuencias generadas con semilla fija
   (`random.Random(<n>)`, sin dependencias nuevas).
 
