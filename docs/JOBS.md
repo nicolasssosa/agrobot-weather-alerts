@@ -154,6 +154,12 @@ inactivas no cambian de estado.
 **Re-armado por cambio de alerta** (`app/services/alerts.py`, `update_alert`): si el PATCH cambia
 el `threshold` a un valor distinto o pasa `is_active` de `false` a `true`, en la **misma
 transacción** del UPDATE de la alerta y en este orden:
+0. `SELECT pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)` (S12b SEC-1/CR-1), **antes** del UPDATE
+   de la alerta. Los PATCH no se bloquean entre sí (lock compartido); solo esperan a una evaluación
+   en curso, y el evaluador (lock exclusivo) espera a los PATCH abiertos. Así una evaluación nunca
+   ve un umbral viejo con un estado ya re-armado, ni re-arma después de que el PATCH canceló, y no
+   hay deadlock entre los dos sobre `alert_day_states`. La espera es corta: el worker commitea
+   apenas termina de evaluar, antes de despachar.
 1. `UPDATE alert_day_states SET armed = true, updated_at = now() WHERE alert_id = :id` (= `reset`).
 2. Las notificaciones `pending` **no arrendadas** de la alerta (`next_attempt_at <= now()`, misma
    regla que el DELETE de S9) pasan a `cancelled` con `last_error = 'alert_reset'`.
