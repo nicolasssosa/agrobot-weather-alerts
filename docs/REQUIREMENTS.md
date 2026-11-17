@@ -71,7 +71,7 @@ una notificación cuando los pronósticos almacenados superen ese umbral.
 | D6 | Eventos | `frost`, `rain`, `hail`, `strong_wind`, `heat_wave` (extensibles: VARCHAR + CHECK). | — |
 | D7 | Canal | `Notifier` Protocol; implementación `LoggingNotifier`. | Adaptador WhatsApp (fuera de alcance). |
 | D8 | Auth | Header `X-User-Id` simulado. | Identidad provista por el gateway de WhatsApp. |
-| D9 | "Hoy" | **Fecha local del campo** según su zona IANA (`fields.timezone`, default `America/Argentina/Buenos_Aires`) (S12a). | — |
+| D9 | "Hoy" | **Fecha local del campo** según su zona IANA (`fields.timezone`, default `America/Argentina/Buenos_Aires`) (S12a). Las zonas `Etc/GMT±N` siguen la convención POSIX de signo invertido (`Etc/GMT+12` = UTC−12). | — |
 | D10 | Entrega | At-least-once (puede duplicarse solo si el proceso muere entre el envío y el commit). | Idempotency key en el proveedor. |
 | D11 | Borrado de alertas | **Lógico** (`deleted_at`): DELETE idempotente, el historial de notificaciones se conserva y las pendientes se cancelan (S9). | Borrado físico (pierde el historial). |
 | D12 | Validación al enviar | El dispatcher re-verifica contra la alerta **actual** antes de enviar (activa, no borrada, probabilidad ≥ umbral vigente); si ya no corresponde, la notificación queda `cancelled` (S9). | — |

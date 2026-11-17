@@ -38,6 +38,8 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
         ("longitude", "numeric", "NO", None, 9, 6),
         ("created_at", "timestamp with time zone", "NO", None, None, None),
         ("updated_at", "timestamp with time zone", "NO", None, None, None),
+        # `0007` agrega la columna al final (ADD COLUMN) con el default de D9.
+        ("timezone", "character varying", "NO", 64, None, None),
     ],
     "weather_forecasts": [
         ("id", "bigint", "NO", None, 64, 0),
@@ -336,6 +338,7 @@ async def test_required_column_defaults_match_data_model(db_session: AsyncSessio
         assert defaults[(table, "updated_at")] == "now()"
 
     assert defaults[("alerts", "is_active")] == "true"
+    assert defaults[("fields", "timezone")].startswith("'America/Argentina/Buenos_Aires'")
     assert defaults[("notifications", "status")].startswith("'pending'")
     assert defaults[("notifications", "attempts")] == "0"
     assert defaults[("notifications", "next_attempt_at")] == "now()"
@@ -429,11 +432,11 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_through_0006() -> None:
+def test_migration_chain_is_0001_through_0007() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0006"
+    assert script.get_current_head() == "0007"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
@@ -452,3 +455,6 @@ def test_migration_chain_is_0001_through_0006() -> None:
     idempotency_alerts_only = script.get_revision("0006")
     assert idempotency_alerts_only is not None
     assert idempotency_alerts_only.down_revision == "0005"
+    field_timezone = script.get_revision("0007")
+    assert field_timezone is not None
+    assert field_timezone.down_revision == "0006"

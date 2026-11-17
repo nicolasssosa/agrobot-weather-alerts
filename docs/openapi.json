@@ -202,7 +202,8 @@
           {
             "latitude": -34.6037,
             "longitude": -58.3816,
-            "name": "Lote Norte"
+            "name": "Lote Norte",
+            "timezone": "America/Argentina/Buenos_Aires"
           }
         ],
         "properties": {
@@ -222,6 +223,12 @@
             "maxLength": 120,
             "minLength": 1,
             "title": "Name",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "America/Argentina/Buenos_Aires",
+            "maxLength": 64,
+            "title": "Timezone",
             "type": "string"
           }
         },
@@ -275,7 +282,8 @@
             "id": 1,
             "latitude": -34.6037,
             "longitude": -58.3816,
-            "name": "Lote Norte"
+            "name": "Lote Norte",
+            "timezone": "America/Argentina/Buenos_Aires"
           }
         ],
         "properties": {
@@ -299,6 +307,10 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
           }
         },
         "required": [
@@ -306,6 +318,7 @@
           "name",
           "latitude",
           "longitude",
+          "timezone",
           "created_at"
         ],
         "title": "FieldRead",
@@ -1308,12 +1321,43 @@
           "422": {
             "content": {
               "application/json": {
+                "examples": {
+                  "invalid_body": {
+                    "summary": "Body inválido (validación automática de FastAPI)",
+                    "value": {
+                      "detail": [
+                        {
+                          "input": 91,
+                          "loc": [
+                            "body",
+                            "latitude"
+                          ],
+                          "msg": "Input should be less than or equal to 90",
+                          "type": "less_than_equal"
+                        }
+                      ]
+                    }
+                  },
+                  "unknown_timezone": {
+                    "summary": "Zona desconocida para PostgreSQL (validación del service)",
+                    "value": {
+                      "detail": "Invalid timezone 'localtime': it is not a timezone recognized by PostgreSQL (pg_timezone_names)"
+                    }
+                  }
+                },
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Dos formas según el caso: un body inválido o una zona con formato inválido responde `HTTPValidationError` con `detail` como lista de errores; una zona que PostgreSQL no reconoce con coincidencia exacta (`pg_timezone_names`) responde `ErrorResponse` con `detail` string."
           }
         },
         "security": [

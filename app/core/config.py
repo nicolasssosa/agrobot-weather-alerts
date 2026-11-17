@@ -25,6 +25,9 @@ class Settings(BaseSettings):
     # Frescura máxima de un pronóstico para evaluarlo (docs/JOBS.md §Evaluador, D14).
     max_forecast_age_hours: int = Field(default=24, ge=1, le=168)
 
+    # Horizonte de evaluación en días desde el "hoy" local de cada campo (D2, S12a): 0 = sin límite.
+    alert_horizon_days: int = Field(default=7, ge=0, le=365)
+
     # Tolerancia de reloj para un `issued_at` en el futuro (docs/JOBS.md §Ingesta mock, D14).
     forecast_future_tolerance_minutes: int = Field(default=60, ge=0, le=1440)
 

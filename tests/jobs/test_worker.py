@@ -325,7 +325,7 @@ async def test_run_cycle_does_not_dispatch_when_evaluate_alerts_raises(
     dispatched: list[int] = []
 
     async def failing_evaluate(  # type: ignore[no-untyped-def]
-        session, *, today, now, max_forecast_age_hours, forecast_future_tolerance_minutes
+        session, *, now, horizon_days, max_forecast_age_hours, future_tolerance_minutes
     ):
         raise RuntimeError("evaluation down")
 
@@ -734,7 +734,7 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
     fake_notifier: FakeNotifier,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """El worker le pasa al evaluador su `now` y los settings de frescura (S11)."""
+    """El worker le pasa al evaluador su `now` y los settings de frescura/horizonte (S11/S12a)."""
     captured: dict[str, object] = {}
 
     async def _fake_evaluate(session: AsyncSession, **kwargs: object) -> int:
@@ -751,6 +751,7 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
         dispatch_lease_seconds=60,
         max_forecast_age_hours=6,
         forecast_future_tolerance_minutes=30,
+        alert_horizon_days=3,
     )
 
     await run_cycle(
@@ -762,8 +763,60 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
     )
 
     assert captured == {
-        "today": EVAL_NOW.date(),
         "now": EVAL_NOW,
+        "horizon_days": 3,
         "max_forecast_age_hours": 6,
-        "forecast_future_tolerance_minutes": 30,
+        "future_tolerance_minutes": 30,
     }
+
+
+async def test_one_cycle_evaluates_each_field_with_its_own_local_today(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    make_alert: MakeAlert,
+    fake_notifier: FakeNotifier,
+) -> None:
+    """Dos campos en +14 y -11 en el mismo ciclo: cada uno evalúa su propio "hoy" (D9).
+
+    Con horizonte 1, a las 12:00Z del 2030-01-01 Kiritimati ya está en el 2 y Pago Pago en el
+    1. Los dos campos tienen los mismos pronósticos guardados, así que el ciclo debe crear y
+    enviar exactamente un aviso por campo, cada uno para su día local.
+    """
+    east = await make_field(name="Lote +14")
+    east.timezone = "Pacific/Kiritimati"
+    west = await make_field(name="Lote -11")
+    west.timezone = "Pacific/Pago_Pago"
+    await db_session.flush()
+    alerts = {}
+    for field in (east, west):
+        alert = await make_alert(field, event_type=EventType.FROST, threshold=50)
+        alerts[field.id] = alert
+        for day in (date(2030, 1, 1), date(2030, 1, 2)):
+            await make_forecast(
+                field,
+                forecast_date=day,
+                event_type=EventType.FROST,
+                probability=85,
+                issued_at=EVAL_NOW,
+            )
+    settings = _settings().model_copy(update={"alert_horizon_days": 1})
+
+    result = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        settings,
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert result == CycleResult(created=2, dispatch=DispatchResult(sent=2, retried=0, failed=0))
+    notifications = list((await db_session.execute(select(Notification))).scalars().all())
+    rows = {(notification.alert_id, notification.forecast_date) for notification in notifications}
+    assert rows == {
+        (alerts[east.id].id, date(2030, 1, 2)),
+        (alerts[west.id].id, date(2030, 1, 1)),
+    }
+    assert {notification.status for notification in notifications} == {NotificationStatus.SENT}
+    assert len(fake_notifier.sent) == 2

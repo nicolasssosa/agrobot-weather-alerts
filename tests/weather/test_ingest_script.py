@@ -94,3 +94,54 @@ def test_main_can_run_twice_in_the_same_process(monkeypatch: pytest.MonkeyPatch)
 
     # Sin `cache_clear()` la 2da corrida reusaría el engine disposed de la 1ra (mismo objeto).
     assert after_first is not after_second
+
+
+async def test_run_forwards_the_configured_future_tolerance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC-3: la ingesta usa `FORECAST_FUTURE_TOLERANCE_MINUTES`, no el default del código."""
+    captured: dict[str, object] = {}
+
+    async def _fake_ingest(session: object, provider: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    class _FakeSession:
+        async def __aenter__(self) -> "_FakeSession":
+            return self
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+        async def scalar(self, statement: object) -> int:
+            return 0
+
+        async def commit(self) -> None:
+            return None
+
+    class _FakeEngine:
+        async def dispose(self) -> None:
+            return None
+
+    def _fake_get_engine() -> _FakeEngine:
+        return _FakeEngine()
+
+    def _fake_get_sessionmaker() -> object:
+        return _FakeSession
+
+    _fake_get_engine.cache_clear = lambda: None  # type: ignore[attr-defined]
+    _fake_get_sessionmaker.cache_clear = lambda: None  # type: ignore[attr-defined]
+    monkeypatch.setattr(ingest_module, "get_engine", _fake_get_engine)
+    monkeypatch.setattr(ingest_module, "get_sessionmaker", _fake_get_sessionmaker)
+    monkeypatch.setattr(ingest_module, "ingest_forecasts", _fake_ingest)
+    monkeypatch.setattr(
+        ingest_module,
+        "get_settings",
+        lambda: Settings(forecast_future_tolerance_minutes=17),
+    )
+
+    rows = await ingest_module._run(4)
+
+    assert rows == 0
+    assert captured["days"] == 4
+    assert captured["future_tolerance_minutes"] == 17

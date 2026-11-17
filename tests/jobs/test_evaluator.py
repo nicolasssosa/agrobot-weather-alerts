@@ -43,18 +43,22 @@ FUTURE_TOLERANCE_MINUTES = 60
 def _evaluate(
     session: AsyncSession,
     *,
-    today: date = TODAY,
     now: datetime = NOW,
+    horizon_days: int = 0,
     max_forecast_age_hours: int = MAX_AGE_HOURS,
-    forecast_future_tolerance_minutes: int = FUTURE_TOLERANCE_MINUTES,
+    future_tolerance_minutes: int = FUTURE_TOLERANCE_MINUTES,
 ) -> Awaitable[int]:
-    """Corre el evaluador con `today`/`now`/ventana fijos (nunca el reloj real)."""
+    """Corre el evaluador con `now`/ventana fijos (nunca el reloj real).
+
+    `horizon_days=0` reproduce el comportamiento previo a S12a (sin horizonte); los tests del
+    horizonte lo pasan explícito.
+    """
     return evaluate_alerts(
         session,
-        today=today,
         now=now,
+        horizon_days=horizon_days,
         max_forecast_age_hours=max_forecast_age_hours,
-        forecast_future_tolerance_minutes=forecast_future_tolerance_minutes,
+        future_tolerance_minutes=future_tolerance_minutes,
     )
 
 
@@ -74,10 +78,10 @@ def _compiled_sql(*, literal_binds: bool = False) -> str:
     options = {"literal_binds": True} if literal_binds else {}
     return str(
         _build_statement(
-            TODAY,
             now=NOW,
+            horizon_days=0,
             max_forecast_age_hours=MAX_AGE_HOURS,
-            forecast_future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+            future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
         ).compile(dialect=postgresql.dialect(), compile_kwargs=options)
     )
 
@@ -518,15 +522,23 @@ async def test_no_forecasts_returns_zero(
 # --- "Hoy" en los bordes de mes / año -------------------------------------
 
 
-@pytest.mark.parametrize("today", [date(2026, 12, 31), date(2027, 1, 1)])
+@pytest.mark.parametrize(
+    "now",
+    [
+        datetime(2026, 12, 31, 12, 0, tzinfo=UTC),
+        datetime(2027, 1, 1, 12, 0, tzinfo=UTC),
+    ],
+)
 async def test_today_at_month_and_year_boundary(
     db_session: AsyncSession,
     make_field: MakeField,
     make_alert: MakeAlert,
     make_forecast: MakeForecast,
-    today: date,
+    now: datetime,
 ) -> None:
-    """El corte `forecast_date >= today` es correcto cruzando fin de mes y de año."""
+    """El corte `forecast_date >= hoy local` es correcto cruzando fin de mes y de año."""
+    # 12:00Z es el mismo día calendario en Buenos Aires (09:00 -03:00).
+    today = now.date()
     field = await make_field()
     await make_alert(field, event_type=EventType.FROST, threshold=50)
     for offset in (-1, 0, 1):
@@ -535,9 +547,10 @@ async def test_today_at_month_and_year_boundary(
             forecast_date=today + timedelta(days=offset),
             event_type=EventType.FROST,
             probability=80,
+            issued_at=now,
         )
 
-    created = await _evaluate(db_session, today=today)
+    created = await _evaluate(db_session, now=now)
 
     assert created == 2
     dates = {notification.forecast_date for notification in await _notifications(db_session)}
@@ -788,16 +801,16 @@ async def test_thirty_days_five_events_multiple_alerts_counted_exactly(
 
 
 async def _evaluate_and_commit(
-    session_factory: async_sessionmaker[AsyncSession], *, today: date
+    session_factory: async_sessionmaker[AsyncSession], *, now: datetime
 ) -> int:
     """Corre el evaluador en su propia conexión y commitea (libera locks del INSERT)."""
     async with session_factory() as session:
         created = await evaluate_alerts(
             session,
-            today=today,
-            now=NOW,
+            now=now,
+            horizon_days=0,
             max_forecast_age_hours=MAX_AGE_HOURS,
-            forecast_future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+            future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
         )
         await session.commit()
         return created
@@ -852,8 +865,8 @@ async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
         expected = len(days) * len(EventType)
 
         first, second = await asyncio.gather(
-            _evaluate_and_commit(session_factory, today=TODAY),
-            _evaluate_and_commit(session_factory, today=TODAY),
+            _evaluate_and_commit(session_factory, now=NOW),
+            _evaluate_and_commit(session_factory, now=NOW),
         )
 
         assert first + second == expected
@@ -1310,3 +1323,245 @@ async def test_a_forecast_within_the_future_tolerance_is_evaluated(
     )
 
     assert await _evaluate(db_session) == 1
+
+
+# --- "Hoy" local por campo y horizonte (S12a, D9/D2) -----------------------
+
+
+async def test_local_today_uses_the_field_timezone(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """A las 01:00Z del 17 en Buenos Aires todavía es 16; en UTC ya es 17 (D9)."""
+    now = datetime(2026, 11, 17, 1, 0, tzinfo=UTC)
+
+    buenos_aires = await make_field(name="Lote Buenos Aires")
+    buenos_aires.timezone = "America/Argentina/Buenos_Aires"
+    utc_field = await make_field(name="Lote UTC")
+    utc_field.timezone = "UTC"
+    await db_session.flush()
+
+    ba_alert = await make_alert(buenos_aires, event_type=EventType.FROST, threshold=50)
+    await make_alert(utc_field, event_type=EventType.FROST, threshold=50)
+    await make_forecast(
+        buenos_aires,
+        forecast_date=date(2026, 11, 16),
+        event_type=EventType.FROST,
+        probability=80,
+        issued_at=now,
+    )
+    await make_forecast(
+        utc_field,
+        forecast_date=date(2026, 11, 16),
+        event_type=EventType.FROST,
+        probability=80,
+        issued_at=now,
+    )
+
+    created = await _evaluate(db_session, now=now)
+
+    assert created == 1
+    [notification] = await _notifications(db_session)
+    assert notification.alert_id == ba_alert.id
+    assert notification.forecast_date == date(2026, 11, 16)
+
+
+async def test_a_timezone_ahead_of_utc_uses_its_own_local_today(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """A las 20:00Z del 16 en Tokio ya es el 17: el día local 16 quedó atrás."""
+    now = datetime(2026, 11, 16, 20, 0, tzinfo=UTC)
+
+    tokyo = await make_field(name="Lote Tokio")
+    tokyo.timezone = "Asia/Tokyo"
+    await db_session.flush()
+    alert = await make_alert(tokyo, event_type=EventType.RAIN, threshold=50)
+    for day in (date(2026, 11, 16), date(2026, 11, 17)):
+        await make_forecast(
+            tokyo,
+            forecast_date=day,
+            event_type=EventType.RAIN,
+            probability=80,
+            issued_at=now,
+        )
+
+    created = await _evaluate(db_session, now=now)
+
+    assert created == 1
+    [notification] = await _notifications(db_session)
+    assert notification.alert_id == alert.id
+    assert notification.forecast_date == date(2026, 11, 17)
+
+
+async def test_the_horizon_is_relative_to_the_fields_local_today(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Ventana `[hoy_local, hoy_local + 7)`: hoy+6 dispara, hoy+7 no (D2)."""
+    now = datetime(2026, 11, 17, 1, 0, tzinfo=UTC)  # hoy local 16 en Buenos Aires
+
+    field = await make_field(name="Lote Horizonte")
+    field.timezone = "America/Argentina/Buenos_Aires"
+    await db_session.flush()
+    await make_alert(field, event_type=EventType.HAIL, threshold=50)
+    today = date(2026, 11, 16)
+    inside = today + timedelta(days=6)
+    outside = today + timedelta(days=7)
+    for day in (inside, outside):
+        await make_forecast(
+            field,
+            forecast_date=day,
+            event_type=EventType.HAIL,
+            probability=80,
+            issued_at=now,
+        )
+
+    assert await _evaluate(db_session, now=now, horizon_days=7) == 1
+    [notification] = await _notifications(db_session)
+    assert notification.forecast_date == inside
+
+    # `0` = sin límite superior: el día que quedaba afuera ahora dispara.
+    assert await _evaluate(db_session, now=now, horizon_days=0) == 1
+    dates = {n.forecast_date for n in await _notifications(db_session)}
+    assert dates == {inside, outside}
+
+
+async def test_a_horizon_of_zero_has_no_upper_bound(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    field = await make_field()
+    await make_alert(field, event_type=EventType.HEAT_WAVE, threshold=40)
+    far = TODAY + timedelta(days=365)
+    await make_forecast(
+        field,
+        forecast_date=far,
+        event_type=EventType.HEAT_WAVE,
+        probability=60,
+        issued_at=NOW,
+    )
+
+    assert await _evaluate(db_session, now=NOW, horizon_days=0) == 1
+    [notification] = await _notifications(db_session)
+    assert notification.forecast_date == far
+
+
+def test_the_local_today_and_horizon_are_computed_in_sql() -> None:
+    """El "hoy" sale de `AT TIME ZONE fields.timezone`; no se calcula en Python (S12a)."""
+    sql = str(
+        _build_statement(
+            now=NOW,
+            horizon_days=7,
+            max_forecast_age_hours=MAX_AGE_HOURS,
+            future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+        ).compile(dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True})
+    )
+
+    assert "AT TIME ZONE fields.timezone" in sql
+    assert "CAST(" in sql
+    assert "fields.timezone" in sql
+    assert "weather_forecasts.forecast_date <" in sql
+
+
+# --- Pronósticos con `issued_at` adelantado (S12a SEC-4) -------------------
+
+
+async def test_future_forecasts_are_reported_with_counts(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """El warning cuenta pronósticos excluidos por adelantados y sus campos (SEC-4)."""
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    too_far = NOW + timedelta(minutes=FUTURE_TOLERANCE_MINUTES + 1)
+
+    first = await make_field()
+    await make_alert(first, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        first,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=too_far,
+    )
+    second = await make_field()
+    await make_alert(second, event_type=EventType.RAIN, threshold=50)
+    for offset in range(2):
+        await make_forecast(
+            second,
+            forecast_date=TODAY + timedelta(days=offset),
+            event_type=EventType.RAIN,
+            probability=80,
+            issued_at=too_far,
+        )
+    # Una alerta pausada no cuenta (no se evalúa).
+    paused = await make_field()
+    await make_alert(paused, event_type=EventType.HAIL, threshold=50, is_active=False)
+    await make_forecast(
+        paused,
+        forecast_date=TODAY,
+        event_type=EventType.HAIL,
+        probability=100,
+        issued_at=too_far,
+    )
+    await db_session.flush()
+
+    assert await _evaluate(db_session, now=NOW) == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert "future_forecasts count=3 fields=2 tolerance_minutes=60" in messages
+
+
+async def test_no_future_warning_when_every_forecast_is_within_the_tolerance(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=NOW + timedelta(minutes=FUTURE_TOLERANCE_MINUTES),
+    )
+
+    assert await _evaluate(db_session, now=NOW) == 1
+    assert "future_forecasts" not in caplog.text
+
+
+async def test_future_forecast_outside_the_horizon_is_not_counted(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """El warning sólo cuenta la ventana evaluada: un día fuera del horizonte no cuenta."""
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY + timedelta(days=7),
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=NOW + timedelta(minutes=FUTURE_TOLERANCE_MINUTES + 1),
+    )
+
+    assert await _evaluate(db_session, now=NOW, horizon_days=7) == 0
+    assert "future_forecasts" not in caplog.text
