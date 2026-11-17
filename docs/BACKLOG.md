@@ -155,8 +155,24 @@ usuario y horario de silencio y §Worker.
 - [x] Los tests existentes del dispatcher y el worker siguen verdes (se ajustan solo los que asumían un mensaje por notificación para un mismo usuario; justificarlo en el reporte).
 - [x] OpenAPI regenerado (`make openapi`) y test de contrato verde.
 
-## S14 — Operación · D16
-- [ ] `statement_timeout`/`lock_timeout`; cuotas por usuario; notificaciones `failed` reintentables; job de retención (pronósticos pasados, `alert_day_states` de días pasados, claves de idempotencia vencidas); límite de tamaño de request y de cantidad de errores en el 422 (follow-ups S4).
+## S14a — Límites operativos · D16, RNF-04
+Archivos: `app/core/config.py` (settings nuevos), `app/core/db.py` (`build_engine` + timeouts),
+`app/core/errors.py` (tope de errores del 422 y handler 503), `app/api/middleware.py` (nuevo),
+`app/main.py` (solo registrar el middleware), `app/services/fields.py`, `app/api/routers/fields.py`
+(solo el texto del 409 en `responses=`), `app/jobs/evaluator.py` (lock no bloqueante),
+`.env.example`, `docs/openapi.json` (si cambia), tests.
+Contrato: API.md §Convenciones y §fields, JOBS.md §Evaluador (paso 0).
+- [ ] Timeouts de DB: `DB_STATEMENT_TIMEOUT_MS` (default 30000) y `DB_LOCK_TIMEOUT_MS` (default 5000), 0 = sin límite, aplicados a **todas** las conexiones del engine de la app (API y worker) como `server_settings` de asyncpg desde `build_engine(settings)`; `get_engine()` lo usa. Las migraciones (`migrations/env.py`) no cambian. Test: una conexión de `build_engine` devuelve los valores configurados en `SHOW statement_timeout` / `SHOW lock_timeout`; con 0 no hay límite.
+- [ ] API: un error de Postgres por `lock_timeout` (sqlstate `55P03`) o `statement_timeout` (`57014`) → **503** `{"detail": "Database busy, try again later"}` con header `Retry-After: 1` y log `db_timeout sqlstate=<s> path=<path>` (warning). Cualquier otro error de DB sigue como hasta ahora. Test con un lock retenido desde otra conexión.
+- [ ] Evaluador: el lock de evaluación pasa a `pg_try_advisory_xact_lock(EVALUATOR_LOCK_KEY)`; si está tomado, no evalúa, devuelve 0 y loguea `evaluation_skipped reason=lock_busy` (info). El worker sigue al despacho en el mismo ciclo. Los PATCH de alertas mantienen `pg_advisory_xact_lock_shared` sin cambios.
+- [ ] Cuota de campos: `MAX_FIELDS_PER_USER` (default 20, rango 1..1000). Crear el campo número N+1 → 409 `Field limit reached for this user`. La cuenta y el insert se serializan por usuario (`SELECT ... FROM users WHERE id = :user_id FOR NO KEY UPDATE` antes de contar): dos creaciones concurrentes con un solo lugar libre → una 201 y una 409. El límite se chequea **antes** que el nombre duplicado.
+- [ ] Tamaño de request: middleware ASGI puro (no `BaseHTTPMiddleware`) con `MAX_REQUEST_BODY_BYTES` (default 65536, rango 1024..1048576). `Content-Length` mayor al límite → 413 `{"detail": "Request body too large"}` sin leer el body; sin `Content-Length` (chunked) corta al superar el límite con el mismo 413. Exactamente el límite → pasa. Log `request_body_too_large path=<path> limit=<n>` (warning).
+- [ ] 422 acotado: como máximo 20 errores en `detail` (los primeros, en el orden de FastAPI); si hay más, se agrega un último elemento `{"loc": [], "msg": "<n> more errors omitted", "type": "too_many_errors"}` con `n` = cantidad omitida. Con 20 o menos, la respuesta no cambia.
+- [ ] Settings nuevos en `config.py` y `.env.example`. OpenAPI regenerado si cambia algún texto; test de contrato verde.
+
+## S14b — Reintento manual de `failed` y job de retención · D16
+- [ ] `POST /api/v1/notifications/{id}/retry`: `failed` → `pending` (attempts 0, `next_attempt_at = now`); otro estado → 409; ajena → 404. Sigue valiendo la validación al enviar (D12).
+- [ ] Job de retención en el worker con `RETENTION_DAYS` (default 30): borra `weather_forecasts` y `alert_day_states` con fecha anterior a hoy UTC − `RETENTION_DAYS` y las claves de idempotencia vencidas; las notificaciones se conservan.
 
 ## S15 — Observabilidad
 - [ ] Logs JSON estructurados con `request_id`; métricas Prometheus (`/metrics`); `GET /health/live` y `/health/ready` (DB + heartbeat del worker).
@@ -205,9 +221,9 @@ Follow-ups:
 | S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | README §Próximos pasos |
 | S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | ✅ documentado en API.md §Convenciones |
 | S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | ✅ resuelto en S4 |
-| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
-| S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | README §Próximos pasos |
-| S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | README §Próximos pasos |
+| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | **S14b** (retención) |
+| S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | **S14a** |
+| S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | **S14a** (`MAX_FIELDS_PER_USER`; el horizonte ya está en S12a) |
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
 | S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
 | S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |

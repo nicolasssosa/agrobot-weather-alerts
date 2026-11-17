@@ -111,11 +111,14 @@ def reset(state: DayState) -> DayState:
 
 **Algoritmo SQL**, todo en la transacción del llamador:
 
-0. **Lock de evaluación:** `SELECT pg_advisory_xact_lock(:key)` con una constante del módulo
-   (`EVALUATOR_LOCK_KEY`). Una sola réplica evalúa por vez; la otra espera y, como sus sentencias
-   siguientes toman un snapshot nuevo, ve lo que la primera commiteó. Sin el lock, dos réplicas con
-   snapshots distintos podrían re-armar y volver a disparar el mismo día (episodio duplicado). Se
-   libera solo al terminar la transacción (commit/rollback del worker).
+0. **Lock de evaluación:** `SELECT pg_try_advisory_xact_lock(:key)` con una constante del módulo
+   (`EVALUATOR_LOCK_KEY`) (S14a). Una sola réplica evalúa por vez. Si el lock está tomado (otra
+   réplica evaluando o un PATCH de alerta con el lock compartido abierto), **no evalúa**: devuelve 0,
+   loguea `evaluation_skipped reason=lock_busy` (info) y el worker sigue al despacho del mismo ciclo;
+   la evaluación se hace en el ciclo siguiente. No se espera el lock: con `DB_LOCK_TIMEOUT_MS` /
+   `DB_STATEMENT_TIMEOUT_MS` la espera terminaría en error y cortaría también el despacho. Sin el
+   lock, dos réplicas con snapshots distintos podrían re-armar y volver a disparar el mismo día
+   (episodio duplicado). Se libera solo al terminar la transacción (commit/rollback del worker).
 1. **Re-armado** (una sentencia): `UPDATE alert_day_states s SET armed = true, updated_at = now()
    FROM (candidatos) c WHERE s.alert_id = c.alert_id AND s.forecast_date = c.forecast_date
    AND NOT s.armed AND c.probability < GREATEST(c.threshold - :rearm_margin, 1)`. `candidatos` =

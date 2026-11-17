@@ -19,6 +19,16 @@ Base: `/api/v1` (excepto `/health`). JSON en todos lados. OpenAPI en `/docs`.
   Respuesta: `{"items": [...], "limit": 50, "offset": 0}` (schema genérico `Page[T]`).
 - **Fechas:** `date` ISO (`2026-11-20`); `datetime` ISO 8601 con zona.
 - Requests con campos desconocidos → 422 (`extra="forbid"`).
+- **422 acotado** (S14a): `detail` trae como máximo 20 errores (los primeros, en el orden de
+  FastAPI). Si hubo más, se agrega un último elemento
+  `{"loc": [], "msg": "<n> more errors omitted", "type": "too_many_errors"}` con `n` = cantidad omitida.
+- **Tamaño de request** (S14a): body de hasta `MAX_REQUEST_BODY_BYTES` (default 65536). Mayor →
+  **413** `{"detail": "Request body too large"}`, con o sin `Content-Length` (chunked se corta al
+  superar el límite). Aplica a todos los endpoints; no se declara por endpoint en OpenAPI.
+- **Base de datos ocupada** (S14a): si una consulta supera `DB_LOCK_TIMEOUT_MS` esperando un lock
+  o `DB_STATEMENT_TIMEOUT_MS` ejecutándose → **503** `{"detail": "Database busy, try again later"}`
+  con header `Retry-After: 1`. El cliente puede reintentar (en `POST /alerts`, con la misma
+  `Idempotency-Key`). No se declara por endpoint en OpenAPI.
 
 ---
 
@@ -112,6 +122,10 @@ Request `FieldCreate`:
 
 Respuesta **201** `FieldRead`: `{"id", "name", "latitude", "longitude", "timezone", "created_at"}`.
 409 si el usuario ya tiene un campo con ese nombre.
+
+**Límite** (S14a, D16): como máximo `MAX_FIELDS_PER_USER` (default 20) campos por usuario; el
+siguiente → 409 `Field limit reached for this user`. El límite se chequea antes que el nombre
+duplicado. Dos creaciones simultáneas con un solo lugar libre → una 201 y una 409.
 
 ### `GET /api/v1/fields` → 200 `Page[FieldRead]`
 ### `GET /api/v1/fields/{field_id}` → 200 `FieldRead` | 404
