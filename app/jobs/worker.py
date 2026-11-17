@@ -65,15 +65,14 @@ async def run_cycle(
     1. `now` (o `clock()`) da el día a evaluar y el corte de frescura de los pronósticos; la
        evaluación corre en su propia sesión y commitea, porque el dispatcher maneja sus propias
        transacciones.
-    2. Se despacha en lotes mientras el lote vuelva lleno. Cada llamada obtiene un `now`
-       **fresco** de `clock()`: el lease se calcula desde el momento real del claim.
+    2. Se despacha en lotes mientras el lote vuelva lleno (`users == batch_size`, S13: el lote
+       mide usuarios/mensajes, no notificaciones). Cada llamada obtiene un `now` **fresco** de
+       `clock()`: el lease se calcula desde el momento real del claim.
     3. Si `stop_event` está seteado no se arranca un lote nuevo (S7 SEC-2): el shutdown no
        espera a drenar toda la cola, lo pendiente queda para el próximo arranque.
-    4. Un lote que no cambia el estado de ninguna fila
-       (`sent + retried + failed + cancelled == 0`) corta el drenado, para no girar en vacío
-       si todas las filas fueron ignoradas por las guardas del dispatcher. Las canceladas
-       cuentan como procesadas: un lote lleno de cancelaciones no corta el drenado porque
-       puede haber más pendientes detrás. Además hay un tope de
+    4. Un lote con menos usuarios que `batch_size` no vino lleno: la cola vencida se vació.
+       Las canceladas y las diferidas por horario de silencio no cortan el drenado por sí
+       mismas: lo que importa es cuántos usuarios procesó el lote. Hay además un tope de
        `MAX_DISPATCH_BATCHES_PER_CYCLE` lotes por ciclo.
 
     Devuelve lo creado y la suma de los lotes; loguea `cycle_done` (RNF-06).
@@ -92,7 +91,7 @@ async def run_cycle(
         )
         await session.commit()
 
-    sent = retried = failed = cancelled = 0
+    sent = retried = failed = cancelled = deferred = users = 0
     batches = 0
     while batches < MAX_DISPATCH_BATCHES_PER_CYCLE:
         if stop_event is not None and stop_event.is_set():
@@ -109,29 +108,40 @@ async def run_cycle(
             concurrency=settings.dispatch_concurrency,
             lease_seconds=settings.dispatch_lease_seconds,
             max_forecast_age_hours=settings.max_forecast_age_hours,
+            digest_max_items=settings.digest_max_items,
         )
         batches += 1
         sent += batch.sent
         retried += batch.retried
         failed += batch.failed
         cancelled += batch.cancelled
-        processed = batch.sent + batch.retried + batch.failed + batch.cancelled
-        # `processed == 0`: el lote (aunque haya venido lleno) no cambió ninguna fila.
-        # `processed < batch_size`: el lote no vino lleno, la cola vencida se vació.
-        if processed == 0 or processed < settings.dispatch_batch_size:
+        deferred += batch.deferred
+        users += batch.users
+        # El lote mide usuarios/mensajes (S13): si vino lleno puede haber más pendientes.
+        if batch.users < settings.dispatch_batch_size:
             break
     else:
         logger.warning("dispatch_drain_capped batches=%d", MAX_DISPATCH_BATCHES_PER_CYCLE)
 
-    dispatch = DispatchResult(sent=sent, retried=retried, failed=failed, cancelled=cancelled)
+    dispatch = DispatchResult(
+        sent=sent,
+        retried=retried,
+        failed=failed,
+        cancelled=cancelled,
+        deferred=deferred,
+        users=users,
+    )
     duration_ms = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "cycle_done created=%d sent=%d retried=%d failed=%d cancelled=%d duration_ms=%d",
+        "cycle_done created=%d users=%d sent=%d retried=%d failed=%d cancelled=%d deferred=%d "
+        "duration_ms=%d",
         created,
+        dispatch.users,
         dispatch.sent,
         dispatch.retried,
         dispatch.failed,
         dispatch.cancelled,
+        dispatch.deferred,
         duration_ms,
     )
     return CycleResult(created=created, dispatch=dispatch)

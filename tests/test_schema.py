@@ -36,6 +36,10 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
         ("name", "character varying", "NO", 120, None, None),
         ("created_at", "timestamp with time zone", "NO", None, None, None),
         ("updated_at", "timestamp with time zone", "NO", None, None, None),
+        # `0009` agrega las columnas al final (ADD COLUMN): zona y horario de silencio (S13).
+        ("timezone", "character varying", "NO", 64, None, None),
+        ("quiet_hours_start", "time without time zone", "YES", None, None, None),
+        ("quiet_hours_end", "time without time zone", "YES", None, None, None),
     ],
     "fields": [
         ("id", "bigint", "NO", None, 64, 0),
@@ -175,6 +179,9 @@ EXPECTED_CHECKS = {
     ("notifications", "ck_notifications_threshold_range"),
     ("alert_day_states", "ck_alert_day_states_episode_positive"),
     ("users", "ck_users_phone_number_e164"),
+    # `0009` (S13): el silencio es ambos extremos o ninguno, y la ventana no es vacía.
+    ("users", "ck_users_quiet_hours_both_or_none"),
+    ("users", "ck_users_quiet_hours_not_empty"),
 }
 
 EXPECTED_INDEXES = {
@@ -380,6 +387,9 @@ async def test_required_column_defaults_match_data_model(db_session: AsyncSessio
 
     assert defaults[("alerts", "is_active")] == "true"
     assert defaults[("fields", "timezone")].startswith("'America/Argentina/Buenos_Aires'")
+    assert defaults[("users", "timezone")].startswith("'America/Argentina/Buenos_Aires'")
+    assert defaults[("users", "quiet_hours_start")] is None
+    assert defaults[("users", "quiet_hours_end")] is None
     assert defaults[("notifications", "status")].startswith("'pending'")
     assert defaults[("notifications", "episode")] == "1"
     assert defaults[("notifications", "attempts")] == "0"
@@ -474,11 +484,11 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_through_0008() -> None:
+def test_migration_chain_is_0001_through_0009() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0008"
+    assert script.get_current_head() == "0009"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
@@ -503,3 +513,6 @@ def test_migration_chain_is_0001_through_0008() -> None:
     alert_episodes = script.get_revision("0008")
     assert alert_episodes is not None
     assert alert_episodes.down_revision == "0007"
+    user_quiet_hours = script.get_revision("0009")
+    assert user_quiet_hours is not None
+    assert user_quiet_hours.down_revision == "0008"

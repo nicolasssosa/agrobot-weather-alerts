@@ -57,6 +57,9 @@ Análogamente:
 - crea usuario → 201; teléfono duplicado → 409; teléfono inválido → 422.
 - `GET /users/me` sin header → 401; con header de user inexistente → 401; ok → 200.
 
+- `PATCH /users/me` (S13): setea y desactiva `quiet_hours`; omitir la clave no la cambia; `{}`,
+  `start == end`, `"22:00:30"`, zona inválida o campo extra → 422; sin header → 401.
+
 ### `tests/api/test_fields.py`
 - crear → 201 y aparece en el listado; nombre duplicado (mismo user) → 409;
   mismo nombre para otro user → 201; latitud 91 → 422.
@@ -99,6 +102,19 @@ Análogamente:
 - notifier lento (`asyncio.sleep` > timeout) → cuenta como fallo (no cuelga).
 - respeta `batch_size`.
 - `build_message_text` → string exacto de docs/JOBS.md.
+
+- envío agrupado (S13): dos notificaciones vencidas del mismo usuario → un solo `send` con el texto
+  de `build_digest_text` y ambas `sent`; usuarios distintos → un mensaje cada uno; más de
+  `digest_max_items` → el excedente queda `pending` y vencido; fallo del envío → cada una con su
+  propio backoff / `failed`.
+- horario de silencio (S13): usuario en silencio → `deferred`, `next_attempt_at` = fin del silencio,
+  `attempts` sin cambios, ningún `send`; con `now` = fin del silencio → se envían en un mensaje.
+  Alerta borrada durante el silencio → `cancelled`. Día ya pasado en la zona del campo →
+  `cancelled` con `forecast_date_passed`.
+- `build_digest_text` → string exacto de docs/JOBS.md.
+
+### `tests/jobs/test_quiet_hours.py` (S13)
+- tabla de casos de `quiet_until` (BACKLOG.md §S13), con instantes UTC fijos.
 
 ### `tests/jobs/test_worker.py`
 - `run_cycle` end-to-end con forecasts + alertas → notificaciones `sent`.

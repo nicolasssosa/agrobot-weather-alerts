@@ -538,6 +538,60 @@
         "title": "NotificationStatus",
         "type": "string"
       },
+      "QuietHours-Input": {
+        "additionalProperties": false,
+        "description": "Ventana de silencio en hora local: `[start, end)`; `start > end` cruza la medianoche.\n\nSolo horas `HH:MM` (00:00-23:59): segundos distintos de cero, un offset de zona en el\nvalor o `start == end` son 422 (docs/API.md §users).",
+        "examples": [
+          {
+            "end": "07:00",
+            "start": "22:00"
+          }
+        ],
+        "properties": {
+          "end": {
+            "format": "time",
+            "title": "End",
+            "type": "string"
+          },
+          "start": {
+            "format": "time",
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "title": "QuietHours",
+        "type": "object"
+      },
+      "QuietHours-Output": {
+        "additionalProperties": false,
+        "description": "Ventana de silencio en hora local: `[start, end)`; `start > end` cruza la medianoche.\n\nSolo horas `HH:MM` (00:00-23:59): segundos distintos de cero, un offset de zona en el\nvalor o `start == end` son 422 (docs/API.md §users).",
+        "examples": [
+          {
+            "end": "07:00",
+            "start": "22:00"
+          }
+        ],
+        "properties": {
+          "end": {
+            "title": "End",
+            "type": "string"
+          },
+          "start": {
+            "title": "Start",
+            "type": "string"
+          }
+        },
+        "required": [
+          "start",
+          "end"
+        ],
+        "title": "QuietHours",
+        "type": "object"
+      },
       "UnavailableStatus": {
         "description": "Resultado de `GET /health` cuando la base de datos no responde.",
         "examples": [
@@ -564,7 +618,12 @@
         "examples": [
           {
             "name": "Juan Pérez",
-            "phone_number": "+5491100000001"
+            "phone_number": "+5491100000001",
+            "quiet_hours": {
+              "end": "07:00",
+              "start": "22:00"
+            },
+            "timezone": "America/Argentina/Buenos_Aires"
           }
         ],
         "properties": {
@@ -577,6 +636,22 @@
           "phone_number": {
             "pattern": "^\\+[1-9][0-9]{7,14}$",
             "title": "Phone Number",
+            "type": "string"
+          },
+          "quiet_hours": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuietHours-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timezone": {
+            "default": "America/Argentina/Buenos_Aires",
+            "maxLength": 64,
+            "title": "Timezone",
             "type": "string"
           }
         },
@@ -594,7 +669,12 @@
             "created_at": "2026-11-16T12:00:00Z",
             "id": 1,
             "name": "Juan Pérez",
-            "phone_number": "+5491100000001"
+            "phone_number": "+5491100000001",
+            "quiet_hours": {
+              "end": "07:00",
+              "start": "22:00"
+            },
+            "timezone": "America/Argentina/Buenos_Aires"
           }
         ],
         "properties": {
@@ -614,15 +694,70 @@
           "phone_number": {
             "title": "Phone Number",
             "type": "string"
+          },
+          "quiet_hours": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuietHours-Output"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timezone": {
+            "title": "Timezone",
+            "type": "string"
           }
         },
         "required": [
           "id",
           "phone_number",
           "name",
+          "timezone",
+          "quiet_hours",
           "created_at"
         ],
         "title": "UserRead",
+        "type": "object"
+      },
+      "UserUpdate": {
+        "additionalProperties": false,
+        "description": "Request de `PATCH /api/v1/users/me`.\n\nTodos los campos son opcionales pero el body vacío es 422. Un `null` **explícito** en\n`quiet_hours` desactiva el silencio; omitir la clave no lo cambia (se distingue con\n`model_fields_set` en el service). `timezone` no admite `null` (la columna es NOT NULL).\n`phone_number` y `name` no son editables: crearlos como extra da 422.",
+        "examples": [
+          {
+            "quiet_hours": {
+              "end": "07:00",
+              "start": "22:00"
+            },
+            "timezone": "America/Argentina/Cordoba"
+          }
+        ],
+        "properties": {
+          "quiet_hours": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/QuietHours-Input"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "title": "UserUpdate",
         "type": "object"
       },
       "ValidationError": {
@@ -1760,11 +1895,18 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Dos formas según el caso: un body inválido (o una zona con formato inválido) responde `HTTPValidationError` con `detail` como lista de errores; una zona que PostgreSQL no reconoce con coincidencia exacta (`pg_timezone_names`) responde `ErrorResponse` con `detail` string."
           }
         },
         "summary": "Crear un usuario",
@@ -1808,6 +1950,71 @@
           }
         ],
         "summary": "Obtener el usuario autenticado",
+        "tags": [
+          "users"
+        ]
+      },
+      "patch": {
+        "description": "Actualiza la zona horaria y/o el horario de silencio del usuario autenticado.",
+        "operationId": "update_current_user_endpoint_api_v1_users_me_patch",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UserUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UserRead"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "detail": "Missing or invalid X-User-Id header"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Missing or invalid X-User-Id header"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
+                }
+              }
+            },
+            "description": "Dos formas según el caso: un body inválido (o una zona con formato inválido) responde `HTTPValidationError` con `detail` como lista de errores; una zona que PostgreSQL no reconoce con coincidencia exacta (`pg_timezone_names`) responde `ErrorResponse` con `detail` string."
+          }
+        },
+        "security": [
+          {
+            "X-User-Id": []
+          }
+        ],
+        "summary": "Actualizar el usuario autenticado",
         "tags": [
           "users"
         ]

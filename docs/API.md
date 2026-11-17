@@ -63,11 +63,39 @@ Request `UserCreate`:
 - `phone_number`: regex E.164 `^\+[1-9][0-9]{7,14}$` (dígitos ASCII, idéntico al CHECK de la DB).
 - `name`: 1..120 chars, se aplica `strip()`; vacío tras strip → 422.
 
-Respuesta **201** `UserRead`: `{"id", "phone_number", "name", "created_at"}`.
+Opcionales (S13): `timezone` (default `America/Argentina/Buenos_Aires`) y `quiet_hours` (default
+`null` = sin silencio), con las mismas reglas que en el PATCH de abajo.
+
+Respuesta **201** `UserRead`:
+```json
+{"id": 1, "phone_number": "+5491100000001", "name": "Juan Pérez",
+ "timezone": "America/Argentina/Buenos_Aires", "quiet_hours": {"start": "22:00", "end": "07:00"},
+ "created_at": "..."}
+```
+`quiet_hours` es `null` si el usuario no configuró silencio.
 409 si el teléfono ya existe.
 
 ### `GET /api/v1/users/me`
 200 `UserRead` del usuario autenticado.
+
+### `PATCH /api/v1/users/me` (S13, D15)
+Request `UserUpdate` (todos opcionales, al menos uno requerido → `{}` responde 422 con un
+`model_validator`, como `AlertUpdate`):
+```json
+{"timezone": "America/Argentina/Cordoba", "quiet_hours": {"start": "22:00", "end": "07:00"}}
+```
+- `timezone`: misma validación que `fields.timezone` (formato en el schema; reconocida por Postgres
+  en el service → 422 con el mismo mensaje que `POST /fields`).
+- `quiet_hours`: objeto `QuietHours {start, end}` con horas locales `"HH:MM"` (00:00–23:59); segundos
+  distintos de cero, zona horaria en el valor o `start == end` → 422. `start > end` cruza la
+  medianoche (22:00–07:00). Ventana `[start, end)`: a las `end` ya se envía.
+- `"quiet_hours": null` desactiva el silencio; omitir la clave no lo cambia (se distingue con
+  `model_fields_set`).
+- `phone_number` y `name` no son editables (campo extra → 422).
+
+200 `UserRead`; 401 sin auth. Durante el horario de silencio las notificaciones no se envían: quedan
+`pending` y salen todas juntas al terminar (JOBS.md §Envío agrupado). Cambiar el horario no
+adelanta las ya diferidas.
 
 ## fields
 

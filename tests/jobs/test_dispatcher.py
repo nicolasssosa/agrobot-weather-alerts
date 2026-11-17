@@ -8,7 +8,7 @@ import asyncio
 import logging
 import uuid
 from collections.abc import Callable
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 
 import pytest
@@ -21,11 +21,16 @@ from sqlalchemy.pool import NullPool
 from app.core.config import Settings
 from app.core.pii import mask_phone, mask_phone_in_text
 from app.jobs.dispatcher import (
+    _USERS_CLAIM_SQL,
+    ClaimedNotification,
     DispatchResult,
     _claim_batch,
     _claim_statement,
+    _defer_statement,
+    _lease_statement,
     _record_outcomes,
     _SendOutcome,
+    build_digest_text,
     build_message_text,
     dispatch_pending,
 )
@@ -40,7 +45,9 @@ from app.models import (
 )
 from app.notifiers.base import NotificationMessage, NotifierError
 from app.notifiers.log import LoggingNotifier
+from app.schemas.user import UserUpdate
 from app.services.alerts import delete_alert
+from app.services.users import update_user
 from tests.conftest import (
     TEST_DATABASE_URL,
     FakeNotifier,
@@ -53,6 +60,9 @@ NOW = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
 #: Claim con un lease en el futuro lejano: el `DELETE` de la API compara contra `now()` real,
 #: así que la fila arrendada no debe parecer vencida por el reloj del test.
 LEASE_SAFE_NOW = datetime(2099, 1, 1, tzinfo=UTC)
+#: Día pronosticado **posterior** a `LEASE_SAFE_NOW`: con la validación de S13
+#: (`forecast_date_passed`) un día de 2026 se cancelaría en vez de enviarse.
+LEASE_SAFE_FORECAST_DATE = date(2099, 1, 3)
 FORECAST_DATE = date(2026, 11, 18)
 
 DISPATCH_KWARGS = {
@@ -63,6 +73,7 @@ DISPATCH_KWARGS = {
     "concurrency": 10,
     "lease_seconds": 60,
     "max_forecast_age_hours": 24,
+    "digest_max_items": 10,
 }
 
 
@@ -136,7 +147,7 @@ async def _make_notification(
 
 def _compiled_claim_sql() -> str:
     return str(
-        _claim_statement(NOW, 10, DISPATCH_KWARGS["max_forecast_age_hours"]).compile(
+        _claim_statement(NOW, user_ids=[1], digest_max_items=10).compile(
             dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
         )
     )
@@ -192,6 +203,97 @@ def test_claim_locks_only_notifications_and_orders_by_due_date() -> None:
     assert "FOR UPDATE OF notifications SKIP LOCKED" in sql
     assert "notifications.status = 'pending'" in sql
     assert "ORDER BY notifications.next_attempt_at, notifications.id" in sql
+    # S13: el tope es por usuario (ventana sobre `fields.user_id`), no por lote.
+    assert "row_number() OVER (PARTITION BY fields.user_id" in sql
+
+
+def test_the_batch_claim_locks_the_users_with_for_no_key_update() -> None:
+    """S13: el lock de la fila del usuario garantiza un solo mensaje por usuario."""
+    sql = str(_USERS_CLAIM_SQL)
+
+    assert "FOR NO KEY UPDATE SKIP LOCKED" in sql
+    assert "min(n.next_attempt_at), f.user_id" in sql
+    assert "LIMIT :batch_size" in sql
+
+
+def test_the_outer_claim_rechecks_pending_and_due_date_after_the_lock() -> None:
+    """CR-1: el WHERE externo repite `pending` y `next_attempt_at <= now`.
+
+    La subconsulta rankeada queda fija en el snapshot de la sentencia; si otra transacción
+    cancela una notificación antes de que el claim la lockee, el recheck de Postgres (EPQ)
+    solo re-evalúa el WHERE externo. Sin los predicados repetidos la fila cancelada se
+    reclamaría y se enviaría. Por eso cada uno aparece dos veces: adentro y afuera.
+    """
+    sql = _compiled_claim_sql()
+
+    assert sql.count("notifications.status = 'pending'") == 2
+    assert sql.count("notifications.next_attempt_at <= ") == 2
+
+
+async def test_the_lease_update_skips_a_notification_cancelled_before_the_lock(
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-1: el arriendo con `RETURNING id` no toca lo que otra transacción canceló."""
+    alert = await make_alert(await make_field(await make_user()))
+    pending = await _make_notification(db_session, alert, forecast_date=FORECAST_DATE)
+    cancelled = await _make_notification(
+        db_session,
+        alert,
+        forecast_date=FORECAST_DATE + timedelta(days=1),
+        status=NotificationStatus.CANCELLED,
+        last_error="alert_reset",
+    )
+    lease_until = NOW + timedelta(seconds=60)
+
+    leased = (
+        (
+            await db_session.execute(
+                _lease_statement([pending.id, cancelled.id], now=NOW, lease_until=lease_until)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    assert list(leased) == [pending.id]
+    await db_session.refresh(pending)
+    await db_session.refresh(cancelled)
+    assert pending.next_attempt_at == lease_until
+    assert cancelled.next_attempt_at == NOW
+
+
+async def test_the_deferral_update_skips_a_notification_cancelled_before_the_lock(
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-1: el diferimiento también cuenta solo las filas que siguen `pending`."""
+    alert = await make_alert(await make_field(await make_user()))
+    pending = await _make_notification(db_session, alert, forecast_date=FORECAST_DATE)
+    cancelled = await _make_notification(
+        db_session,
+        alert,
+        forecast_date=FORECAST_DATE + timedelta(days=1),
+        status=NotificationStatus.CANCELLED,
+        last_error="alert_reset",
+    )
+    until = NOW + timedelta(hours=1)
+
+    deferred = (
+        (await db_session.execute(_defer_statement([pending.id, cancelled.id], until=until)))
+        .scalars()
+        .all()
+    )
+
+    assert list(deferred) == [pending.id]
+    await db_session.refresh(pending)
+    await db_session.refresh(cancelled)
+    assert pending.next_attempt_at == until
+    assert cancelled.next_attempt_at == NOW
 
 
 # --- Éxito ----------------------------------------------------------------
@@ -213,7 +315,7 @@ async def test_pending_notification_is_sent_with_the_exact_message(
         test_sessionmaker, FakeNotifier(), now=NOW, clock=_clock_at(NOW), **DISPATCH_KWARGS
     )
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
     assert notification.sent_at == NOW
@@ -278,7 +380,7 @@ async def test_the_claim_lease_blocks_other_dispatchers_until_it_expires(
 
     later = NOW + timedelta(seconds=lease_seconds + 1)
     result = await dispatch_pending(test_sessionmaker, notifier, now=later, **DISPATCH_KWARGS)
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
     assert notification.attempts == 1
@@ -305,7 +407,7 @@ async def test_failure_keeps_it_pending_and_schedules_the_backoff(
         **DISPATCH_KWARGS,
     )
 
-    assert result == DispatchResult(sent=0, retried=1, failed=0)
+    assert result == DispatchResult(sent=0, retried=1, failed=0, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.PENDING
     assert notification.attempts == 1
@@ -341,7 +443,7 @@ async def test_a_retry_is_sent_once_its_backoff_has_passed(
         test_sessionmaker, notifier, now=later, clock=_clock_at(later), **DISPATCH_KWARGS
     )
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
     assert notification.attempts == 2
@@ -392,7 +494,7 @@ async def test_exhausting_max_attempts_marks_it_failed(
         test_sessionmaker, FakeNotifier(fail_times=1), now=NOW, **DISPATCH_KWARGS
     )
 
-    assert result == DispatchResult(sent=0, retried=0, failed=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=1, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.FAILED
     assert notification.attempts == 3
@@ -474,7 +576,7 @@ async def test_a_slow_notifier_times_out_and_counts_as_a_failure(
         test_sessionmaker, _SlowNotifier(), now=NOW, **{**DISPATCH_KWARGS, "timeout_seconds": 0.05}
     )
 
-    assert result == DispatchResult(sent=0, retried=1, failed=0)
+    assert result == DispatchResult(sent=0, retried=1, failed=0, users=1)
     await db_session.refresh(notification)
     assert notification.attempts == 1
     assert notification.last_error is not None
@@ -569,25 +671,26 @@ async def test_a_huge_error_is_truncated_to_the_db_limit(
 # --- Lotes ----------------------------------------------------------------
 
 
-async def test_batch_size_limits_the_batch_and_respects_the_due_order(
+async def test_batch_size_limits_the_users_per_batch(
     test_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,
+    make_user: MakeUser,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
-    field = await make_field()
-    alert = await make_alert(field)
-    notifications = [
-        await _make_notification(db_session, alert, forecast_date=FORECAST_DATE + timedelta(days=i))
-        for i in range(3)
-    ]
+    """S13: `batch_size` es la cantidad de usuarios (= mensajes) por lote."""
+    notifications = []
+    for _ in range(3):
+        owner = await make_user()
+        alert = await make_alert(await make_field(owner))
+        notifications.append(await _make_notification(db_session, alert))
     notifier = FakeNotifier()
 
     result = await dispatch_pending(
         test_sessionmaker, notifier, now=NOW, **{**DISPATCH_KWARGS, "batch_size": 2}
     )
 
-    assert result == DispatchResult(sent=2, retried=0, failed=0)
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=2)
     assert [message.notification_id for message in notifier.sent] == [
         notifications[0].id,
         notifications[1].id,
@@ -612,21 +715,22 @@ class _SelectiveNotifier:
 async def test_a_mixed_batch_counts_success_retry_and_exhausted(
     test_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,
+    make_user: MakeUser,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
-    field = await make_field()
-    alert = await make_alert(field)
-    ok = await _make_notification(db_session, alert)
-    retry = await _make_notification(db_session, alert, forecast_date=date(2026, 11, 19))
-    exhausted = await _make_notification(
-        db_session, alert, forecast_date=date(2026, 11, 20), attempts=2
-    )
+    """Un usuario por resultado: cada notificación lleva su propio `attempts`."""
+    notifications = []
+    for attempts in (0, 0, 2):
+        owner = await make_user()
+        alert = await make_alert(await make_field(owner))
+        notifications.append(await _make_notification(db_session, alert, attempts=attempts))
+    ok, retry, exhausted = notifications
     notifier = _SelectiveNotifier(failing_ids={retry.id, exhausted.id})
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=1, failed=1)
+    assert result == DispatchResult(sent=1, retried=1, failed=1, users=3)
     assert [message.notification_id for message in notifier.sent] == [ok.id]
     statuses = {}
     for notification in (ok, retry, exhausted):
@@ -683,8 +787,12 @@ async def _dispatch(
     )
 
 
-async def test_two_concurrent_dispatchers_never_send_the_same_notification() -> None:
-    """Dos workers en conexiones distintas y datos commiteados: cada una se envía una vez."""
+async def test_two_concurrent_dispatchers_send_a_single_message_per_user() -> None:
+    """Dos workers en conexiones distintas y datos commiteados: un solo mensaje por usuario.
+
+    El claim lockea la fila del usuario (`FOR NO KEY UPDATE SKIP LOCKED`): la otra réplica la
+    saltea. Además, ninguna notificación se envía dos veces.
+    """
     engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)
     phone_number = f"+54911{uuid.uuid4().int % 10**8:08d}"
@@ -740,12 +848,12 @@ async def test_two_concurrent_dispatchers_never_send_the_same_notification() -> 
             _dispatch(session_factory, second_notifier),
         )
 
-        delivered = [
-            message.notification_id for message in first_notifier.sent + second_notifier.sent
-        ]
-        assert len(delivered) == len(set(delivered)) == 6
+        messages = first_notifier.sent + second_notifier.sent
+        # Un solo mensaje para el usuario, con sus 6 notificaciones.
+        assert len(messages) == 1
+        assert messages[0].text.startswith("⚠️ Tenés 6 alertas climáticas:")
         assert first.sent + second.sent == 6
-        assert first.sent + first.retried + second.sent + second.retried == 6
+        assert first.deferred + second.deferred == 0
         async with session_factory() as check:
             statuses = (
                 await check.execute(
@@ -753,6 +861,13 @@ async def test_two_concurrent_dispatchers_never_send_the_same_notification() -> 
                 )
             ).scalars()
             assert list(statuses) == [NotificationStatus.SENT] * 6
+            attempts = (
+                await check.execute(
+                    select(Notification.attempts).where(Notification.alert_id == alert.id)
+                )
+            ).scalars()
+            # Cada notificación se envió exactamente una vez.
+            assert list(attempts) == [1] * 6
     finally:
         async with engine.begin() as conn:
             await conn.execute(delete(User).where(User.phone_number == phone_number))
@@ -1010,7 +1125,7 @@ async def test_a_non_notifier_exception_is_retried_like_any_other(
         **DISPATCH_KWARGS,
     )
 
-    assert result == DispatchResult(sent=0, retried=1, failed=0)
+    assert result == DispatchResult(sent=0, retried=1, failed=0, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.PENDING
     assert notification.attempts == 1
@@ -1055,7 +1170,7 @@ async def test_max_attempts_one_fails_on_the_first_error(
         **{**DISPATCH_KWARGS, "max_attempts": 1},
     )
 
-    assert result == DispatchResult(sent=0, retried=0, failed=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=1, users=1)
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.FAILED
     assert notification.attempts == 1
@@ -1067,27 +1182,24 @@ async def test_max_attempts_one_fails_on_the_first_error(
 # --- Orden de la cola ------------------------------------------------------
 
 
-async def test_batch_size_one_takes_the_earliest_due_and_breaks_ties_by_id(
+async def test_batch_size_one_takes_the_earliest_due_and_breaks_ties_by_user_id(
     test_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,
+    make_user: MakeUser,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
-    """Orden `next_attempt_at, id`: el id menor no gana si todavía no está vencido."""
-    alert = await make_alert(await make_field())
-    late = await _make_notification(
-        db_session,
-        alert,
-        forecast_date=date(2026, 11, 21),
-        next_attempt_at=NOW + timedelta(seconds=10),
-    )
-    early = await _make_notification(
-        db_session, alert, forecast_date=date(2026, 11, 19), next_attempt_at=NOW
-    )
-    tied = await _make_notification(
-        db_session, alert, forecast_date=date(2026, 11, 20), next_attempt_at=NOW
-    )
-    # `late` tiene el id más chico, pero vence después: no debe reclamarse primero.
+    """Orden `min(next_attempt_at), user_id` de los usuarios, y `next_attempt_at, id` de la cola."""
+
+    async def _user_notification(due: datetime) -> Notification:
+        owner = await make_user()
+        alert = await make_alert(await make_field(owner))
+        return await _make_notification(db_session, alert, next_attempt_at=due)
+
+    late = await _user_notification(NOW + timedelta(seconds=10))
+    early = await _user_notification(NOW)
+    tied = await _user_notification(NOW)
+    # `late` se creó primero (id menor) pero vence después: no debe reclamarse primero.
     assert late.id < early.id < tied.id
     notifier = FakeNotifier()
     kwargs = {**DISPATCH_KWARGS, "batch_size": 1}
@@ -1155,7 +1267,7 @@ async def test_a_notification_that_no_longer_applies_is_cancelled_without_sendin
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
     assert notifier.calls == 0
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.CANCELLED
@@ -1187,7 +1299,7 @@ async def test_a_mixed_batch_sends_only_the_valid_notifications(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0, cancelled=3)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, cancelled=3, users=1)
     assert [message.notification_id for message in notifier.sent] == [valid.id]
     statuses = {}
     for notification in (valid, deleted, inactive, raised):
@@ -1216,7 +1328,7 @@ async def test_lowering_the_current_threshold_does_not_cancel_a_pending_notifica
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert [message.notification_id for message in notifier.sent] == [notification.id]
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1239,7 +1351,7 @@ async def test_probability_equal_to_the_current_threshold_is_not_cancelled(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert [message.notification_id for message in notifier.sent] == [notification.id]
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1264,7 +1376,7 @@ async def test_the_current_forecast_probability_equal_to_the_threshold_is_sent(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert [message.notification_id for message in notifier.sent] == [notification.id]
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1290,7 +1402,7 @@ async def test_the_current_forecast_probability_below_the_threshold_cancels(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
     assert notifier.calls == 0
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.CANCELLED
@@ -1317,7 +1429,7 @@ async def test_a_second_episode_below_the_current_threshold_is_cancelled(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
     assert notifier.calls == 0
     await db_session.refresh(cancelled)
     assert cancelled.status == NotificationStatus.CANCELLED
@@ -1344,7 +1456,7 @@ async def test_a_second_episode_above_the_current_threshold_is_sent(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert [message.notification_id for message in notifier.sent] == [notification.id]
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1366,7 +1478,7 @@ async def test_the_current_forecast_probability_above_the_threshold_is_sent(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert [message.notification_id for message in notifier.sent] == [notification.id]
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1393,7 +1505,7 @@ async def test_a_pending_notification_with_a_stale_forecast_is_cancelled_without
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
     assert notifier.calls == 0
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.CANCELLED
@@ -1417,7 +1529,7 @@ async def test_a_pending_notification_without_a_forecast_is_cancelled_as_stale(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
     assert notifier.calls == 0
     await db_session.refresh(notification)
     assert notification.last_error == "stale_forecast"
@@ -1439,7 +1551,7 @@ async def test_a_pending_notification_whose_forecast_was_deleted_is_cancelled_as
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
     assert notifier.calls == 0
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.CANCELLED
@@ -1465,7 +1577,7 @@ async def test_a_pending_notification_at_the_freshness_boundary_is_sent(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert [message.notification_id for message in notifier.sent] == [notification.id]
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1495,7 +1607,7 @@ async def test_each_notification_goes_to_its_own_owners_phone(
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=2, retried=0, failed=0)
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=2)
     delivered = {message.notification_id: message.phone_number for message in notifier.sent}
     assert delivered == {
         ana_notification.id: "+5491100000001",
@@ -1509,19 +1621,19 @@ async def test_each_notification_goes_to_its_own_owners_phone(
 async def test_a_failure_does_not_stop_the_rest_of_the_batch(
     test_sessionmaker: async_sessionmaker[AsyncSession],
     db_session: AsyncSession,
+    make_user: MakeUser,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
-    alert = await make_alert(await make_field())
-    failing = await _make_notification(db_session, alert, next_attempt_at=NOW)
-    ok = await _make_notification(
-        db_session, alert, forecast_date=date(2026, 11, 19), next_attempt_at=NOW
-    )
+    failing_alert = await make_alert(await make_field(await make_user()))
+    failing = await _make_notification(db_session, failing_alert)
+    ok_alert = await make_alert(await make_field(await make_user()))
+    ok = await _make_notification(db_session, ok_alert)
     notifier = _SelectiveNotifier(failing_ids={failing.id})
 
     result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
 
-    assert result == DispatchResult(sent=1, retried=1, failed=0)
+    assert result == DispatchResult(sent=1, retried=1, failed=0, users=2)
     assert [message.notification_id for message in notifier.sent] == [ok.id]
 
 
@@ -1585,7 +1697,7 @@ async def test_a_notifier_touching_the_row_does_not_undo_the_sent_state(
         test_sessionmaker, notifier, now=NOW, clock=_clock_at(NOW), **DISPATCH_KWARGS
     )
 
-    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
     assert len(notifier.sent) == 1
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
@@ -1620,7 +1732,7 @@ async def test_no_dispatcher_or_logging_notifier_record_has_the_full_phone(
 
     messages = [record.getMessage() for record in caplog.records]
     assert messages
-    assert any("dispatch_done sent=1 retried=0 failed=0" in message for message in messages)
+    assert any("dispatch_done users=1 sent=1 retried=0 failed=0" in message for message in messages)
     assert any("phone=***7766" in message for message in messages)
     assert all(phone_number not in message for message in messages)
 
@@ -1727,7 +1839,7 @@ async def test_the_row_is_not_locked_while_the_network_call_is_in_flight() -> No
         finally:
             notifier.release.set()
 
-        assert await dispatch == DispatchResult(sent=1, retried=0, failed=0)
+        assert await dispatch == DispatchResult(sent=1, retried=0, failed=0, users=1)
     finally:
         notifier.release.set()
         async with engine.begin() as conn:
@@ -1793,34 +1905,36 @@ async def test_a_stale_lease_owner_cannot_record_its_outcome(
     notification = await _make_notification(db_session, alert)
     lease_seconds = DISPATCH_KWARGS["lease_seconds"]
 
-    worker_a, cancelled_a = await _claim_batch(
+    worker_a = await _claim_batch(
         test_sessionmaker,
         now=NOW,
         batch_size=10,
         lease_seconds=lease_seconds,
         max_forecast_age_hours=DISPATCH_KWARGS["max_forecast_age_hours"],
+        digest_max_items=DISPATCH_KWARGS["digest_max_items"],
     )
-    assert cancelled_a == 0
-    assert [item.id for item in worker_a] == [notification.id]
-    assert worker_a[0].lease_until == NOW + timedelta(seconds=lease_seconds)
+    assert worker_a.cancelled == 0
+    assert [item.id for item in worker_a.claimed] == [notification.id]
+    assert worker_a.claimed[0].lease_until == NOW + timedelta(seconds=lease_seconds)
 
     # El lease de A vence y B reclama la misma fila con una hora posterior.
     later = NOW + timedelta(seconds=lease_seconds + 1)
-    worker_b, cancelled_b = await _claim_batch(
+    worker_b = await _claim_batch(
         test_sessionmaker,
         now=later,
         batch_size=10,
         lease_seconds=lease_seconds,
         max_forecast_age_hours=DISPATCH_KWARGS["max_forecast_age_hours"],
+        digest_max_items=DISPATCH_KWARGS["digest_max_items"],
     )
-    assert cancelled_b == 0
-    assert [item.id for item in worker_b] == [notification.id]
-    assert worker_b[0].lease_until == later + timedelta(seconds=lease_seconds)
-    assert worker_b[0].lease_until != worker_a[0].lease_until
+    assert worker_b.cancelled == 0
+    assert [item.id for item in worker_b.claimed] == [notification.id]
+    assert worker_b.claimed[0].lease_until == later + timedelta(seconds=lease_seconds)
+    assert worker_b.claimed[0].lease_until != worker_a.claimed[0].lease_until
 
     recorded_by_b = await _record_outcomes(
         test_sessionmaker,
-        [_SendOutcome(worker_b[0], None)],
+        [_SendOutcome(worker_b.claimed[0], None)],
         clock=_clock_at(later),
         max_attempts=DISPATCH_KWARGS["max_attempts"],
         backoff_base_seconds=DISPATCH_KWARGS["backoff_base_seconds"],
@@ -1829,7 +1943,7 @@ async def test_a_stale_lease_owner_cannot_record_its_outcome(
 
     recorded_by_a = await _record_outcomes(
         test_sessionmaker,
-        [_SendOutcome(worker_a[0], None)],
+        [_SendOutcome(worker_a.claimed[0], None)],
         clock=_clock_at(later + timedelta(seconds=1)),
         max_attempts=DISPATCH_KWARGS["max_attempts"],
         backoff_base_seconds=DISPATCH_KWARGS["backoff_base_seconds"],
@@ -1863,14 +1977,13 @@ class _ConcurrencyProbeNotifier:
 async def test_concurrency_bounds_the_number_of_simultaneous_sends(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
-    alert = await make_alert(await make_field())
-    for offset in range(5):
-        await _make_notification(
-            db_session, alert, forecast_date=FORECAST_DATE + timedelta(days=offset)
-        )
+    for _ in range(5):
+        alert = await make_alert(await make_field(await make_user()))
+        await _make_notification(db_session, alert, forecast_date=FORECAST_DATE + timedelta(days=1))
     notifier = _ConcurrencyProbeNotifier()
 
     result = await dispatch_pending(
@@ -1880,7 +1993,7 @@ async def test_concurrency_bounds_the_number_of_simultaneous_sends(
         **{**DISPATCH_KWARGS, "concurrency": 2, "timeout_seconds": 5.0},
     )
 
-    assert result == DispatchResult(sent=5, retried=0, failed=0)
+    assert result == DispatchResult(sent=5, retried=0, failed=0, users=5)
     assert notifier.calls == 5
     assert notifier.max_active == 2
 
@@ -1912,7 +2025,7 @@ async def test_a_notification_deleted_between_the_claim_and_the_update_is_ignore
         **DISPATCH_KWARGS,
     )
 
-    assert result == DispatchResult(sent=0, retried=0, failed=0)
+    assert result == DispatchResult(sent=0, retried=0, failed=0, users=1)
     remaining = await db_session.scalar(
         select(func.count()).select_from(Notification).where(Notification.id == notification.id)
     )
@@ -1953,7 +2066,7 @@ async def test_soft_deleting_the_alert_while_the_send_is_in_flight_keeps_the_rea
             setup.add(
                 WeatherForecast(
                     field_id=field.id,
-                    forecast_date=FORECAST_DATE,
+                    forecast_date=LEASE_SAFE_FORECAST_DATE,
                     event_type=EventType.FROST,
                     probability=80,
                     source="mock",
@@ -1963,7 +2076,7 @@ async def test_soft_deleting_the_alert_while_the_send_is_in_flight_keeps_the_rea
             )
             notification = Notification(
                 alert_id=alert.id,
-                forecast_date=FORECAST_DATE,
+                forecast_date=LEASE_SAFE_FORECAST_DATE,
                 event_type=EventType.FROST,
                 probability=80,
                 threshold=50,
@@ -1995,7 +2108,7 @@ async def test_soft_deleting_the_alert_while_the_send_is_in_flight_keeps_the_rea
             notifier.release.set()
 
         result = await dispatch
-        assert result == DispatchResult(sent=1, retried=0, failed=0)
+        assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
 
         async with session_factory() as check:
             stored_alert = (
@@ -2055,7 +2168,7 @@ async def test_a_leased_notification_of_a_deleted_alert_is_cancelled_when_the_le
             setup.add(
                 WeatherForecast(
                     field_id=field.id,
-                    forecast_date=FORECAST_DATE,
+                    forecast_date=LEASE_SAFE_FORECAST_DATE,
                     event_type=EventType.FROST,
                     probability=80,
                     source="mock",
@@ -2065,7 +2178,7 @@ async def test_a_leased_notification_of_a_deleted_alert_is_cancelled_when_the_le
             )
             notification = Notification(
                 alert_id=alert.id,
-                forecast_date=FORECAST_DATE,
+                forecast_date=LEASE_SAFE_FORECAST_DATE,
                 event_type=EventType.FROST,
                 probability=80,
                 threshold=50,
@@ -2113,7 +2226,7 @@ async def test_a_leased_notification_of_a_deleted_alert_is_cancelled_when_the_le
             now=LEASE_SAFE_NOW + timedelta(seconds=DISPATCH_KWARGS["lease_seconds"] + 1),
             **DISPATCH_KWARGS,
         )
-        assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+        assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
 
         async with session_factory() as check:
             stored = (
@@ -2146,3 +2259,823 @@ def test_settings_reject_a_lease_that_does_not_cover_the_worst_case_batch() -> N
 
     settings = Settings(dispatch_lease_seconds=101, **worst_case)
     assert settings.dispatch_lease_seconds == 101
+
+
+# --- Texto del digest (S13) -------------------------------------------------
+#
+# docs/JOBS.md §Texto del digest: exacto, ordenado por
+# `(forecast_date, field_name, event_type.value, threshold, id)`, sin `\n` final.
+
+
+def _claimed(
+    *,
+    id: int = 1,
+    user_id: int = 1,
+    forecast_date: date = FORECAST_DATE,
+    event_type: EventType = EventType.FROST,
+    probability: int = 85,
+    threshold: int = 70,
+    attempts: int = 0,
+    phone_number: str = "+5491100000001",
+    field_name: str = "Lote Norte",
+) -> ClaimedNotification:
+    """Un `ClaimedNotification` plano para probar el texto sin pasar por la DB."""
+    return ClaimedNotification(
+        id=id,
+        user_id=user_id,
+        forecast_date=forecast_date,
+        event_type=event_type,
+        probability=probability,
+        threshold=threshold,
+        attempts=attempts,
+        phone_number=phone_number,
+        field_name=field_name,
+        lease_until=NOW + timedelta(seconds=60),
+    )
+
+
+def test_build_digest_text_matches_jobs_md_exactly() -> None:
+    text = build_digest_text(
+        [
+            _claimed(
+                id=1,
+                event_type=EventType.FROST,
+                field_name="Lote Norte",
+                probability=85,
+                threshold=70,
+                forecast_date=date(2026, 11, 18),
+            ),
+            _claimed(
+                id=2,
+                event_type=EventType.HAIL,
+                field_name="Lote Sur",
+                probability=60,
+                threshold=50,
+                forecast_date=date(2026, 11, 19),
+            ),
+        ]
+    )
+
+    assert text == (
+        "⚠️ Tenés 2 alertas climáticas:\n"
+        '• Helada en "Lote Norte": 85% de probabilidad para el 18/11/2026 (tu umbral: 70%).\n'
+        '• Granizo en "Lote Sur": 60% de probabilidad para el 19/11/2026 (tu umbral: 50%).'
+    )
+    assert not text.endswith("\n")
+
+
+def test_build_digest_text_capitalizes_every_spanish_label() -> None:
+    text = build_digest_text(
+        [
+            _claimed(id=1, event_type=EventType.HEAT_WAVE),
+            _claimed(id=2, event_type=EventType.STRONG_WIND),
+        ]
+    )
+
+    labels = [line.split(" en ")[0].lstrip("• ") for line in text.splitlines()[1:]]
+    assert labels == ["Ola de calor", "Viento fuerte"]
+
+
+def test_build_digest_text_sorts_by_date_field_event_threshold_and_id() -> None:
+    items = [
+        _claimed(id=4, forecast_date=date(2026, 11, 19), field_name="A", threshold=10),
+        _claimed(id=3, forecast_date=date(2026, 11, 18), field_name="B", threshold=10),
+        _claimed(id=2, forecast_date=date(2026, 11, 18), field_name="A", threshold=90),
+        _claimed(id=1, forecast_date=date(2026, 11, 18), field_name="A", threshold=50),
+    ]
+
+    lines = build_digest_text(items).splitlines()
+
+    assert [line.split("(tu umbral: ")[1].rstrip("%).") for line in lines[1:]] == [
+        "50",
+        "90",
+        "10",
+        "10",
+    ]
+    assert '"A"' in lines[1] and "18/11/2026" in lines[1]
+    assert '"A"' in lines[2] and "18/11/2026" in lines[2]
+    assert '"B"' in lines[3] and "18/11/2026" in lines[3]
+    assert '"A"' in lines[4] and "19/11/2026" in lines[4]
+
+
+def test_build_digest_text_requires_at_least_two_notifications() -> None:
+    with pytest.raises(ValueError, match="at least 2"):
+        build_digest_text([_claimed()])
+    with pytest.raises(ValueError, match="at least 2"):
+        build_digest_text([])
+
+
+# --- Envío agrupado por usuario (S13) ---------------------------------------
+
+
+async def test_two_due_notifications_of_the_same_user_go_out_in_one_digest(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    owner = await make_user(phone_number="+5491100000003")
+    frost_alert = await make_alert(
+        await make_field(owner, name="Lote Norte"),
+        event_type=EventType.FROST,
+        threshold=70,
+    )
+    hail_alert = await make_alert(
+        await make_field(owner, name="Lote Sur"),
+        event_type=EventType.HAIL,
+        threshold=50,
+    )
+    first = await _make_notification(
+        db_session, frost_alert, forecast_date=date(2026, 11, 18), probability=85
+    )
+    second = await _make_notification(
+        db_session, hail_alert, forecast_date=date(2026, 11, 19), probability=60
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    message = notifier.sent[0]
+    # `notification_id` = el menor id del grupo.
+    assert message.notification_id == min(first.id, second.id)
+    assert message.phone_number == "+5491100000003"
+    assert message.text == (
+        "⚠️ Tenés 2 alertas climáticas:\n"
+        '• Helada en "Lote Norte": 85% de probabilidad para el 18/11/2026 (tu umbral: 70%).\n'
+        '• Granizo en "Lote Sur": 60% de probabilidad para el 19/11/2026 (tu umbral: 50%).'
+    )
+    for notification in (first, second):
+        await db_session.refresh(notification)
+        assert notification.status == NotificationStatus.SENT
+        assert notification.attempts == 1
+
+
+async def test_each_user_gets_its_own_message_in_the_same_batch(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    ana = await make_user(phone_number="+5491100000011")
+    bruno = await make_user(phone_number="+5491100000012")
+    ana_alert = await make_alert(await make_field(ana))
+    bruno_alert = await make_alert(await make_field(bruno), event_type=EventType.RAIN, threshold=40)
+    await _make_notification(db_session, ana_alert)
+    await _make_notification(db_session, bruno_alert, probability=60)
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=2)
+    by_phone = {message.phone_number: message for message in notifier.sent}
+    assert set(by_phone) == {"+5491100000011", "+5491100000012"}
+    assert "Tenés" not in by_phone["+5491100000011"].text
+
+
+async def test_more_than_digest_max_items_leaves_the_excess_pending_and_due(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    owner = await make_user()
+    alert = await make_alert(await make_field(owner))
+    notifications = [
+        await _make_notification(
+            db_session, alert, forecast_date=date(2026, 11, 18) + timedelta(days=offset)
+        )
+        for offset in range(3)
+    ]
+    notifier = FakeNotifier()
+    kwargs = {**DISPATCH_KWARGS, "digest_max_items": 2}
+
+    first = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **kwargs)
+
+    assert first == DispatchResult(sent=2, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].text.startswith("⚠️ Tenés 2 alertas climáticas:")
+    await db_session.refresh(notifications[2])
+    assert notifications[2].status == NotificationStatus.PENDING
+    # El excedente queda vencido: sale en el lote siguiente.
+    assert notifications[2].next_attempt_at == NOW
+
+    second = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **kwargs)
+
+    assert second == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert notifier.sent[1].notification_id == notifications[2].id
+    assert "Tenés" not in notifier.sent[1].text
+    await db_session.refresh(notifications[2])
+    assert notifications[2].status == NotificationStatus.SENT
+
+
+async def test_a_failed_digest_applies_its_own_attempts_to_each_notification(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    owner = await make_user()
+    alert = await make_alert(await make_field(owner))
+    retried = await _make_notification(db_session, alert, forecast_date=date(2026, 11, 18))
+    exhausted = await _make_notification(
+        db_session, alert, forecast_date=date(2026, 11, 19), attempts=2
+    )
+
+    result = await dispatch_pending(
+        test_sessionmaker,
+        _FailingNotifier(NotifierError("boom")),
+        now=NOW,
+        **{**DISPATCH_KWARGS, "clock": _clock_at(NOW)},
+    )
+
+    assert result == DispatchResult(sent=0, retried=1, failed=1, users=1)
+    await db_session.refresh(retried)
+    assert retried.status == NotificationStatus.PENDING
+    assert retried.attempts == 1
+    assert retried.next_attempt_at == NOW + timedelta(seconds=30)
+    await db_session.refresh(exhausted)
+    assert exhausted.status == NotificationStatus.FAILED
+    assert exhausted.attempts == 3
+    # El error del mensaje se aplica a todas, con el teléfono enmascarado.
+    assert retried.last_error == "NotifierError: boom"
+    assert exhausted.last_error == "NotifierError: boom"
+
+
+# --- Horario de silencio (S13) ---------------------------------------------
+
+#: 2026-11-16 17:30 UTC = 14:30 en Buenos Aires (UTC-3).
+QUIET_NOW = datetime(2026, 11, 16, 17, 30, tzinfo=UTC)
+#: Fin de una ventana 13:00-15:00 local.
+QUIET_END = datetime(2026, 11, 16, 18, 0, tzinfo=UTC)
+
+
+async def test_a_user_in_quiet_hours_gets_everything_deferred_and_nothing_sent(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    owner = await make_user()
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notifications = [
+        await _make_notification(
+            db_session, alert, forecast_date=date(2026, 11, 18) + timedelta(days=offset)
+        )
+        for offset in range(2)
+    ]
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(
+        test_sessionmaker,
+        notifier,
+        now=QUIET_NOW,
+        clock=_clock_at(QUIET_NOW),
+        **DISPATCH_KWARGS,
+    )
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=0, deferred=2, users=1)
+    assert notifier.calls == 0
+    for notification in notifications:
+        await db_session.refresh(notification)
+        assert notification.status == NotificationStatus.PENDING
+        assert notification.next_attempt_at == QUIET_END
+        # El silencio no es un intento: ni `attempts` ni `last_error` cambian.
+        assert notification.attempts == 0
+        assert notification.last_error is None
+        assert notification.sent_at is None
+
+    # Al terminar el silencio salen todas juntas, en un solo mensaje.
+    sent_now = QUIET_END
+    sent = await dispatch_pending(
+        test_sessionmaker, notifier, now=sent_now, clock=_clock_at(sent_now), **DISPATCH_KWARGS
+    )
+
+    assert sent == DispatchResult(sent=2, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].text.startswith("⚠️ Tenés 2 alertas climáticas:")
+    for notification in notifications:
+        await db_session.refresh(notification)
+        assert notification.status == NotificationStatus.SENT
+        assert notification.attempts == 1
+
+
+async def test_a_window_crossing_midnight_defers_until_tomorrow(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    owner = await make_user()
+    owner.quiet_hours_start = time(22, 0)
+    owner.quiet_hours_end = time(7, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notification = await _make_notification(db_session, alert)
+    notifier = FakeNotifier()
+
+    # 2026-11-17 02:30 UTC = 23:30 local del 16/11.
+    result = await dispatch_pending(
+        test_sessionmaker,
+        notifier,
+        now=QUIET_NOW + timedelta(hours=9),
+        clock=_clock_at(QUIET_NOW + timedelta(hours=9)),
+        **DISPATCH_KWARGS,
+    )
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=0, deferred=1, users=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    # 07:00 local del 17/11 = 10:00 UTC.
+    assert notification.next_attempt_at == datetime(2026, 11, 17, 10, 0, tzinfo=UTC)
+
+
+async def test_an_invalid_user_timezone_is_logged_and_the_message_is_sent(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    owner = await make_user()
+    owner.timezone = "Mars/Olympus"
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    await _make_notification(db_session, alert)
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(
+            test_sessionmaker, notifier, now=QUIET_NOW, **DISPATCH_KWARGS
+        )
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert notifier.calls == 1
+    assert any(
+        f"invalid_user_timezone user_id={owner.id}" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("timezone", ["zone.tab", "America/"])
+async def test_a_user_timezone_that_raises_value_error_does_not_stop_the_batch(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+    timezone: str,
+) -> None:
+    """SEC-1: `ZoneInfo` también lanza `ValueError` con nombres no normalizados.
+
+    El usuario con la zona inválida va primero en el claim: antes del fix la excepción cortaba
+    el lote y nadie recibía su mensaje.
+    """
+    broken = await make_user()
+    broken.timezone = timezone
+    broken.quiet_hours_start = time(13, 0)
+    broken.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    await _make_notification(db_session, await make_alert(await make_field(broken)))
+    healthy = await make_user()
+    await _make_notification(db_session, await make_alert(await make_field(healthy)))
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(
+            test_sessionmaker, notifier, now=QUIET_NOW, **DISPATCH_KWARGS
+        )
+
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=2)
+    assert len(notifier.sent) == 2
+    assert any(
+        f"invalid_user_timezone user_id={broken.id}" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_a_notification_cancelled_during_the_silence_is_not_deferred(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    owner = await make_user()
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notification = await _make_notification(db_session, alert)
+    alert.deleted_at = QUIET_NOW
+    await db_session.flush()
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=QUIET_NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, deferred=0, users=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.CANCELLED
+    assert notification.last_error == "alert_deleted"
+
+
+# --- Cancelación por día pronosticado pasado (S13) -------------------------
+
+
+async def test_a_notification_for_a_past_day_in_the_field_timezone_is_cancelled(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """NOW (16/11 12:00Z) es 16/11 09:00 en Buenos Aires: el 15/11 ya pasó."""
+    alert = await make_alert(await make_field(await make_user()))
+    notification = await _make_notification(db_session, alert, forecast_date=date(2026, 11, 15))
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1, users=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.CANCELLED
+    assert notification.last_error == "forecast_date_passed"
+    assert notification.attempts == 0
+
+
+async def test_the_past_day_check_uses_the_field_timezone_not_the_utc_date(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """A las 12:00Z del 16/11 en Kiritimati (+14) ya es el 17: el 16 está pasado.
+
+    El mismo día en un campo de Buenos Aires sigue siendo hoy y se envía.
+    """
+    east = await make_field(await make_user(), name="Lote +14")
+    east.timezone = "Pacific/Kiritimati"
+    west = await make_field(await make_user(), name="Lote -3")
+    await db_session.flush()
+    east_notification = await _make_notification(
+        db_session, await make_alert(east), forecast_date=date(2026, 11, 16)
+    )
+    west_notification = await _make_notification(
+        db_session, await make_alert(west), forecast_date=date(2026, 11, 16)
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, cancelled=1, users=2)
+    assert [message.notification_id for message in notifier.sent] == [west_notification.id]
+    await db_session.refresh(east_notification)
+    assert east_notification.status == NotificationStatus.CANCELLED
+    assert east_notification.last_error == "forecast_date_passed"
+    await db_session.refresh(west_notification)
+    assert west_notification.status == NotificationStatus.SENT
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("deleted", "alert_deleted"),
+        ("inactive", "alert_inactive"),
+    ],
+)
+async def test_the_cancellation_order_puts_the_alert_state_before_the_past_day(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    mutation: str,
+    reason: str,
+) -> None:
+    """Orden: alerta borrada > inactiva > día pasado > umbral > frescura (JOBS.md §S13)."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(db_session, alert, forecast_date=date(2026, 11, 14))
+    if mutation == "deleted":
+        alert.deleted_at = NOW
+    else:
+        alert.is_active = False
+    await db_session.flush()
+
+    result = await dispatch_pending(test_sessionmaker, FakeNotifier(), now=NOW, **DISPATCH_KWARGS)
+
+    assert result.cancelled == 1
+    await db_session.refresh(notification)
+    assert notification.last_error == reason
+
+
+async def test_the_past_day_beats_the_current_threshold(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """El día pasado se revisa antes que el umbral vigente (JOBS.md §S13)."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=60, forecast_date=date(2026, 11, 14)
+    )
+    alert.threshold = 90
+    await db_session.flush()
+
+    await dispatch_pending(test_sessionmaker, FakeNotifier(), now=NOW, **DISPATCH_KWARGS)
+
+    await db_session.refresh(notification)
+    assert notification.last_error == "forecast_date_passed"
+
+
+# --- S13: bordes del silencio, del digest y de la cancelación ---------------
+
+#: 16:00 UTC = 13:00 en Buenos Aires: el primer instante de la ventana.
+QUIET_START = datetime(2026, 11, 16, 16, 0, tzinfo=UTC)
+
+
+async def test_the_window_start_defers_and_the_window_end_sends(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """JOBS.md §S13: ventana `[start, end)`; `now == start` difiere y `now == end` envía."""
+    owner = await make_user()
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notification = await _make_notification(db_session, alert)
+    notifier = FakeNotifier()
+
+    at_start = await dispatch_pending(
+        test_sessionmaker,
+        notifier,
+        now=QUIET_START,
+        clock=_clock_at(QUIET_START),
+        **DISPATCH_KWARGS,
+    )
+
+    assert at_start == DispatchResult(0, 0, 0, deferred=1, users=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.PENDING
+    assert notification.next_attempt_at == QUIET_END
+    assert notification.attempts == 0
+
+    at_end = await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_END, clock=_clock_at(QUIET_END), **DISPATCH_KWARGS
+    )
+
+    assert at_end == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert notification.attempts == 1
+
+
+async def test_a_quiet_user_and_an_active_user_in_the_same_batch(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Un usuario en silencio y otro no en el mismo lote: el segundo se envía ya."""
+    quiet_owner = await make_user(phone_number="+5491100000021")
+    quiet_owner.quiet_hours_start = time(13, 0)
+    quiet_owner.quiet_hours_end = time(15, 0)
+    active_owner = await make_user(phone_number="+5491100000022")
+    await db_session.flush()
+    quiet_notification = await _make_notification(
+        db_session, await make_alert(await make_field(quiet_owner))
+    )
+    active_notification = await _make_notification(
+        db_session,
+        await make_alert(await make_field(active_owner), event_type=EventType.RAIN, threshold=40),
+        probability=60,
+    )
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.INFO, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(
+            test_sessionmaker,
+            notifier,
+            now=QUIET_NOW,
+            clock=_clock_at(QUIET_NOW),
+            **DISPATCH_KWARGS,
+        )
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, deferred=1, users=2)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].phone_number == "+5491100000022"
+    assert "Tenés" not in notifier.sent[0].text
+    await db_session.refresh(active_notification)
+    assert active_notification.status == NotificationStatus.SENT
+    await db_session.refresh(quiet_notification)
+    assert quiet_notification.status == NotificationStatus.PENDING
+    assert quiet_notification.next_attempt_at == QUIET_END
+    # El log reporta los dos contadores nuevos (JOBS.md §S13).
+    assert any(
+        "dispatch_done users=2 sent=1 retried=0 failed=0 cancelled=0 deferred=1"
+        in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_a_past_forecast_day_in_an_unknown_field_timezone_skips_the_check(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """JOBS.md §S13: una zona del campo que `zoneinfo` no reconoce saltea solo ese chequeo."""
+    field = await make_field(await make_user())
+    field.timezone = "Mars/Olympus"
+    await db_session.flush()
+    alert = await make_alert(field, threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 13)
+    )
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert any("invalid_field_timezone" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_field_timezone_that_raises_value_error_skips_only_the_past_day_check(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SEC-1: `America/` es un `ValueError` de `zoneinfo`, no `ZoneInfoNotFoundError`."""
+    field = await make_field(await make_user())
+    field.timezone = "America/"
+    await db_session.flush()
+    alert = await make_alert(field, threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 13)
+    )
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert any(
+        "invalid_field_timezone timezone=America/" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_exactly_digest_max_items_sends_one_message_and_leaves_nothing_pending(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Borde `row_number() <= digest_max_items`: justo el tope entra completo en el digest."""
+    owner = await make_user()
+    alert = await make_alert(await make_field(owner))
+    notifications = [
+        await _make_notification(
+            db_session, alert, forecast_date=date(2026, 11, 18) + timedelta(days=offset)
+        )
+        for offset in range(2)
+    ]
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(
+        test_sessionmaker, notifier, now=NOW, **{**DISPATCH_KWARGS, "digest_max_items": 2}
+    )
+
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].text.startswith("⚠️ Tenés 2 alertas climáticas:")
+    for notification in notifications:
+        await db_session.refresh(notification)
+        assert notification.status == NotificationStatus.SENT
+    pending = await db_session.scalar(
+        select(func.count())
+        .select_from(Notification)
+        .where(
+            Notification.alert_id == alert.id,
+            Notification.status == NotificationStatus.PENDING,
+        )
+    )
+    assert pending == 0
+
+
+async def test_a_single_valid_notification_next_to_a_cancelled_one_keeps_the_simple_text(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Válida + cancelada en el mismo lote: el digest solo lleva las válidas (acá, una)."""
+    owner = await make_user()
+    field = await make_field(owner, name="Lote Norte")
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    valid = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 18)
+    )
+    passed = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 15)
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, cancelled=1, users=1)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].notification_id == valid.id
+    assert notifier.sent[0].text == build_message_text(
+        event_type=EventType.FROST,
+        field_name="Lote Norte",
+        probability=85,
+        threshold=70,
+        forecast_date=date(2026, 11, 18),
+    )
+    assert "Tenés" not in notifier.sent[0].text
+    await db_session.refresh(passed)
+    assert passed.status == NotificationStatus.CANCELLED
+    assert passed.last_error == "forecast_date_passed"
+
+
+async def test_changing_the_quiet_hours_does_not_advance_already_deferred_notifications(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """JOBS.md §S13: un PATCH del silencio no adelanta lo ya diferido (sale a su hora)."""
+    owner = await make_user()
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notification = await _make_notification(db_session, alert)
+    notifier = FakeNotifier()
+
+    await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_NOW, clock=_clock_at(QUIET_NOW), **DISPATCH_KWARGS
+    )
+    await db_session.refresh(notification)
+    assert notification.next_attempt_at == QUIET_END
+
+    # El usuario desactiva el silencio: lo diferido conserva el fin con el que se difirió.
+    await update_user(db_session, owner, UserUpdate(quiet_hours=None))
+
+    still_deferred = await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_NOW, clock=_clock_at(QUIET_NOW), **DISPATCH_KWARGS
+    )
+
+    assert still_deferred == DispatchResult(0, 0, 0)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.PENDING
+    assert notification.next_attempt_at == QUIET_END
+    assert notification.attempts == 0
+
+    sent = await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_END, clock=_clock_at(QUIET_END), **DISPATCH_KWARGS
+    )
+
+    assert sent == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
