@@ -103,8 +103,13 @@ Análogamente:
 - varias alertas/días → cuenta correcta.
 - episodios (S12b): arriba → abajo de `rearm_level` → arriba crea el episodio 2; quedarse arriba no
   repite; bajar dentro de la banda de histéresis y volver no repite; pronóstico viejo no re-arma.
-- lock tomado por otra conexión (S14a) → devuelve 0, no crea ni re-arma nada y loguea
-  `evaluation_skipped reason=lock_busy`; el worker igual despacha en ese ciclo.
+- lock tomado por otra conexión más que `EVALUATOR_LOCK_WAIT_MS` (S14a) → devuelve 0, no crea ni
+  re-arma nada y loguea `evaluation_skipped reason=lock_busy` (warning); el worker igual despacha
+  en ese ciclo; después del skip la sesión sigue usable y el `lock_timeout` vuelve al de la conexión.
+- lock tomado y liberado antes de vencer la espera → evalúa normalmente.
+- con el evaluador encolado, un `lock_shared` nuevo (PATCH) espera detrás de él (no lo adelanta).
+- PATCH de una alerta inexistente o ajena → 404 sin tomar el lock compartido.
+- worker: la evaluación lanza → `evaluation_failed`, y el ciclo igual despacha.
 - equivalencia SQL vs. `app/jobs/episodes.step` en secuencias generadas con semilla fija
   (`random.Random(<n>)`, sin dependencias nuevas).
 

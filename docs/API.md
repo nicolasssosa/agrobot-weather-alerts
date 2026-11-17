@@ -52,7 +52,7 @@ red: con la clave, el reintento nunca crea una alerta duplicada y recibe la resp
 | Primera vez con la clave | Se ejecuta normalmente; si responde 2xx se guarda la respuesta |
 | Misma clave + mismo body (dentro de la vigencia) | **La misma respuesta guardada**, byte a byte, sin volver a ejecutar; header `Idempotent-Replayed: true` |
 | Misma clave + body distinto | 422 `{"detail": "Idempotency-Key reused with a different request"}` |
-| Dos requests simultáneos con la misma clave | Se serializan: uno ejecuta, el otro recibe el replay |
+| Dos requests simultáneos con la misma clave | Se serializan: uno ejecuta, el otro recibe el replay. Si el primero tarda más que `DB_LOCK_TIMEOUT_MS`, el segundo recibe 503 y al reintentar con la misma clave recibe el replay |
 | La operación falla (404/409/422) | No se guarda la clave: el cliente puede corregir y reintentar con la misma |
 | Clave vencida (`IDEMPOTENCY_TTL_HOURS`, default 24) | Se trata como nueva |
 

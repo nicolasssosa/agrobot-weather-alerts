@@ -111,12 +111,16 @@ def reset(state: DayState) -> DayState:
 
 **Algoritmo SQL**, todo en la transacción del llamador:
 
-0. **Lock de evaluación:** `SELECT pg_try_advisory_xact_lock(:key)` con una constante del módulo
-   (`EVALUATOR_LOCK_KEY`) (S14a). Una sola réplica evalúa por vez. Si el lock está tomado (otra
-   réplica evaluando o un PATCH de alerta con el lock compartido abierto), **no evalúa**: devuelve 0,
-   loguea `evaluation_skipped reason=lock_busy` (info) y el worker sigue al despacho del mismo ciclo;
-   la evaluación se hace en el ciclo siguiente. No se espera el lock: con `DB_LOCK_TIMEOUT_MS` /
-   `DB_STATEMENT_TIMEOUT_MS` la espera terminaría en error y cortaría también el despacho. Sin el
+0. **Lock de evaluación:** `SELECT pg_advisory_xact_lock(:key)` con una constante del módulo
+   (`EVALUATOR_LOCK_KEY`), pedido **en cola** con una espera acotada (S14a): dentro de un savepoint,
+   `lock_timeout = EVALUATOR_LOCK_WAIT_MS` (default 10000) solo para esa sentencia; después se
+   restaura el `lock_timeout` de la conexión. Una sola réplica evalúa por vez. Esperar en la cola
+   (y no un `pg_try_*` de un solo intento) importa: un pedido exclusivo encolado hace que los
+   `lock_shared` nuevos de los PATCH esperen detrás, así un flujo constante de PATCH no puede
+   dejar al evaluador sin turno (S14a SEC-1). Si la espera vence (otra réplica evaluando más que
+   eso), se hace rollback del savepoint y **no evalúa**: devuelve 0, loguea
+   `evaluation_skipped reason=lock_busy wait_ms=<n>` (warning) y el worker sigue al despacho del
+   mismo ciclo; la evaluación se hace en el ciclo siguiente. Sin el
    lock, dos réplicas con snapshots distintos podrían re-armar y volver a disparar el mismo día
    (episodio duplicado). Se libera solo al terminar la transacción (commit/rollback del worker).
 1. **Re-armado** (una sentencia): `UPDATE alert_day_states s SET armed = true, updated_at = now()
@@ -157,8 +161,10 @@ inactivas no cambian de estado.
 **Re-armado por cambio de alerta** (`app/services/alerts.py`, `update_alert`): si el PATCH cambia
 el `threshold` a un valor distinto o pasa `is_active` de `false` a `true`, en la **misma
 transacción** del UPDATE de la alerta y en este orden:
-0. `SELECT pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)` (S12b SEC-1/CR-1), **antes** del UPDATE
-   de la alerta. Los PATCH no se bloquean entre sí (lock compartido); solo esperan a una evaluación
+0. `SELECT pg_advisory_xact_lock_shared(EVALUATOR_LOCK_KEY)` (S12b SEC-1/CR-1), **después** de
+   verificar que la alerta existe y es del usuario (desde S14a: un 404 no toma el lock) y **antes**
+   del UPDATE de la alerta. Mientras el evaluador espera en la cola, los PATCH nuevos esperan
+   detrás de él; si esa espera supera `DB_LOCK_TIMEOUT_MS`, el PATCH responde 503 reintentable. Los PATCH no se bloquean entre sí (lock compartido); solo esperan a una evaluación
    en curso, y el evaluador (lock exclusivo) espera a los PATCH abiertos. Así una evaluación nunca
    ve un umbral viejo con un estado ya re-armado, ni re-arma después de que el PATCH canceló, y no
    hay deadlock entre los dos sobre `alert_day_states`. La espera es corta: el worker commitea
@@ -427,6 +433,11 @@ async def run_cycle(
 ```
 1. `now = now or datetime.now(UTC)`.
 2. `async with sessionmaker() as s:` → `created = await evaluate_alerts(s, now=now, ..., rearm_margin=settings.rearm_margin)` → `await s.commit()`.
+   Si la evaluación lanza (por ejemplo un `statement_timeout` con muchos datos), loguear
+   `evaluation_failed` con el stack (`logger.exception`), rollback, `created = 0` y **seguir al
+   paso 3**: una evaluación rota no frena el envío de lo ya pendiente (S14a CR-2). Con
+   `DB_STATEMENT_TIMEOUT_MS` (default 30 s) cada sentencia de la evaluación debe entrar en ese
+   tiempo; si la cantidad de campos y pronósticos lo supera, subir el valor.
 3. Despachar en lotes hasta vaciar la cola vencida: llamar
    `dispatch_pending(sessionmaker, notifier, ..., digest_max_items=settings.digest_max_items)` (maneja sus propias transacciones) mientras el
    lote haya venido lleno (desde S13: `dispatch.users == batch_size`), **con un `now` fresco
