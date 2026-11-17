@@ -43,7 +43,9 @@ from app.models import (
 )
 from app.notifiers.base import NotificationMessage, NotifierError
 from app.notifiers.log import LoggingNotifier
+from app.schemas.user import UserUpdate
 from app.services.alerts import delete_alert
+from app.services.users import update_user
 from tests.conftest import (
     TEST_DATABASE_URL,
     FakeNotifier,
@@ -2680,3 +2682,249 @@ async def test_the_past_day_beats_the_current_threshold(
 
     await db_session.refresh(notification)
     assert notification.last_error == "forecast_date_passed"
+
+
+# --- S13: bordes del silencio, del digest y de la cancelación ---------------
+
+#: 16:00 UTC = 13:00 en Buenos Aires: el primer instante de la ventana.
+QUIET_START = datetime(2026, 11, 16, 16, 0, tzinfo=UTC)
+
+
+async def test_the_window_start_defers_and_the_window_end_sends(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """JOBS.md §S13: ventana `[start, end)`; `now == start` difiere y `now == end` envía."""
+    owner = await make_user()
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notification = await _make_notification(db_session, alert)
+    notifier = FakeNotifier()
+
+    at_start = await dispatch_pending(
+        test_sessionmaker,
+        notifier,
+        now=QUIET_START,
+        clock=_clock_at(QUIET_START),
+        **DISPATCH_KWARGS,
+    )
+
+    assert at_start == DispatchResult(0, 0, 0, deferred=1, users=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.PENDING
+    assert notification.next_attempt_at == QUIET_END
+    assert notification.attempts == 0
+
+    at_end = await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_END, clock=_clock_at(QUIET_END), **DISPATCH_KWARGS
+    )
+
+    assert at_end == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert notification.attempts == 1
+
+
+async def test_a_quiet_user_and_an_active_user_in_the_same_batch(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Un usuario en silencio y otro no en el mismo lote: el segundo se envía ya."""
+    quiet_owner = await make_user(phone_number="+5491100000021")
+    quiet_owner.quiet_hours_start = time(13, 0)
+    quiet_owner.quiet_hours_end = time(15, 0)
+    active_owner = await make_user(phone_number="+5491100000022")
+    await db_session.flush()
+    quiet_notification = await _make_notification(
+        db_session, await make_alert(await make_field(quiet_owner))
+    )
+    active_notification = await _make_notification(
+        db_session,
+        await make_alert(await make_field(active_owner), event_type=EventType.RAIN, threshold=40),
+        probability=60,
+    )
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.INFO, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(
+            test_sessionmaker,
+            notifier,
+            now=QUIET_NOW,
+            clock=_clock_at(QUIET_NOW),
+            **DISPATCH_KWARGS,
+        )
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, deferred=1, users=2)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].phone_number == "+5491100000022"
+    assert "Tenés" not in notifier.sent[0].text
+    await db_session.refresh(active_notification)
+    assert active_notification.status == NotificationStatus.SENT
+    await db_session.refresh(quiet_notification)
+    assert quiet_notification.status == NotificationStatus.PENDING
+    assert quiet_notification.next_attempt_at == QUIET_END
+    # El log reporta los dos contadores nuevos (JOBS.md §S13).
+    assert any(
+        "dispatch_done users=2 sent=1 retried=0 failed=0 cancelled=0 deferred=1"
+        in record.getMessage()
+        for record in caplog.records
+    )
+
+
+async def test_a_past_forecast_day_in_an_unknown_field_timezone_skips_the_check(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """JOBS.md §S13: una zona del campo que `zoneinfo` no reconoce saltea solo ese chequeo."""
+    field = await make_field(await make_user())
+    field.timezone = "Mars/Olympus"
+    await db_session.flush()
+    alert = await make_alert(field, threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 13)
+    )
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert any("invalid_field_timezone" in record.getMessage() for record in caplog.records)
+
+
+async def test_exactly_digest_max_items_sends_one_message_and_leaves_nothing_pending(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Borde `row_number() <= digest_max_items`: justo el tope entra completo en el digest."""
+    owner = await make_user()
+    alert = await make_alert(await make_field(owner))
+    notifications = [
+        await _make_notification(
+            db_session, alert, forecast_date=date(2026, 11, 18) + timedelta(days=offset)
+        )
+        for offset in range(2)
+    ]
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(
+        test_sessionmaker, notifier, now=NOW, **{**DISPATCH_KWARGS, "digest_max_items": 2}
+    )
+
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].text.startswith("⚠️ Tenés 2 alertas climáticas:")
+    for notification in notifications:
+        await db_session.refresh(notification)
+        assert notification.status == NotificationStatus.SENT
+    pending = await db_session.scalar(
+        select(func.count())
+        .select_from(Notification)
+        .where(
+            Notification.alert_id == alert.id,
+            Notification.status == NotificationStatus.PENDING,
+        )
+    )
+    assert pending == 0
+
+
+async def test_a_single_valid_notification_next_to_a_cancelled_one_keeps_the_simple_text(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Válida + cancelada en el mismo lote: el digest solo lleva las válidas (acá, una)."""
+    owner = await make_user()
+    field = await make_field(owner, name="Lote Norte")
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    valid = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 18)
+    )
+    passed = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 15)
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, cancelled=1, users=1)
+    assert len(notifier.sent) == 1
+    assert notifier.sent[0].notification_id == valid.id
+    assert notifier.sent[0].text == build_message_text(
+        event_type=EventType.FROST,
+        field_name="Lote Norte",
+        probability=85,
+        threshold=70,
+        forecast_date=date(2026, 11, 18),
+    )
+    assert "Tenés" not in notifier.sent[0].text
+    await db_session.refresh(passed)
+    assert passed.status == NotificationStatus.CANCELLED
+    assert passed.last_error == "forecast_date_passed"
+
+
+async def test_changing_the_quiet_hours_does_not_advance_already_deferred_notifications(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """JOBS.md §S13: un PATCH del silencio no adelanta lo ya diferido (sale a su hora)."""
+    owner = await make_user()
+    owner.quiet_hours_start = time(13, 0)
+    owner.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    alert = await make_alert(await make_field(owner))
+    notification = await _make_notification(db_session, alert)
+    notifier = FakeNotifier()
+
+    await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_NOW, clock=_clock_at(QUIET_NOW), **DISPATCH_KWARGS
+    )
+    await db_session.refresh(notification)
+    assert notification.next_attempt_at == QUIET_END
+
+    # El usuario desactiva el silencio: lo diferido conserva el fin con el que se difirió.
+    await update_user(db_session, owner, UserUpdate(quiet_hours=None))
+
+    still_deferred = await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_NOW, clock=_clock_at(QUIET_NOW), **DISPATCH_KWARGS
+    )
+
+    assert still_deferred == DispatchResult(0, 0, 0)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.PENDING
+    assert notification.next_attempt_at == QUIET_END
+    assert notification.attempts == 0
+
+    sent = await dispatch_pending(
+        test_sessionmaker, notifier, now=QUIET_END, clock=_clock_at(QUIET_END), **DISPATCH_KWARGS
+    )
+
+    assert sent == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1

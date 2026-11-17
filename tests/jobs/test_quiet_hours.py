@@ -134,3 +134,67 @@ def test_an_unknown_timezone_raises_zoneinfo_not_found() -> None:
             start=time(13, 0),
             end=time(15, 0),
         )
+
+
+# --- Ventana de un día completo (00:00-23:59) -------------------------------
+
+
+@pytest.mark.parametrize(
+    ("utc_moment", "expected"),
+    [
+        # 00:00 local del 16/11: primer instante de la ventana (borde `start` incluido).
+        (_utc(2026, 11, 16, 3, 0), _utc(2026, 11, 17, 2, 59)),
+        # 12:00 local: adentro.
+        (_utc(2026, 11, 16, 15, 0), _utc(2026, 11, 17, 2, 59)),
+        # 23:58 local: adentro, a un minuto del fin.
+        (_utc(2026, 11, 17, 2, 58), _utc(2026, 11, 17, 2, 59)),
+        # 23:59 local: borde `end` excluido, ya se envía.
+        (_utc(2026, 11, 17, 2, 59), None),
+        # 00:00 local del día siguiente: vuelve a empezar la ventana.
+        (_utc(2026, 11, 17, 3, 0), _utc(2026, 11, 18, 2, 59)),
+    ],
+)
+def test_a_full_day_window_is_half_open_and_ends_right_before_midnight(
+    utc_moment: datetime, expected: datetime | None
+) -> None:
+    assert quiet_until(utc_moment, timezone=TZ, start=time(0, 0), end=time(23, 59)) == expected
+
+
+# --- Cambios de horario de verano (DST) -------------------------------------
+#
+# JOBS.md §S13: el fin se arma con `datetime.combine(fecha, end, tzinfo=zone)` (`fold=0`):
+# `zoneinfo` resuelve con el offset previo una hora local inexistente, y si el fin queda
+# `<= now` no hay silencio (no se difiere de más en el día del cambio).
+
+
+def test_the_end_inside_a_dst_gap_resolves_with_the_pre_spring_offset() -> None:
+    """America/Santiago salta de 00:00 a 01:00 el 2026-09-06: las 00:30 no existen.
+
+    Una ventana 23:00-00:30 abierta la noche anterior termina en esa hora inexistente:
+    con `fold=0` el fin cae a las 04:30 UTC (01:30 local, ya con el offset de verano, -03)
+    y sigue siendo posterior a `now`.
+    """
+    until = quiet_until(
+        _utc(2026, 9, 6, 3, 30),  # 2026-09-05 23:30 local (-04)
+        timezone="America/Santiago",
+        start=time(23, 0),
+        end=time(0, 30),
+    )
+
+    assert until == _utc(2026, 9, 6, 4, 30)
+
+
+def test_an_ambiguous_end_already_passed_in_a_dst_fold_is_not_quiet() -> None:
+    """America/New_York repite 01:00-02:00 el 2026-11-01: 01:15 ocurre dos veces.
+
+    A la segunda (01:15 EST = 06:15 UTC) el fin con `fold=0` (01:30 EDT = 05:30 UTC) ya
+    pasó: el fin calculado es `<= now`, así que no se difiere 24 h por el salto de DST.
+    """
+    until = quiet_until(
+        _utc(2026, 11, 1, 6, 15),
+        timezone="America/New_York",
+        start=time(0, 30),
+        end=time(1, 30),
+    )
+
+    assert until is None

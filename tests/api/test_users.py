@@ -399,3 +399,50 @@ async def test_patch_only_touches_the_authenticated_user(
     other = await client.get(f"{API}/me", headers=auth(bruno))
     assert other.json()["quiet_hours"] is None
     assert other.json()["timezone"] == "America/Argentina/Buenos_Aires"
+
+
+@pytest.mark.parametrize("invalid_time", ["24:00", "7:00", "07:00Z"])
+async def test_quiet_hours_outside_hh_mm_returns_422(
+    client: AsyncClient, make_user: MakeUser, invalid_time: str
+) -> None:
+    """API.md §users: horas locales `HH:MM` (00:00-23:59), sin segundos ni offset."""
+    user = await make_user()
+
+    response = await client.patch(
+        f"{API}/me",
+        json={"quiet_hours": {"start": invalid_time, "end": "23:00"}},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 422
+
+
+async def test_a_timezone_that_postgres_does_not_know_exactly_returns_422(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    """La fuente de verdad es `pg_timezone_names` (API.md §users), no `zoneinfo`.
+
+    En macOS `zoneinfo` resuelve la variante en minúsculas (filesystem case-insensitive) y la
+    rechaza el service; en otros SO la rechaza el schema. En ambos casos es 422 y no se
+    escribe nada.
+    """
+    user = await make_user()
+
+    created = await client.post(
+        API,
+        json={
+            "phone_number": "+5491122334480",
+            "name": "Ana",
+            "timezone": "america/argentina/buenos_aires",
+        },
+    )
+    patched = await client.patch(
+        f"{API}/me",
+        json={"timezone": "america/argentina/buenos_aires"},
+        headers=auth(user),
+    )
+
+    assert created.status_code == 422
+    assert patched.status_code == 422
+    me = await client.get(f"{API}/me", headers=auth(user))
+    assert me.json()["timezone"] == "America/Argentina/Buenos_Aires"

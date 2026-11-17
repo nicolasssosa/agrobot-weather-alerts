@@ -150,6 +150,19 @@ def test_migration_0008_upgrade_and_downgrade_are_clean() -> None:
     command.upgrade(cfg, "head")
 
 
+def test_migration_0009_upgrade_and_downgrade_are_clean() -> None:
+    """La migración `0009` se revierte y se vuelve a aplicar sin errores (S13).
+
+    `downgrade()` elimina las tres columnas y los dos CHECK de `users` (DATA_MODEL.md
+    §Migración 0009); el `upgrade` siguiente las recrea y el resto de la suite vuelve a
+    correr sobre el esquema completo.
+    """
+    cfg = _config()
+
+    command.downgrade(cfg, "0008")
+    command.upgrade(cfg, "head")
+
+
 def test_migration_0008_backfills_day_states_for_already_notified_days() -> None:
     """`0008`: un día ya notificado queda desarmado en episodio 1 (no se re-avisa)."""
     cfg = _config()
