@@ -26,6 +26,8 @@ from app.jobs.dispatcher import (
     DispatchResult,
     _claim_batch,
     _claim_statement,
+    _defer_statement,
+    _lease_statement,
     _record_outcomes,
     _SendOutcome,
     build_digest_text,
@@ -212,6 +214,86 @@ def test_the_batch_claim_locks_the_users_with_for_no_key_update() -> None:
     assert "FOR NO KEY UPDATE SKIP LOCKED" in sql
     assert "min(n.next_attempt_at), f.user_id" in sql
     assert "LIMIT :batch_size" in sql
+
+
+def test_the_outer_claim_rechecks_pending_and_due_date_after_the_lock() -> None:
+    """CR-1: el WHERE externo repite `pending` y `next_attempt_at <= now`.
+
+    La subconsulta rankeada queda fija en el snapshot de la sentencia; si otra transacción
+    cancela una notificación antes de que el claim la lockee, el recheck de Postgres (EPQ)
+    solo re-evalúa el WHERE externo. Sin los predicados repetidos la fila cancelada se
+    reclamaría y se enviaría. Por eso cada uno aparece dos veces: adentro y afuera.
+    """
+    sql = _compiled_claim_sql()
+
+    assert sql.count("notifications.status = 'pending'") == 2
+    assert sql.count("notifications.next_attempt_at <= ") == 2
+
+
+async def test_the_lease_update_skips_a_notification_cancelled_before_the_lock(
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-1: el arriendo con `RETURNING id` no toca lo que otra transacción canceló."""
+    alert = await make_alert(await make_field(await make_user()))
+    pending = await _make_notification(db_session, alert, forecast_date=FORECAST_DATE)
+    cancelled = await _make_notification(
+        db_session,
+        alert,
+        forecast_date=FORECAST_DATE + timedelta(days=1),
+        status=NotificationStatus.CANCELLED,
+        last_error="alert_reset",
+    )
+    lease_until = NOW + timedelta(seconds=60)
+
+    leased = (
+        (
+            await db_session.execute(
+                _lease_statement([pending.id, cancelled.id], now=NOW, lease_until=lease_until)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    assert list(leased) == [pending.id]
+    await db_session.refresh(pending)
+    await db_session.refresh(cancelled)
+    assert pending.next_attempt_at == lease_until
+    assert cancelled.next_attempt_at == NOW
+
+
+async def test_the_deferral_update_skips_a_notification_cancelled_before_the_lock(
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-1: el diferimiento también cuenta solo las filas que siguen `pending`."""
+    alert = await make_alert(await make_field(await make_user()))
+    pending = await _make_notification(db_session, alert, forecast_date=FORECAST_DATE)
+    cancelled = await _make_notification(
+        db_session,
+        alert,
+        forecast_date=FORECAST_DATE + timedelta(days=1),
+        status=NotificationStatus.CANCELLED,
+        last_error="alert_reset",
+    )
+    until = NOW + timedelta(hours=1)
+
+    deferred = (
+        (await db_session.execute(_defer_statement([pending.id, cancelled.id], until=until)))
+        .scalars()
+        .all()
+    )
+
+    assert list(deferred) == [pending.id]
+    await db_session.refresh(pending)
+    await db_session.refresh(cancelled)
+    assert pending.next_attempt_at == until
+    assert cancelled.next_attempt_at == NOW
 
 
 # --- Éxito ----------------------------------------------------------------
@@ -2548,6 +2630,44 @@ async def test_an_invalid_user_timezone_is_logged_and_the_message_is_sent(
     )
 
 
+@pytest.mark.parametrize("timezone", ["zone.tab", "America/"])
+async def test_a_user_timezone_that_raises_value_error_does_not_stop_the_batch(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+    timezone: str,
+) -> None:
+    """SEC-1: `ZoneInfo` también lanza `ValueError` con nombres no normalizados.
+
+    El usuario con la zona inválida va primero en el claim: antes del fix la excepción cortaba
+    el lote y nadie recibía su mensaje.
+    """
+    broken = await make_user()
+    broken.timezone = timezone
+    broken.quiet_hours_start = time(13, 0)
+    broken.quiet_hours_end = time(15, 0)
+    await db_session.flush()
+    await _make_notification(db_session, await make_alert(await make_field(broken)))
+    healthy = await make_user()
+    await _make_notification(db_session, await make_alert(await make_field(healthy)))
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(
+            test_sessionmaker, notifier, now=QUIET_NOW, **DISPATCH_KWARGS
+        )
+
+    assert result == DispatchResult(sent=2, retried=0, failed=0, users=2)
+    assert len(notifier.sent) == 2
+    assert any(
+        f"invalid_user_timezone user_id={broken.id}" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 async def test_a_notification_cancelled_during_the_silence_is_not_deferred(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],
@@ -2808,6 +2928,37 @@ async def test_a_past_forecast_day_in_an_unknown_field_timezone_skips_the_check(
     await db_session.refresh(notification)
     assert notification.status == NotificationStatus.SENT
     assert any("invalid_field_timezone" in record.getMessage() for record in caplog.records)
+
+
+async def test_a_field_timezone_that_raises_value_error_skips_only_the_past_day_check(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """SEC-1: `America/` es un `ValueError` de `zoneinfo`, no `ZoneInfoNotFoundError`."""
+    field = await make_field(await make_user())
+    field.timezone = "America/"
+    await db_session.flush()
+    alert = await make_alert(field, threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_date=date(2026, 11, 13)
+    )
+    notifier = FakeNotifier()
+
+    with caplog.at_level(logging.WARNING, logger="app.jobs.dispatcher"):
+        result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(notifier.sent) == 1
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert any(
+        "invalid_field_timezone timezone=America/" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 async def test_exactly_digest_max_items_sends_one_message_and_leaves_nothing_pending(

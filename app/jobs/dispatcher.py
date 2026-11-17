@@ -24,7 +24,7 @@ from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from sqlalchemy import Select, func, select, text, update
+from sqlalchemy import Select, Update, func, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.pii import mask_phone_in_text
@@ -289,7 +289,15 @@ def _claim_statement(
             & (WeatherForecast.event_type == Notification.event_type)
             & (WeatherForecast.forecast_date == Notification.forecast_date),
         )
-        .where(Notification.id.in_(_ranked_due_ids(now, user_ids, digest_max_items)))
+        .where(
+            Notification.id.in_(_ranked_due_ids(now, user_ids, digest_max_items)),
+            # Repetidos a propósito (CR-1): Postgres re-evalúa el WHERE externo al lockear la
+            # fila (EPQ) y la subconsulta quedó fija en el snapshot de la sentencia. Sin estos
+            # predicados, una notificación que otra transacción canceló entre el snapshot y el
+            # lock se reclamaría igual y se enviaría para una alerta pausada/borrada.
+            Notification.status == NotificationStatus.PENDING,
+            Notification.next_attempt_at <= now,
+        )
         .order_by(Notification.next_attempt_at, Notification.id)
         .with_for_update(of=Notification, skip_locked=True)
     )
@@ -298,15 +306,56 @@ def _claim_statement(
     return statement  # type: ignore[return-value]
 
 
-def _local_today(now: datetime, timezone: str) -> date | None:
-    """Fecha local del campo a `now`; `None` si `zoneinfo` no reconoce la zona.
+def _lease_statement(
+    notification_ids: Sequence[int], *, now: datetime, lease_until: datetime
+) -> Update:
+    """Arrienda solo las notificaciones que siguen `pending` y vencidas (token del lote).
 
-    Una zona inválida saltea solo el chequeo de día pasado (docs/JOBS.md §S13): el campo no
-    puede abortar el lote por un dato mal cargado.
+    `RETURNING id`: el llamador envía únicamente las filas que este UPDATE realmente arrendó.
+    La guarda de estado es la segunda defensa de CR-1: si una transacción canceló la fila
+    (PATCH con `alert_reset` o DELETE de la alerta) después del claim, no se envía.
+    """
+    return (
+        update(Notification)
+        .where(
+            Notification.id.in_(notification_ids),
+            Notification.status == NotificationStatus.PENDING,
+            Notification.next_attempt_at <= now,
+        )
+        .values(next_attempt_at=lease_until)
+        .returning(Notification.id)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _defer_statement(notification_ids: Sequence[int], *, until: datetime) -> Update:
+    """Difiere las notificaciones que sigan `pending` hasta `until`; `RETURNING id` las cuenta.
+
+    Igual que el lease (CR-1), una fila cancelada entre el claim y esta sentencia no cambia de
+    `next_attempt_at` ni se cuenta como diferida.
+    """
+    return (
+        update(Notification)
+        .where(
+            Notification.id.in_(notification_ids),
+            Notification.status == NotificationStatus.PENDING,
+        )
+        .values(next_attempt_at=until)
+        .returning(Notification.id)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _local_today(now: datetime, timezone: str) -> date | None:
+    """Fecha local del campo a `now`; `None` si `zoneinfo` rechaza la zona.
+
+    Una zona inválida (`ZoneInfoNotFoundError` o el `ValueError` de nombres como `zone.tab`,
+    `America/`) saltea solo el chequeo de día pasado (docs/JOBS.md §S13): el campo no puede
+    abortar el lote por un dato mal cargado.
     """
     try:
         return now.astimezone(ZoneInfo(timezone)).date()
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         logger.warning("invalid_field_timezone timezone=%s", timezone)
         return None
 
@@ -350,8 +399,11 @@ def _cancellation_reason(
 def _quiet_until_for(user: ClaimedUser, now: datetime) -> datetime | None:
     """Fin del silencio del usuario (o `None` si no está en silencio).
 
-    Una zona que `zoneinfo` no reconoce no puede diferir nada: se loguea
-    `invalid_user_timezone` y se envía como si no tuviera silencio (docs/JOBS.md §S13).
+    Una zona que `zoneinfo` rechaza no puede diferir nada: se loguea
+    `invalid_user_timezone` y se envía como si no tuviera silencio (docs/JOBS.md §S13). Se
+    capturan las dos excepciones que puede lanzar `ZoneInfo`: `ZoneInfoNotFoundError` (zona
+    inexistente) y `ValueError` (nombres no normalizados como `zone.tab`, `America/`), que
+    escrito directo en la DB frenaría el dispatch de todos los usuarios.
     """
     try:
         return quiet_until(
@@ -360,7 +412,7 @@ def _quiet_until_for(user: ClaimedUser, now: datetime) -> datetime | None:
             start=user.quiet_hours_start,
             end=user.quiet_hours_end,
         )
-    except ZoneInfoNotFoundError:
+    except (ZoneInfoNotFoundError, ValueError):
         logger.warning("invalid_user_timezone user_id=%d", user.id)
         return None
 
@@ -495,26 +547,29 @@ async def _claim_batch(
                 )
                 .execution_options(synchronize_session=False)
             )
+        deferred = 0
         for until, notification_ids in deferred_ids.values():
-            await session.execute(
-                update(Notification)
-                .where(
-                    Notification.id.in_(notification_ids),
-                    Notification.status == NotificationStatus.PENDING,
-                )
-                .values(next_attempt_at=until)
-                .execution_options(synchronize_session=False)
+            deferred += len(
+                (await session.execute(_defer_statement(notification_ids, until=until)))
+                .scalars()
+                .all()
             )
         if claimed:
-            await session.execute(
-                update(Notification)
-                .where(Notification.id.in_([item.id for item in claimed]))
-                .values(next_attempt_at=lease_until)
-                .execution_options(synchronize_session=False)
+            leased_ids = set(
+                (
+                    await session.execute(
+                        _lease_statement(
+                            [item.id for item in claimed], now=now, lease_until=lease_until
+                        )
+                    )
+                )
+                .scalars()
+                .all()
             )
+            # Solo se envía lo que este lote arrendó de verdad (CR-1).
+            claimed = [item for item in claimed if item.id in leased_ids]
         await session.commit()
 
-    deferred = sum(len(ids) for _, ids in deferred_ids.values())
     return _ClaimBatch(
         claimed=claimed,
         cancelled=sum(len(ids) for ids in cancellations.values()),
