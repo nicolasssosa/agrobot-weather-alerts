@@ -15,7 +15,7 @@ proceso de ingeniería alrededor de ellos.
 | Desarrollo | Coder ([coder.md](../.agents/coder.md)) | código + tests, `CODER_REPORT` |
 | Testing | QA ([qa.md](../.agents/qa.md)) | tests de borde, `QA_REPORT` |
 | Review | Code + Security ([code-reviewer.md](../.agents/code-reviewer.md), [security-reviewer.md](../.agents/security-reviewer.md)) | `REVIEW` JSON |
-| Integración | PM + GitHub Actions (S8) | PR, CI verde, squash merge |
+| Integración | PM + GitHub Actions (S16) | PR, CI verde, squash merge |
 
 ## Convenciones de git
 
@@ -23,7 +23,7 @@ proceso de ingeniería alrededor de ellos.
 - Conventional Commits; un commit squash por historia en `main`:
   `feat(alerts): S4 alerts CRUD API`. Sin atribución de IA ni en commits (`Co-Authored-By`) ni en PRs.
 - Descripción del PR = `.github/pull_request_template.md` con los reportes de QA y las reviews.
-- `main` siempre en verde. Hasta que exista el CI (S8), el gate es `make check`, re-ejecutado por el PM.
+- `main` siempre en verde. El gate es el CI de GitHub Actions (S16) más `make check` re-ejecutado por el PM.
 
 ## Merge gate (antes de cada merge)
 
