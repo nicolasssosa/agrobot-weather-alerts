@@ -6,6 +6,7 @@ Todas las corridas usan un `today` fijo: nunca el reloj real.
 
 import asyncio
 import logging
+import random
 import uuid
 from collections.abc import Awaitable
 from datetime import UTC, date, datetime, timedelta, timezone
@@ -17,9 +18,11 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
-from app.jobs.evaluator import _build_statement, evaluate_alerts
+from app.jobs.episodes import INITIAL_STATE, DayState, reset, step
+from app.jobs.evaluator import EVALUATOR_LOCK_KEY, _build_statement, evaluate_alerts
 from app.models import (
     Alert,
+    AlertDayState,
     EventType,
     Field,
     Notification,
@@ -27,6 +30,8 @@ from app.models import (
     User,
     WeatherForecast,
 )
+from app.schemas.alert import AlertUpdate
+from app.services.alerts import update_alert
 from tests.conftest import TEST_DATABASE_URL, MakeAlert, MakeField, MakeForecast, MakeUser
 
 TODAY = date(2026, 11, 16)
@@ -38,6 +43,8 @@ NOW = FIXED_AT
 MAX_AGE_HOURS = 24
 #: Tolerancia de reloj para un `issued_at` futuro (docs/JOBS.md §Ingesta mock).
 FUTURE_TOLERANCE_MINUTES = 60
+#: Margen de histéresis por defecto (D1): dispara en >= 70, re-arma en < 60.
+REARM_MARGIN = 10
 
 
 def _evaluate(
@@ -47,6 +54,7 @@ def _evaluate(
     horizon_days: int = 0,
     max_forecast_age_hours: int = MAX_AGE_HOURS,
     future_tolerance_minutes: int = FUTURE_TOLERANCE_MINUTES,
+    rearm_margin: int = REARM_MARGIN,
 ) -> Awaitable[int]:
     """Corre el evaluador con `now`/ventana fijos (nunca el reloj real).
 
@@ -59,6 +67,7 @@ def _evaluate(
         horizon_days=horizon_days,
         max_forecast_age_hours=max_forecast_age_hours,
         future_tolerance_minutes=future_tolerance_minutes,
+        rearm_margin=rearm_margin,
     )
 
 
@@ -66,7 +75,9 @@ async def _notifications(
     session: AsyncSession, *, alert_id: int | None = None
 ) -> list[Notification]:
     """Notificaciones ordenadas; opcionalmente las de una alerta."""
-    statement = select(Notification).order_by(Notification.alert_id, Notification.forecast_date)
+    statement = select(Notification).order_by(
+        Notification.alert_id, Notification.forecast_date, Notification.episode
+    )
     if alert_id is not None:
         statement = statement.where(Notification.alert_id == alert_id)
     result = await session.execute(statement)
@@ -86,6 +97,27 @@ def _compiled_sql(*, literal_binds: bool = False) -> str:
     )
 
 
+async def _day_states(session: AsyncSession) -> list[AlertDayState]:
+    """Estados de episodio ordenados por alerta y día."""
+    result = await session.execute(
+        select(AlertDayState).order_by(AlertDayState.alert_id, AlertDayState.forecast_date)
+    )
+    return list(result.scalars().all())
+
+
+async def _day_state(session: AsyncSession, alert_id: int, forecast_date: date) -> DayState:
+    """Estado de episodio de un (alerta, día); sin fila = `INITIAL_STATE`."""
+    row = (
+        await session.execute(
+            select(AlertDayState.episode, AlertDayState.armed).where(
+                AlertDayState.alert_id == alert_id,
+                AlertDayState.forecast_date == forecast_date,
+            )
+        )
+    ).one_or_none()
+    return INITIAL_STATE if row is None else DayState(episode=row.episode, armed=row.armed)
+
+
 # --- Forma del SQL (CR-1, CR-2) ------------------------------------------
 
 
@@ -103,13 +135,21 @@ def test_active_filter_is_a_bare_boolean_and_excludes_deleted_alerts() -> None:
 
 
 def test_insert_is_counted_in_sql_without_materializing_rows() -> None:
-    """El INSERT va en un CTE y el conteo lo hace Postgres: nunca se traen las filas a
-    Python (`len(result.all())`)."""
+    """El disparo va en CTEs y el conteo lo hace Postgres: nunca se traen las filas a Python.
+
+    `fired` hace el upsert del estado con `DO UPDATE ... WHERE armed` (sigue arriba = no
+    dispara) y `ins` inserta la notificación con `ON CONFLICT (alert_id, forecast_date,
+    episode) DO NOTHING` (red de seguridad de idempotencia).
+    """
     sql = _compiled_sql()
 
-    assert sql.startswith("WITH ins AS")
-    assert "INSERT INTO notifications" in sql
-    assert "ON CONFLICT (alert_id, forecast_date) DO NOTHING" in sql
+    assert sql.startswith("WITH candidatos AS")
+    assert "fired AS" in sql
+    assert "INSERT INTO alert_day_states" in sql
+    assert "ON CONFLICT (alert_id, forecast_date) DO UPDATE" in sql
+    assert "WHERE alert_day_states.armed" in sql
+    assert sql.count("INSERT INTO notifications") == 1
+    assert "ON CONFLICT (alert_id, forecast_date, episode) DO NOTHING" in sql
     assert "RETURNING notifications.id" in sql
     assert "count(*)" in sql
     assert "FROM ins" in sql
@@ -177,6 +217,7 @@ async def test_probability_equal_to_threshold_creates_notification(
     assert notification.threshold == 70
     assert notification.status == NotificationStatus.PENDING
     assert notification.attempts == 0
+    assert notification.episode == 1
     assert notification.next_attempt_at is not None
     assert notification.sent_at is None
     assert notification.last_error is None
@@ -329,26 +370,22 @@ async def test_running_twice_does_not_duplicate(
     assert len(await _notifications(db_session)) == 1
 
 
-async def test_forecast_changes_after_notification_do_not_renotify(
+async def test_forecast_staying_up_after_a_notification_does_not_renotify(
     db_session: AsyncSession,
     make_field: MakeField,
     make_alert: MakeAlert,
     make_forecast: MakeForecast,
 ) -> None:
-    """D1: una vez por (alerta, día), aunque la probabilidad baje y vuelva a subir."""
+    """D1: mientras el día sigue arriba (`armed = false`) una nueva corrida no re-avisa."""
     field = await make_field()
-    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
     forecast = await make_forecast(
         field, forecast_date=TODAY, event_type=EventType.FROST, probability=80
     )
 
     assert await _evaluate(db_session) == 1
 
-    forecast.probability = 10  # el pronóstico baja
-    await db_session.flush()
-    assert await _evaluate(db_session) == 0
-
-    forecast.probability = 95  # y vuelve a subir (upsert de la ingesta)
+    forecast.probability = 95  # el pronóstico sube (upsert de la ingesta)
     await db_session.flush()
     assert await _evaluate(db_session) == 0
 
@@ -356,6 +393,206 @@ async def test_forecast_changes_after_notification_do_not_renotify(
     # El snapshot conserva lo que disparó la alerta, no el pronóstico vigente.
     assert notification.probability == 80
     assert notification.threshold == 70
+    assert notification.episode == 1
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+
+async def test_crossing_down_and_back_up_creates_the_next_episode(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """D1: arriba (ep. 1) -> debajo de `rearm_level` -> arriba crea el episodio 2."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=80
+    )
+
+    assert await _evaluate(db_session) == 1
+
+    forecast.probability = 59  # < 70 - 10: re-arma
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=True)
+
+    forecast.probability = 75  # vuelve a cruzar el umbral
+    await db_session.flush()
+    assert await _evaluate(db_session) == 1
+
+    notifications = await _notifications(db_session, alert_id=alert.id)
+    assert [(n.forecast_date, n.episode, n.probability) for n in notifications] == [
+        (TODAY, 1, 80),
+        (TODAY, 2, 75),
+    ]
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=2, armed=False)
+
+    # Re-ejecutar el ciclo no duplica el episodio 2.
+    assert await _evaluate(db_session) == 0
+    assert len(await _notifications(db_session, alert_id=alert.id)) == 2
+
+
+async def test_probability_inside_the_hysteresis_band_does_not_renotify(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Con umbral 70 y margen 10, oscilar entre 60 y 69 no re-arma ni dispara."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=80
+    )
+    assert await _evaluate(db_session) == 1
+
+    for probability in (69, 60, 65, 69, 60):
+        forecast.probability = probability
+        await db_session.flush()
+        assert await _evaluate(db_session) == 0
+        assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+    forecast.probability = 70
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert len(await _notifications(db_session, alert_id=alert.id)) == 1
+
+
+async def test_the_rearm_level_scales_with_the_configured_margin(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """`rearm_margin=0`: bajar a `threshold - 1` ya re-arma (no hay banda)."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=80
+    )
+    assert await _evaluate(db_session, rearm_margin=0) == 1
+
+    forecast.probability = 69
+    await db_session.flush()
+    assert await _evaluate(db_session, rearm_margin=0) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=True)
+
+    forecast.probability = 70
+    await db_session.flush()
+    assert await _evaluate(db_session, rearm_margin=0) == 1
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=2, armed=False)
+
+
+async def test_the_rearm_level_never_goes_below_one(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Umbral 5 y margen 99: `rearm_level` es 1, así que 0 re-arma y 1 dispara."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=5)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=5
+    )
+    assert await _evaluate(db_session, rearm_margin=99) == 1
+
+    forecast.probability = 1  # 1 >= rearm_level (1): sigue desarmado
+    await db_session.flush()
+    assert await _evaluate(db_session, rearm_margin=99) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+    forecast.probability = 0  # 0 < 1: re-arma
+    await db_session.flush()
+    assert await _evaluate(db_session, rearm_margin=99) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=True)
+
+
+async def test_a_stale_forecast_does_not_rearm_a_fired_day(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Regla 7 + D1: un pronóstico viejo no está en los candidatos, así que no re-arma."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=NOW,
+    )
+    assert await _evaluate(db_session) == 1
+
+    forecast.probability = 0
+    forecast.issued_at = NOW - timedelta(hours=MAX_AGE_HOURS + 1)
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+    # Cuando la ingesta vuelve a traer un pronóstico fresco y bajo, sí re-arma.
+    forecast.probability = 30
+    forecast.issued_at = NOW
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=True)
+
+
+async def test_an_inactive_alert_does_not_rearm_its_days(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Mientras la alerta está pausada el evaluador no la mira: el estado no cambia."""
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=90
+    )
+    assert await _evaluate(db_session) == 1
+
+    alert.is_active = False
+    forecast.probability = 0
+    await db_session.flush()
+    assert await _evaluate(db_session) == 0
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+
+
+async def test_the_log_reports_created_and_rearmed_counts(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Log exacto `alerts_evaluated created=<n> rearmed=<m>` (JOBS.md §Evaluador)."""
+    caplog.set_level(logging.INFO, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_alert(field, event_type=EventType.RAIN, threshold=70)
+    frost = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=90
+    )
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.RAIN, probability=90)
+
+    assert await _evaluate(db_session) == 2
+    assert any(
+        record.getMessage().startswith("alerts_evaluated created=2 rearmed=0")
+        for record in caplog.records
+    )
+
+    frost.probability = 0
+    await db_session.flush()
+    caplog.clear()
+    assert await _evaluate(db_session) == 0
+    assert any(
+        record.getMessage().startswith("alerts_evaluated created=0 rearmed=1")
+        for record in caplog.records
+    )
 
 
 async def test_multiple_alerts_and_days_are_counted_exactly(
@@ -692,17 +929,17 @@ async def test_several_thresholds_for_the_same_field_and_event_only_fire_the_cro
     assert await _evaluate(db_session) == 0
 
 
-async def test_reactivation_after_a_cancelled_pending_does_not_recreate_the_day(
+async def test_reactivating_by_direct_write_does_not_reset_the_day_state(
     db_session: AsyncSession,
     make_field: MakeField,
     make_alert: MakeAlert,
     make_forecast: MakeForecast,
 ) -> None:
-    """Comportamiento observado (posible deuda de producto, QA-1).
+    """El evaluador solo sigue `alert_day_states`: el re-armado por PATCH lo hace el service.
 
-    Al pausar la alerta, el dispatcher cancela la notificación pendiente; al reactivarla, el
-    dedupe `UNIQUE (alert_id, forecast_date)` la deja cancelada y el evaluador NO crea un
-    reemplazo para ese día. El día queda sin aviso aunque la alerta vuelva a estar activa.
+    Escribir `is_active` directo (sin pasar por `update_alert`) no re-arma el día, así que
+    un día ya avisado y desarmado sigue sin re-avisarse aunque la alerta vuelva a estar
+    activa. El camino real (PATCH) sí re-arma y se prueba en `tests/api/test_alerts.py`.
     """
     field = await make_field()
     alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
@@ -725,6 +962,7 @@ async def test_reactivation_after_a_cancelled_pending_does_not_recreate_the_day(
     assert still_cancelled.id == notification.id
     assert still_cancelled.status == NotificationStatus.CANCELLED
     assert still_cancelled.last_error == "alert_inactive"
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
 
 
 async def test_soft_deleted_alert_keeps_its_history_and_a_new_alert_notifies_again(
@@ -803,7 +1041,7 @@ async def test_thirty_days_five_events_multiple_alerts_counted_exactly(
 async def _evaluate_and_commit(
     session_factory: async_sessionmaker[AsyncSession], *, now: datetime
 ) -> int:
-    """Corre el evaluador en su propia conexión y commitea (libera locks del INSERT)."""
+    """Corre el evaluador en su propia conexión y commitea (libera locks de la transacción)."""
     async with session_factory() as session:
         created = await evaluate_alerts(
             session,
@@ -811,6 +1049,7 @@ async def _evaluate_and_commit(
             horizon_days=0,
             max_forecast_age_hours=MAX_AGE_HOURS,
             future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+            rearm_margin=REARM_MARGIN,
         )
         await session.commit()
         return created
@@ -886,6 +1125,203 @@ async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
             async with engine.begin() as conn:
                 await conn.execute(delete(User).where(User.id == user_id))
         await engine.dispose()
+
+
+async def test_two_concurrent_evaluations_do_not_duplicate_episodes() -> None:
+    """Dos conexiones separadas sobre los mismos datos: un episodio, una notificación.
+
+    Sin `pg_advisory_xact_lock` cada réplica podría re-armar y disparar el mismo día con su
+    propio snapshot (episodio duplicado). El lock serializa la evaluación; la red de
+    seguridad `UNIQUE (alert_id, forecast_date, episode)` quedaría como segunda barrera.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    suffix = uuid.uuid4().hex
+    user_id: int | None = None
+    try:
+        async with session_factory() as setup:
+            user = User(
+                phone_number=f"+54911{uuid.uuid4().int % 10**8:08d}",
+                name=f"Episodes concurrent {suffix}",
+            )
+            setup.add(user)
+            await setup.flush()
+            field = Field(
+                user_id=user.id,
+                name=f"Episodes concurrent field {suffix}",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            setup.add(field)
+            await setup.flush()
+            alert = Alert(
+                field_id=field.id, event_type=EventType.FROST, threshold=50, is_active=True
+            )
+            setup.add(alert)
+            await setup.flush()
+            setup.add(
+                WeatherForecast(
+                    field_id=field.id,
+                    forecast_date=TODAY,
+                    event_type=EventType.FROST,
+                    probability=90,
+                    source="mock",
+                    issued_at=FIXED_AT,
+                    fetched_at=FIXED_AT,
+                )
+            )
+            alert_id = alert.id
+            await setup.commit()
+            user_id = user.id
+
+        first, second = await asyncio.gather(
+            _evaluate_and_commit(session_factory, now=NOW),
+            _evaluate_and_commit(session_factory, now=NOW),
+        )
+
+        assert first + second == 1
+        async with session_factory() as check:
+            notifications = (
+                await check.execute(
+                    select(Notification.forecast_date, Notification.episode).where(
+                        Notification.alert_id == alert_id
+                    )
+                )
+            ).all()
+            states = (
+                await check.execute(
+                    select(
+                        AlertDayState.forecast_date,
+                        AlertDayState.episode,
+                        AlertDayState.armed,
+                    ).where(AlertDayState.alert_id == alert_id)
+                )
+            ).all()
+        assert [tuple(row) for row in notifications] == [(TODAY, 1)]
+        assert [tuple(row) for row in states] == [(TODAY, 1, False)]
+    finally:
+        if user_id is not None:
+            async with engine.begin() as conn:
+                await conn.execute(delete(User).where(User.id == user_id))
+        await engine.dispose()
+
+
+async def test_the_evaluation_takes_the_advisory_lock(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Con la transacción del evaluador abierta, otra conexión no puede tomar el lock."""
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=90)
+
+    assert await _evaluate(db_session) == 1
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as conn:
+            free = (
+                await conn.execute(
+                    text("SELECT pg_try_advisory_xact_lock(:key)"),
+                    {"key": EVALUATOR_LOCK_KEY},
+                )
+            ).scalar_one()
+        assert free is False
+    finally:
+        await engine.dispose()
+
+
+# --- Equivalencia SQL vs. la función pura de episodios ---------------------
+
+#: Semilla fija: la secuencia es determinística y se puede reproducir.
+EQUIVALENCE_SEED = 20261117
+EQUIVALENCE_CYCLES = 40
+#: Umbrales que puede elegir el PATCH simulado (incluye el mismo: no re-arma).
+THRESHOLD_CHOICES = (50, 60, 70, 80, 90)
+
+
+async def test_sql_evaluator_matches_the_pure_step_and_reset_functions(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Secuencia determinística (semilla fija) con PATCH de umbral y pausa/reactivación.
+
+    Cada ciclo se corre dos veces: el evaluador SQL (con `app/services/alerts.update_alert`
+    para los PATCH, que es quien re-arma) y la función pura `step`/`reset`. Deben coincidir
+    en notificaciones (día, episodio) y en el estado final del día.
+    """
+    rng = random.Random(EQUIVALENCE_SEED)
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field, forecast_date=TODAY, event_type=EventType.FROST, probability=50
+    )
+
+    threshold = 70
+    active = True
+    probability = 50
+    state = INITIAL_STATE
+    expected: list[tuple[date, int]] = []
+    threshold_changes = 0
+    reactivations = 0
+
+    for cycle in range(EQUIVALENCE_CYCLES):
+        roll = rng.random()
+        if roll < 0.15:
+            new_threshold = rng.choice(THRESHOLD_CHOICES)
+            if new_threshold != threshold:
+                threshold = new_threshold
+                threshold_changes += 1
+                state = reset(state)
+                await update_alert(
+                    db_session, field.user_id, alert.id, AlertUpdate(threshold=threshold)
+                )
+        elif roll < 0.25:
+            active = not active
+            if active:  # reactivación: re-armado
+                reactivations += 1
+                state = reset(state)
+            await update_alert(db_session, field.user_id, alert.id, AlertUpdate(is_active=active))
+
+        probability = min(
+            100,
+            max(
+                0,
+                probability
+                + rng.choice((-40, -25, -15, -10, -5, 0, 5, 10, 15, 25, 40))
+                + rng.randint(-5, 5),
+            ),
+        )
+        forecast.probability = probability
+        await db_session.flush()
+
+        notifies = False
+        if active:
+            state, notifies = step(
+                state,
+                probability=probability,
+                threshold=threshold,
+                rearm_margin=REARM_MARGIN,
+            )
+        if notifies:
+            expected.append((TODAY, state.episode))
+
+        created = await _evaluate(db_session)
+        assert created == int(notifies), (
+            f"cycle={cycle} probability={probability} threshold={threshold} "
+            f"active={active} expected_notify={notifies} created={created}"
+        )
+
+    notifications = await _notifications(db_session, alert_id=alert.id)
+    assert [(n.forecast_date, n.episode) for n in notifications] == expected
+    assert await _day_state(db_session, alert.id, TODAY) == state
+    # La secuencia debe haber ejercitado lo que este test dice cubrir.
+    assert expected, "la secuencia no generó ninguna notificación"
+    assert threshold_changes and reactivations
 
 
 # --- Frescura de los pronósticos (S11, D14) -------------------------------

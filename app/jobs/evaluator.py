@@ -1,11 +1,18 @@
 """Evaluación de alertas vs. pronósticos almacenados.
 
-Spec: docs/JOBS.md §Evaluador. Una sola sentencia set-based: inserta en `notifications` las
-combinaciones (alerta, día) cuyo pronóstico alcanza el umbral, con
-`ON CONFLICT (alert_id, forecast_date) DO NOTHING`, así que re-ejecutar (o correr N workers)
-nunca duplica. El insert va envuelto en un CTE y el conteo se hace en SQL (`SELECT count(*)`),
-así no se materializan en Python las filas del `RETURNING`. Es el paso "evaluar" del ciclo del
-worker; no commitea.
+Spec: docs/JOBS.md §Evaluador y §Episodios. Todo set-based: los candidatos (alerta por
+pronóstico en la ventana) se calculan una vez como CTE y sobre ellos se aplican el
+re-armado y el disparo, contando siempre en SQL (`SELECT count(*)`), nunca trayendo filas a
+Python. No commitea: el llamador es dueño de la transacción.
+
+Desde S12b (D1) la evaluación es **por episodio**: `alert_day_states` guarda, por
+(alerta, día), el último episodio disparado y si el día está armado. Un día armado que
+llega al umbral dispara el episodio siguiente; un día disparado se re-arma cuando la
+probabilidad baja de `max(threshold - REARM_MARGIN, 1)`; entre esos dos valores está la
+banda de histéresis. `UNIQUE (alert_id, forecast_date, episode)` es la red de seguridad de
+idempotencia. Antes de evaluar se toma `pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)`: una
+sola réplica evalúa por vez, así dos snapshots distintos no re-arman y disparan el mismo
+día (episodio duplicado).
 
 Desde S12a (D9) el "hoy" es **local de cada campo**: `(:now AT TIME ZONE fields.timezone)::date`,
 con `now` un `TIMESTAMPTZ` en UTC. Se evalúa `[hoy_local, hoy_local + horizon_days)`; el
@@ -36,30 +43,45 @@ import logging
 from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import (
+    Boolean,
     ColumnElement,
     Date,
     DateTime,
     Integer,
     Select,
+    and_,
     case,
     func,
     literal,
     or_,
     select,
+    update,
 )
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql import ColumnExpressionArgument
+from sqlalchemy.sql.selectable import CTE
 
-from app.models import Alert, Field, Notification, NotificationStatus, WeatherForecast
+from app.models import (
+    Alert,
+    AlertDayState,
+    Field,
+    Notification,
+    NotificationStatus,
+    WeatherForecast,
+)
 from app.services.timezones import PG_TIMEZONE_NAMES
 
 logger = logging.getLogger(__name__)
 
-#: Columnas del INSERT ... SELECT, en el mismo orden que el `select` de abajo.
+#: Clave del lock de evaluación (`pg_advisory_xact_lock`): una réplica evalúa por vez.
+EVALUATOR_LOCK_KEY: int = 202611170008
+
+#: Columnas del INSERT ... SELECT de notificaciones, en el mismo orden que el `select`.
 _INSERT_COLUMNS = (
     "alert_id",
     "forecast_date",
+    "episode",
     "event_type",
     "probability",
     "threshold",
@@ -141,11 +163,15 @@ def _known_timezone() -> ColumnElement[bool]:
     return Field.timezone.in_(select(PG_TIMEZONE_NAMES.c.name))
 
 
-def _alert_conditions(*, now: datetime, horizon_days: int) -> list[ColumnExpressionArgument[bool]]:
-    """Predicados comunes al INSERT y a los warnings.
+def _candidate_conditions(
+    *, now: datetime, horizon_days: int
+) -> list[ColumnExpressionArgument[bool]]:
+    """Predicados de los candidatos (alerta por pronóstico), sin mirar la probabilidad.
 
     Alertas activas y no borradas (el predicado del índice parcial, S9), zona conocida por
-    Postgres, prefiltro constante de fechas (CR-2), ventana local exacta (D9/D2) y umbral.
+    Postgres, prefiltro constante de fechas (CR-2) y ventana local exacta (D9/D2). La
+    comparación contra el umbral la agrega cada paso: el re-armado usa `probability <
+    rearm_level` y el disparo `probability >= threshold`.
     """
     today, in_horizon = _started_window(now, horizon_days)
     conditions: list[ColumnExpressionArgument[bool]] = [
@@ -156,30 +182,42 @@ def _alert_conditions(*, now: datetime, horizon_days: int) -> list[ColumnExpress
         WeatherForecast.forecast_date >= _date_floor(now),
         WeatherForecast.forecast_date >= today,
         in_horizon,
-        WeatherForecast.probability >= Alert.threshold,
     ]
     if horizon_days > 0:
         conditions.append(WeatherForecast.forecast_date <= _date_ceiling(now, horizon_days))
     return conditions
 
 
-def _build_statement(
+def _alert_conditions(*, now: datetime, horizon_days: int) -> list[ColumnExpressionArgument[bool]]:
+    """Predicados comunes a los candidatos y a los warnings (`probability >= threshold`).
+
+    Los warnings de S11/S12a cuentan pronósticos que *habrían disparado* alguna alerta activa.
+    """
+    return [
+        *_candidate_conditions(now=now, horizon_days=horizon_days),
+        WeatherForecast.probability >= Alert.threshold,
+    ]
+
+
+def _build_candidates(
     *,
     now: datetime,
     horizon_days: int,
     max_forecast_age_hours: int,
     future_tolerance_minutes: int,
-) -> Select[tuple[int]]:
-    """Arma el `WITH ins AS (INSERT ...) SELECT count(*) FROM ins` de una corrida."""
-    matching = (
+) -> CTE:
+    """CTE `candidatos`: (alerta, día) de la ventana con su pronóstico vigente y el umbral.
+
+    Mismas condiciones que el evaluador previo a S12b salvo `probability >= threshold`: el
+    re-armado necesita ver también los días que bajaron del umbral.
+    """
+    return (
         select(
-            Alert.id,
-            WeatherForecast.forecast_date,
-            WeatherForecast.event_type,
-            WeatherForecast.probability,
-            Alert.threshold,
-            literal(NotificationStatus.PENDING.value),
-            func.now(),
+            Alert.id.label("alert_id"),
+            WeatherForecast.forecast_date.label("forecast_date"),
+            WeatherForecast.event_type.label("event_type"),
+            WeatherForecast.probability.label("probability"),
+            Alert.threshold.label("threshold"),
         )
         .select_from(Alert)
         .join(Field, Field.id == Alert.field_id)
@@ -189,7 +227,7 @@ def _build_statement(
             & (WeatherForecast.event_type == Alert.event_type),
         )
         .where(
-            *_alert_conditions(now=now, horizon_days=horizon_days),
+            *_candidate_conditions(now=now, horizon_days=horizon_days),
             # Frescura (S11, D14): borde incluido, `== cutoff` se evalúa.
             WeatherForecast.issued_at
             >= _freshness_cutoff(now=now, max_forecast_age_hours=max_forecast_age_hours),
@@ -197,11 +235,122 @@ def _build_statement(
             WeatherForecast.issued_at
             <= _future_limit(now=now, future_tolerance_minutes=future_tolerance_minutes),
         )
+        .cte("candidatos")
+    )
+
+
+def _rearm_level(threshold: ColumnElement[int], rearm_margin: int) -> ColumnElement[int]:
+    """`GREATEST(threshold - :rearm_margin, 1)` en SQL (docs/JOBS.md §Episodios)."""
+    return func.greatest(threshold - literal(rearm_margin, Integer), literal(1, Integer))
+
+
+def _build_rearm_statement(
+    *,
+    now: datetime,
+    horizon_days: int,
+    max_forecast_age_hours: int,
+    future_tolerance_minutes: int,
+    rearm_margin: int,
+) -> Select[tuple[int]]:
+    """Re-arma los días disparados cuya probabilidad bajó de `rearm_level`.
+
+    `UPDATE ... RETURNING` envuelto en un CTE: el conteo lo hace Postgres, sin traer filas.
+    """
+    candidates = _build_candidates(
+        now=now,
+        horizon_days=horizon_days,
+        max_forecast_age_hours=max_forecast_age_hours,
+        future_tolerance_minutes=future_tolerance_minutes,
+    )
+    rearmed = (
+        update(AlertDayState)
+        .where(
+            AlertDayState.alert_id == candidates.c.alert_id,
+            AlertDayState.forecast_date == candidates.c.forecast_date,
+            AlertDayState.armed.is_(False),
+            candidates.c.probability < _rearm_level(candidates.c.threshold, rearm_margin),
+        )
+        .values(armed=True, updated_at=func.now())
+        .returning(AlertDayState.id)
+        .cte("rearmed")
+    )
+    return select(func.count()).select_from(rearmed)
+
+
+def _build_statement(
+    *,
+    now: datetime,
+    horizon_days: int,
+    max_forecast_age_hours: int,
+    future_tolerance_minutes: int,
+) -> Select[tuple[int]]:
+    """Dispara los episodios y crea sus notificaciones; cuenta en SQL.
+
+    `WITH fired AS (INSERT INTO alert_day_states ... ON CONFLICT ... DO UPDATE
+    WHERE alert_day_states.armed RETURNING ...), ins AS (INSERT INTO notifications ...
+    ON CONFLICT (alert_id, forecast_date, episode) DO NOTHING RETURNING 1)
+    SELECT count(*) FROM ins`.
+    """
+    candidates = _build_candidates(
+        now=now,
+        horizon_days=horizon_days,
+        max_forecast_age_hours=max_forecast_age_hours,
+        future_tolerance_minutes=future_tolerance_minutes,
+    )
+    fired = (
+        pg_insert(AlertDayState)
+        .from_select(
+            ["alert_id", "forecast_date", "episode", "armed"],
+            select(
+                candidates.c.alert_id,
+                candidates.c.forecast_date,
+                literal(1, Integer),
+                literal(False, Boolean),
+            ).where(candidates.c.probability >= candidates.c.threshold),
+            include_defaults=False,
+        )
+        .on_conflict_do_update(
+            index_elements=["alert_id", "forecast_date"],
+            set_={
+                "episode": AlertDayState.episode + 1,
+                "armed": False,
+                "updated_at": func.now(),
+            },
+            # Un día que sigue arriba (`armed = false`) no vuelve a disparar.
+            where=and_(AlertDayState.armed),
+        )
+        .returning(
+            AlertDayState.alert_id,
+            AlertDayState.forecast_date,
+            AlertDayState.episode,
+        )
+        .cte("fired")
     )
     inserted = (
         pg_insert(Notification)
-        .from_select(_INSERT_COLUMNS, matching, include_defaults=False)
-        .on_conflict_do_nothing(index_elements=["alert_id", "forecast_date"])
+        .from_select(
+            _INSERT_COLUMNS,
+            select(
+                fired.c.alert_id,
+                fired.c.forecast_date,
+                fired.c.episode,
+                candidates.c.event_type,
+                candidates.c.probability,
+                candidates.c.threshold,
+                literal(NotificationStatus.PENDING.value),
+                func.now(),
+            ).select_from(
+                fired.join(
+                    candidates,
+                    and_(
+                        fired.c.alert_id == candidates.c.alert_id,
+                        fired.c.forecast_date == candidates.c.forecast_date,
+                    ),
+                )
+            ),
+            include_defaults=False,
+        )
+        .on_conflict_do_nothing(index_elements=["alert_id", "forecast_date", "episode"])
         .returning(Notification.id)
         .cte("ins")
     )
@@ -267,6 +416,7 @@ async def evaluate_alerts(
     horizon_days: int,
     max_forecast_age_hours: int,
     future_tolerance_minutes: int,
+    rearm_margin: int,
 ) -> int:
     """Crea las notificaciones pendientes que disparan las alertas activas.
 
@@ -277,11 +427,16 @@ async def evaluate_alerts(
     Los campos cuya zona no existe en `pg_timezone_names` se saltean (una zona desconocida
     rompería `AT TIME ZONE` para todos) y se countan en `invalid_timezone_fields` (S12a SEC-1).
 
-    Matchea por campo y tipo de evento, probabilidad `>= threshold` y pronósticos emitidos
-    dentro de la ventana de frescura (`issued_at >= now - max_forecast_age_hours`, borde
-    incluido). Un `issued_at` posterior a `now + future_tolerance_minutes` tampoco se evalúa
-    (S11 SEC-1). Una notificación por (alerta, día): el `ON CONFLICT DO NOTHING` hace la
-    operación idempotente (D1).
+    Por episodio (D1, S12b): un día armado con `probability >= threshold` dispara el
+    episodio `episode + 1`; un día disparado se re-arma cuando la probabilidad baja de
+    `max(threshold - rearm_margin, 1)`; en la banda de histéresis no cambia nada. Todo en la
+    misma transacción del llamador, bajo `pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)` para
+    que dos réplicas no generen episodios duplicados. `UNIQUE (alert_id, forecast_date,
+    episode)` es la red de seguridad de idempotencia.
+
+    Matchea por campo y tipo de evento y solo pronósticos dentro de la ventana de frescura
+    (`issued_at >= now - max_forecast_age_hours`, borde incluido). Un `issued_at` posterior a
+    `now + future_tolerance_minutes` tampoco se evalúa (S11 SEC-1).
 
     Si hay pronósticos de la ventana descartados por viejos o por adelantados, loguea
     `stale_forecasts count=<n> fields=<m> max_age_hours=<h>` (S11, D14) y
@@ -292,6 +447,21 @@ async def evaluate_alerts(
     notificaciones nuevas, contada por Postgres dentro de la misma sentencia (sin
     materializar el `RETURNING` en Python).
     """
+    # Una sola réplica evalúa por vez: la otra espera y su snapshot ve lo ya commiteado.
+    await session.execute(select(func.pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)))
+
+    rearmed: int = (
+        await session.execute(
+            _build_rearm_statement(
+                now=now,
+                horizon_days=horizon_days,
+                max_forecast_age_hours=max_forecast_age_hours,
+                future_tolerance_minutes=future_tolerance_minutes,
+                rearm_margin=rearm_margin,
+            )
+        )
+    ).scalar_one()
+
     created: int = (
         await session.execute(
             _build_statement(
@@ -302,7 +472,13 @@ async def evaluate_alerts(
             )
         )
     ).scalar_one()
-    logger.info("alerts_evaluated created=%d now=%s horizon_days=%d", created, now, horizon_days)
+    logger.info(
+        "alerts_evaluated created=%d rearmed=%d now=%s horizon_days=%d",
+        created,
+        rearmed,
+        now,
+        horizon_days,
+    )
 
     stale_count, stale_fields, future_count, future_fields = (
         await session.execute(

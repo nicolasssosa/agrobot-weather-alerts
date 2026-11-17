@@ -8,7 +8,7 @@ from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Alert, Field, Notification, User, WeatherForecast
+from app.models import Alert, AlertDayState, Field, Notification, User, WeatherForecast
 from app.models.enums import EventType, NotificationStatus
 from tests.conftest import MakeAlert, MakeField, MakeForecast, MakeUser, auth
 
@@ -21,6 +21,7 @@ async def _make_notification(
     *,
     forecast_date: date = DAY,
     probability: int = 80,
+    episode: int = 1,
 ) -> Notification:
     notification = Notification(
         alert_id=alert.id,
@@ -28,6 +29,7 @@ async def _make_notification(
         event_type=alert.event_type,
         probability=probability,
         threshold=alert.threshold,
+        episode=episode,
     )
     session.add(notification)
     await session.flush()
@@ -132,16 +134,95 @@ async def test_threshold_out_of_range_is_rejected(
             await make_alert(field, threshold=0)
 
 
-async def test_duplicate_notification_for_same_alert_and_day_is_rejected(
+async def test_duplicate_notification_for_same_alert_day_and_episode_is_rejected(
     db_session: AsyncSession,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
+    """S12b: la clave de dedupe es (alert_id, forecast_date, episode)."""
     alert = await make_alert(await make_field())
     await _make_notification(db_session, alert)
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
             await _make_notification(db_session, alert)
+
+
+async def test_a_second_episode_for_the_same_alert_and_day_is_allowed(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """Un día re-avisado guarda una notificación por episodio (D1)."""
+    alert = await make_alert(await make_field())
+    first = await _make_notification(db_session, alert, episode=1)
+    second = await _make_notification(db_session, alert, episode=2)
+
+    assert first.id != second.id
+
+
+@pytest.mark.parametrize("episode", [0, -1])
+async def test_notification_episode_below_one_is_rejected(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    episode: int,
+) -> None:
+    alert = await make_alert(await make_field())
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            await _make_notification(db_session, alert, episode=episode)
+
+
+async def test_alert_day_state_episode_below_one_is_rejected(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """`alert_day_states.episode >= 1`: sin fila es episodio 0, nunca una fila con 0."""
+    alert = await make_alert(await make_field())
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            db_session.add(
+                AlertDayState(alert_id=alert.id, forecast_date=DAY, episode=0, armed=True)
+            )
+            await db_session.flush()
+
+
+async def test_duplicate_alert_day_state_is_rejected(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """`UNIQUE (alert_id, forecast_date)`: un solo estado por (alerta, día)."""
+    alert = await make_alert(await make_field())
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=DAY, episode=1, armed=False))
+    await db_session.flush()
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            db_session.add(
+                AlertDayState(alert_id=alert.id, forecast_date=DAY, episode=2, armed=True)
+            )
+            await db_session.flush()
+
+
+async def test_deleting_an_alert_cascades_to_its_day_states(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST)
+    kept = await make_alert(field, event_type=EventType.RAIN)
+    db_session.add(AlertDayState(alert_id=alert.id, forecast_date=DAY, episode=1, armed=False))
+    await db_session.flush()
+
+    await db_session.execute(delete(Alert).where(Alert.id == alert.id))
+
+    states = (
+        await db_session.execute(select(AlertDayState.alert_id, AlertDayState.forecast_date))
+    ).all()
+    assert states == []
+    assert (await db_session.execute(select(Alert.id).where(Alert.id == kept.id))).scalar_one()
 
 
 async def test_deleting_field_cascades_to_forecasts_alerts_and_notifications(
@@ -201,6 +282,7 @@ async def test_notification_defaults(
     assert notification.next_attempt_at is not None
     assert notification.sent_at is None
     assert notification.last_error is None
+    assert notification.episode == 1
 
 
 async def test_threshold_above_100_is_rejected(
@@ -526,7 +608,7 @@ async def test_notification_defaults_are_applied_by_database(
     row = (
         await db_session.execute(
             text(
-                "SELECT status, attempts, next_attempt_at, last_error, sent_at"
+                "SELECT status, attempts, next_attempt_at, last_error, sent_at, episode"
                 " FROM notifications WHERE id = :notification_id"
             ),
             {"notification_id": notification_id},
@@ -537,6 +619,7 @@ async def test_notification_defaults_are_applied_by_database(
     assert row.next_attempt_at is not None
     assert row.last_error is None
     assert row.sent_at is None
+    assert row.episode == 1
 
 
 async def test_auth_helper_builds_the_user_header(make_user: MakeUser) -> None:

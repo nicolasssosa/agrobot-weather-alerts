@@ -22,6 +22,7 @@ class NotificationRead(BaseModel):
                     "id": 10,
                     "alert_id": 1,
                     "forecast_date": "2026-11-18",
+                    "episode": 1,
                     "event_type": "frost",
                     "probability": 85,
                     "threshold": 70,
@@ -37,6 +38,8 @@ class NotificationRead(BaseModel):
     id: int
     alert_id: int
     forecast_date: date
+    #: Número de aviso de esa alerta para ese día (S12b, D1): 1 = primer cruce del umbral.
+    episode: int
     event_type: EventType
     probability: int
     threshold: int

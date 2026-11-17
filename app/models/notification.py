@@ -14,6 +14,7 @@ from sqlalchemy import (
     ForeignKey,
     Identity,
     Index,
+    Integer,
     SmallInteger,
     Text,
     UniqueConstraint,
@@ -35,9 +36,10 @@ class Notification(Base, TimestampMixin):
 
     __tablename__ = "notifications"
     __table_args__ = (
-        UniqueConstraint("alert_id", "forecast_date"),
+        UniqueConstraint("alert_id", "forecast_date", "episode"),
         CheckConstraint("probability BETWEEN 0 AND 100", name="probability_range"),
         CheckConstraint("threshold BETWEEN 1 AND 100", name="threshold_range"),
+        CheckConstraint("episode >= 1", name="episode_positive"),
         CheckConstraint("attempts >= 0", name="attempts_non_negative"),
         CheckConstraint(
             "last_error IS NULL OR char_length(last_error) <= 1000",
@@ -70,6 +72,10 @@ class Notification(Base, TimestampMixin):
     )
     probability: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     threshold: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    #: Número de episodio del (alerta, día) que la generó (S12b, D1): 1 = primer cruce.
+    episode: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
     status: Mapped[NotificationStatus] = mapped_column(
         SAEnum(
             NotificationStatus,

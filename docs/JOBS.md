@@ -89,15 +89,23 @@ re-arma ni dispara. Con umbral 70 y margen 10: dispara en ≥ 70, re-arma en < 6
 ```python
 @dataclass(frozen=True, slots=True)
 class DayState:
-    episode: int   # 0 = nunca disparó
+    episode: int  # 0 = nunca disparó
     armed: bool
+
 
 INITIAL_STATE = DayState(episode=0, armed=True)
 
+
 def rearm_level(threshold: int, rearm_margin: int) -> int: ...
-def step(state: DayState, *, probability: int, threshold: int, rearm_margin: int) -> tuple[DayState, bool]: ...
+def step(
+    state: DayState, *, probability: int, threshold: int, rearm_margin: int
+) -> tuple[DayState, bool]:
+    ...
     # (nuevo estado, ¿notifica?) según la tabla de arriba
-def reset(state: DayState) -> DayState: ...
+
+
+def reset(state: DayState) -> DayState:
+    ...
     # re-armado por cambio de umbral o reactivación: DayState(state.episode, armed=True)
 ```
 

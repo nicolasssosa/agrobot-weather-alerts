@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     # Horizonte de evaluación en días desde el "hoy" local de cada campo (D2, S12a): 0 = sin límite.
     alert_horizon_days: int = Field(default=7, ge=0, le=365)
 
+    # Margen de histéresis del re-aviso por episodio (D1, S12b): un día disparado se re-arma
+    # cuando la probabilidad baja de `max(threshold - rearm_margin, 1)`.
+    rearm_margin: int = Field(default=10, ge=0, le=99)
+
     # Tolerancia de reloj para un `issued_at` en el futuro (docs/JOBS.md §Ingesta mock, D14).
     forecast_future_tolerance_minutes: int = Field(default=60, ge=0, le=1440)
 

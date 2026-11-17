@@ -88,6 +88,7 @@ async def run_cycle(
             horizon_days=settings.alert_horizon_days,
             max_forecast_age_hours=settings.max_forecast_age_hours,
             future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
+            rearm_margin=settings.rearm_margin,
         )
         await session.commit()
 
