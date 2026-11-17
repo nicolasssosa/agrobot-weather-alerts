@@ -84,6 +84,10 @@ Análogamente:
 - otro `event_type` u otro campo → no crea.
 - correr dos veces → segunda vez devuelve 0 y hay una sola fila.
 - varias alertas/días → cuenta correcta.
+- episodios (S12b): arriba → abajo de `rearm_level` → arriba crea el episodio 2; quedarse arriba no
+  repite; bajar dentro de la banda de histéresis y volver no repite; pronóstico viejo no re-arma.
+- equivalencia SQL vs. `app/jobs/episodes.step` en secuencias generadas con semilla fija
+  (`random.Random(<n>)`, sin dependencias nuevas).
 
 ### `tests/jobs/test_dispatcher.py`
 - pendiente → `sent`, `sent_at` seteado, `attempts == 1`, el FakeNotifier recibió el texto exacto y

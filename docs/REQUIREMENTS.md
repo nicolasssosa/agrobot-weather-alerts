@@ -40,7 +40,7 @@ una notificación cuando los pronósticos almacenados superen ese umbral.
 | RF-05 | Un background job evalúa **periódicamente** los pronósticos almacenados contra las alertas activas. | enunciado |
 | RF-06 | Una alerta se dispara cuando `probabilidad >= umbral` para el mismo campo y evento, en **cualquier día desde hoy en adelante**. | enunciado ("a partir del cual"); sin horizonte (decisión §6) |
 | RF-07 | Al dispararse, se notifica al usuario dueño del campo con un mensaje legible (evento, campo, fecha, probabilidad, umbral). | enunciado |
-| RF-08 | **Una sola notificación por alerta y día pronosticado**: ni re-ejecuciones del job ni cambios posteriores del pronóstico generan duplicados. | decisión §6 |
+| RF-08 | **Una notificación por alerta, día pronosticado y episodio** (D1): ni re-ejecuciones del job ni réplicas concurrentes generan duplicados; un pronóstico que se mantiene arriba del umbral no repite el aviso. | decisión §6 |
 | RF-09 | Las notificaciones fallidas se reintentan con backoff exponencial hasta un máximo; luego quedan como `failed`. | production-ready |
 | RF-10 | El usuario puede consultar su historial de notificaciones (filtrable por estado y alerta). | inferido: trazabilidad |
 | RF-11 | Un usuario no puede ver ni operar sobre recursos de otro (404). | production-ready |
@@ -63,7 +63,7 @@ una notificación cuando los pronósticos almacenados superen ese umbral.
 
 | # | Tema | Decisión | Alternativa descartada / futura |
 |---|------|----------|---------------------------------|
-| D1 | Re-notificación | **Por episodio** (S12b): se avisa cada vez que el pronóstico de una alerta y día **cruza el umbral hacia arriba**; mientras siga arriba no se repite. Margen anti-oscilación configurable (`REARM_MARGIN`). Cambiar el umbral re-evalúa la alerta desde cero. | Re-notificar solo si sube ≥ N puntos. |
+| D1 | Re-notificación | **Por episodio** (S12b): se avisa cada vez que el pronóstico de una alerta y día **cruza el umbral hacia arriba**; mientras siga arriba no se repite. Para volver a avisar, la probabilidad tiene que bajar por debajo de `umbral - REARM_MARGIN` (margen anti-oscilación, default 10 puntos; nivel mínimo 1). Cambiar el umbral o reactivar la alerta la re-evalúa desde cero. | Re-notificar solo si sube ≥ N puntos. |
 | D2 | Horizonte de evaluación | **Configurable** `ALERT_HORIZON_DAYS` (default 7; 0 = sin límite) (S12a): los pronósticos lejanos son poco confiables y generan ruido. | Horizonte por alerta. |
 | D3 | Granularidad de pronósticos | Por campo (`weather_forecasts.field_id`). | Tabla `locations` compartida entre campos cercanos. |
 | D4 | Umbral | Entero 1..100 (%); dispara con `>=`. | — |
