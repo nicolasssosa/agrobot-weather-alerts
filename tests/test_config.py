@@ -119,3 +119,68 @@ def test_digest_max_items_rejects_out_of_range_values(value: object) -> None:
 def test_digest_max_items_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DIGEST_MAX_ITEMS", "5")
     assert Settings().digest_max_items == 5
+
+
+# --- Límites operativos (S14a, D16) -----------------------------------------
+
+
+def test_db_timeouts_default_to_30s_and_5s() -> None:
+    """`DB_STATEMENT_TIMEOUT_MS` = 30000 y `DB_LOCK_TIMEOUT_MS` = 5000 (docs/BACKLOG.md §S14a)."""
+    settings = Settings()
+    assert settings.db_statement_timeout_ms == 30000
+    assert settings.db_lock_timeout_ms == 5000
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("db_statement_timeout_ms", 0), ("db_lock_timeout_ms", 0)],
+)
+def test_db_timeouts_accept_zero_as_no_limit(field: str, value: int) -> None:
+    """`0` = sin límite (valor de Postgres para ambos GUC)."""
+    assert getattr(Settings(**{field: value}), field) == value
+
+
+@pytest.mark.parametrize("field", ["db_statement_timeout_ms", "db_lock_timeout_ms"])
+@pytest.mark.parametrize("value", [-1, "abc", "1.5"])
+def test_db_timeouts_reject_negative_or_non_integer_values(field: str, value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{field: value})
+
+
+def test_db_timeouts_read_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DB_STATEMENT_TIMEOUT_MS", "1000")
+    monkeypatch.setenv("DB_LOCK_TIMEOUT_MS", "250")
+    settings = Settings()
+    assert (settings.db_statement_timeout_ms, settings.db_lock_timeout_ms) == (1000, 250)
+
+
+def test_max_fields_per_user_defaults_to_20() -> None:
+    """Cuota de campos por usuario (docs/API.md §fields, S14a)."""
+    assert Settings().max_fields_per_user == 20
+
+
+@pytest.mark.parametrize("value", [1, 20, 1000])
+def test_max_fields_per_user_accepts_the_documented_range(value: int) -> None:
+    assert Settings(max_fields_per_user=value).max_fields_per_user == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 1001, "abc", "20.5"])
+def test_max_fields_per_user_rejects_out_of_range_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(max_fields_per_user=value)  # type: ignore[arg-type]
+
+
+def test_max_request_body_bytes_defaults_to_64_kib() -> None:
+    """Tamaño máximo del body (docs/API.md §Convenciones, S14a)."""
+    assert Settings().max_request_body_bytes == 65536
+
+
+@pytest.mark.parametrize("value", [1024, 65536, 1048576])
+def test_max_request_body_bytes_accepts_the_documented_range(value: int) -> None:
+    assert Settings(max_request_body_bytes=value).max_request_body_bytes == value
+
+
+@pytest.mark.parametrize("value", [0, 1023, 1048577, "abc", "65536.5"])
+def test_max_request_body_bytes_rejects_out_of_range_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(max_request_body_bytes=value)  # type: ignore[arg-type]

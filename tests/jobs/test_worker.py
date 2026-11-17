@@ -16,12 +16,14 @@ from datetime import UTC, date, datetime, timedelta
 from datetime import time as dt_time
 
 import pytest
-from sqlalchemy import select
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy import select, text
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 import app.jobs.worker as worker
 from app.core.config import Settings
 from app.jobs.dispatcher import DispatchResult, dispatch_pending
+from app.jobs.evaluator import EVALUATOR_LOCK_KEY
 from app.jobs.worker import (
     MAX_DISPATCH_BATCHES_PER_CYCLE,
     CycleResult,
@@ -32,6 +34,7 @@ from app.jobs.worker import (
 from app.models import EventType, Notification, NotificationStatus
 from app.notifiers.base import NotificationMessage
 from tests.conftest import (
+    TEST_DATABASE_URL,
     FakeNotifier,
     MakeAlert,
     MakeField,
@@ -974,6 +977,74 @@ async def test_one_cycle_evaluates_each_field_with_its_own_local_today(
     }
     assert {notification.status for notification in notifications} == {NotificationStatus.SENT}
     assert len(fake_notifier.sent) == 2
+
+
+# --- S14a: lock de evaluación no bloqueante --------------------------------
+
+
+async def test_run_cycle_dispatches_when_the_evaluation_lock_is_busy(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    make_alert: MakeAlert,
+    fake_notifier: FakeNotifier,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S14a: si otra réplica (o un PATCH) tiene el lock, el worker no espera y despacha igual."""
+    caplog.set_level(logging.INFO, logger="app.jobs.evaluator")
+    owner = await make_user()
+    field = await make_field(owner, name="Lote bloqueado")
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=FORECAST_DATE,
+        event_type=EventType.FROST,
+        probability=85,
+        issued_at=EVAL_NOW,
+    )
+    # Notificación vencida de un ciclo anterior: el despacho debe sacarla igual.
+    db_session.add(
+        Notification(
+            alert_id=alert.id,
+            forecast_date=FORECAST_DATE,
+            episode=1,
+            event_type=EventType.FROST,
+            probability=85,
+            threshold=70,
+            status=NotificationStatus.PENDING,
+            next_attempt_at=EVAL_NOW - timedelta(minutes=5),
+        )
+    )
+    await db_session.flush()
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as holder:
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:key)"),
+                {"key": EVALUATOR_LOCK_KEY},
+            )
+            result = await run_cycle(
+                test_sessionmaker,
+                fake_notifier,
+                _settings(),
+                now=EVAL_NOW,
+                clock=_clock_at(CLAIM_NOW),
+            )
+            await holder.rollback()
+    finally:
+        await engine.dispose()
+
+    assert result.created == 0
+    assert result.dispatch == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(fake_notifier.sent) == 1
+    assert "evaluation_skipped reason=lock_busy" in [
+        record.getMessage() for record in caplog.records
+    ]
+    statuses = (await db_session.scalars(select(Notification.status))).all()
+    assert statuses == [NotificationStatus.SENT]
 
 
 # --- S13: envío agrupado, digest y horario de silencio ----------------------

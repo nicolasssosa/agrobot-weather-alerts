@@ -5,8 +5,10 @@ Los services lanzan estas excepciones; NUNCA lanzan HTTPException.
     NotFoundError  -> 404 {"detail": "<mensaje>"}
     ConflictError  -> 409 {"detail": "<mensaje>"}
     RequestValidationError -> 422 {"detail": [<error de FastAPI saneado>]}
+    DBAPIError con sqlstate 55P03/57014 -> 503 {"detail": "Database busy, try again later"}
 """
 
+import logging
 import math
 from collections.abc import Sequence
 from itertools import islice
@@ -15,6 +17,9 @@ from typing import Any
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from sqlalchemy.exc import DBAPIError
+
+logger = logging.getLogger(__name__)
 
 
 class DomainError(Exception):
@@ -105,15 +110,77 @@ def _sanitize_validation_errors(errors: Sequence[Any]) -> list[dict[str, object]
     return sanitized
 
 
+#: Tope de errores devueltos en `detail` (docs/API.md §Convenciones, S14a): un body con
+#: miles de claves inválidas no debe producir una respuesta de MBs.
+_MAX_VALIDATION_ERRORS = 20
+
+#: Detalle del 503 por timeout de base de datos (docs/API.md §Convenciones, S14a).
+DB_BUSY_DETAIL = "Database busy, try again later"
+
+#: sqlstates de Postgres que significan "la base está ocupada, reintentá":
+#: `55P03` = lock_not_available (`lock_timeout`), `57014` = query_canceled
+#: (`statement_timeout` o cancelación de la consulta).
+_DB_TIMEOUT_SQLSTATES = frozenset({"55P03", "57014"})
+
+
+def _bounded_validation_errors(errors: Sequence[Any]) -> list[dict[str, object]]:
+    """Sanea los errores y deja como máximo `_MAX_VALIDATION_ERRORS` + un resumen.
+
+    Si había más, el último elemento es
+    `{"loc": [], "msg": "<n> more errors omitted", "type": "too_many_errors"}` con `n` la
+    cantidad omitida (docs/API.md §Convenciones). Con 20 o menos la respuesta no cambia.
+    """
+    sanitized = _sanitize_validation_errors(errors)
+    if len(sanitized) <= _MAX_VALIDATION_ERRORS:
+        return sanitized
+    omitted = len(sanitized) - _MAX_VALIDATION_ERRORS
+    bounded = sanitized[:_MAX_VALIDATION_ERRORS]
+    bounded.append({"loc": [], "msg": f"{omitted} more errors omitted", "type": "too_many_errors"})
+    return bounded
+
+
 async def _request_validation_error_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, RequestValidationError)
     # 422 literal: `status.HTTP_422_UNPROCESSABLE_ENTITY` está deprecado en Starlette reciente.
     return JSONResponse(
         status_code=422,
-        content={"detail": _sanitize_validation_errors(exc.errors())},
+        content={"detail": _bounded_validation_errors(exc.errors())},
+    )
+
+
+def _db_sqlstate(exc: DBAPIError) -> str | None:
+    """sqlstate del error de Postgres, igual que `app/services/_db_errors.py` (S14a).
+
+    asyncpg expone `sqlstate` en `orig` (o en su `__cause__`) y algunas versiones de
+    psycopg/DBAPI usan `pgcode`: se aceptan las dos formas.
+    """
+    orig = exc.orig
+    for candidate in (orig, getattr(orig, "__cause__", None)):
+        sqlstate = getattr(candidate, "sqlstate", None) or getattr(candidate, "pgcode", None)
+        if sqlstate is not None:
+            return str(sqlstate)
+    return None
+
+
+async def _db_timeout_handler(request: Request, exc: Exception) -> JSONResponse:
+    """`lock_timeout` / `statement_timeout` -> 503 con `Retry-After` (docs/API.md, S14a).
+
+    Cualquier otro error de base de datos no es un "reintentá más tarde": se re-lanza y
+    sigue el comportamiento de siempre (500).
+    """
+    assert isinstance(exc, DBAPIError)
+    sqlstate = _db_sqlstate(exc)
+    if sqlstate not in _DB_TIMEOUT_SQLSTATES:
+        raise exc
+    logger.warning("db_timeout sqlstate=%s path=%s", sqlstate, request.url.path)
+    return JSONResponse(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        content={"detail": DB_BUSY_DETAIL},
+        headers={"Retry-After": "1"},
     )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(DomainError, _domain_error_handler)
     app.add_exception_handler(RequestValidationError, _request_validation_error_handler)
+    app.add_exception_handler(DBAPIError, _db_timeout_handler)

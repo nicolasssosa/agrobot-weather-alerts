@@ -19,8 +19,19 @@ class Settings(BaseSettings):
     db_pool_size: PositiveInt = 5
     db_max_overflow: int = Field(default=10, ge=0)
 
+    # Timeouts por conexión del engine de la app (docs/API.md §Convenciones, S14a).
+    # 0 = sin límite (valor de Postgres). Aplican a la API y al worker.
+    db_statement_timeout_ms: int = Field(default=30000, ge=0)
+    db_lock_timeout_ms: int = Field(default=5000, ge=0)
+
     # Tope de alertas vivas por campo (docs/API.md §alerts, "Límite").
     max_alerts_per_field: int = Field(default=10, ge=1, le=100)
+
+    # Cuota de campos por usuario (docs/API.md §fields, "Límite", S14a).
+    max_fields_per_user: int = Field(default=20, ge=1, le=1000)
+
+    # Tamaño máximo del body de un request (docs/API.md §Convenciones, S14a).
+    max_request_body_bytes: int = Field(default=65536, ge=1024, le=1048576)
 
     # Frescura máxima de un pronóstico para evaluarlo (docs/JOBS.md §Evaluador, D14).
     max_forecast_age_hours: int = Field(default=24, ge=1, le=168)

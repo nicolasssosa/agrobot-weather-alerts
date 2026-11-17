@@ -1,20 +1,36 @@
 """Tests de `/fields`. Ver docs/TESTING.md §test_fields y docs/API.md §fields."""
 
+import asyncio
+import uuid
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import pytest
-from httpx import AsyncClient
-from sqlalchemy import select
+from fastapi import FastAPI
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy import delete, func, select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
+from app.core.config import Settings
+from app.core.db import get_session
 from app.jobs.evaluator import evaluate_alerts
-from app.models import EventType, Field, Notification
+from app.main import create_app
+from app.models import EventType, Field, Notification, User
 from app.schemas.common import BIGINT_MAX
 from app.schemas.field import FieldCreate
 from app.services.fields import InvalidTimezoneError, create_field
-from tests.conftest import MakeAlert, MakeField, MakeForecast, MakeUser, auth
+from tests.conftest import (
+    TEST_DATABASE_URL,
+    MakeAlert,
+    MakeField,
+    MakeForecast,
+    MakeUser,
+    auth,
+)
 
 API = "/api/v1/fields"
 
@@ -699,3 +715,179 @@ async def test_a_legacy_alias_accepted_by_the_api_is_usable_by_the_evaluator(
     notification = await db_session.scalar(select(Notification))
     assert notification is not None
     assert notification.forecast_date == now.date()
+
+
+# --- Cuota de campos por usuario (S14a, D16) --------------------------------
+
+
+async def test_the_field_after_the_limit_returns_409(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    """Con `MAX_FIELDS_PER_USER` (default 20) campos, el siguiente -> 409 con el detail exacto."""
+    limit = Settings().max_fields_per_user
+    user = await make_user()
+    for _ in range(limit):
+        await make_field(user=user)
+
+    response = await client.post(
+        API,
+        json={"name": "Lote de más", "latitude": -34.6, "longitude": -58.4},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Field limit reached for this user"}
+    # No se creó nada y el listado conserva exactamente el límite.
+    listing = await client.get(API, headers=auth(user))
+    assert len(listing.json()["items"]) == limit
+
+
+async def test_the_limit_does_not_affect_another_user(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    """La cuota es por usuario: el mismo POST de otro usuario responde 201."""
+    limit = Settings().max_fields_per_user
+    full = await make_user()
+    for _ in range(limit):
+        await make_field(user=full)
+    other = await make_user()
+
+    response = await client.post(
+        API,
+        json={"name": "Lote de otro", "latitude": -34.6, "longitude": -58.4},
+        headers=auth(other),
+    )
+
+    assert response.status_code == 201
+
+
+async def test_the_field_limit_is_checked_before_the_duplicate_name(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    """En el límite, un nombre duplicado responde 409 por la cuota, no por el nombre."""
+    limit = Settings().max_fields_per_user
+    user = await make_user()
+    await make_field(user=user, name="El Lote")
+    for _ in range(limit - 1):
+        await make_field(user=user)
+
+    response = await client.post(
+        API,
+        json={"name": "El Lote", "latitude": -34.6, "longitude": -58.4},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Field limit reached for this user"}
+
+
+async def test_the_field_quota_is_configurable(
+    client: AsyncClient, make_user: MakeUser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con `MAX_FIELDS_PER_USER=1` el primer campo entra y el segundo responde 409 (S14a)."""
+    monkeypatch.setattr("app.services.fields.get_settings", lambda: Settings(max_fields_per_user=1))
+    user = await make_user()
+
+    first = await client.post(
+        API,
+        json={"name": "Primero", "latitude": -34.6, "longitude": -58.4},
+        headers=auth(user),
+    )
+    second = await client.post(
+        API,
+        json={"name": "Segundo", "latitude": -34.6, "longitude": -58.4},
+        headers=auth(user),
+    )
+
+    assert first.status_code == 201
+    assert second.status_code == 409
+    assert second.json() == {"detail": "Field limit reached for this user"}
+
+
+def _app_with_session(session: AsyncSession) -> FastAPI:
+    """App cuya dependency de sesión entrega una sesión concreta (una conexión propia)."""
+    app = create_app()
+
+    async def _override() -> AsyncIterator[AsyncSession]:
+        yield session
+
+    app.dependency_overrides[get_session] = _override
+    return app
+
+
+async def test_two_concurrent_creations_with_one_slot_left_yield_one_201_and_one_409() -> None:
+    """S14a: dos creaciones en conexiones separadas con un solo lugar libre se serializan.
+
+    El conteo y el INSERT se serializan bloqueando la fila del usuario
+    (`SELECT ... FOR NO KEY UPDATE`): la segunda creación cuenta el campo de la primera y
+    responde 409, así nunca se supera `MAX_FIELDS_PER_USER`.
+    """
+    limit = Settings().max_fields_per_user
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    first_session = session_factory()
+    second_session = session_factory()
+    try:
+        suffix = uuid.uuid4().hex
+        async with session_factory() as setup:
+            user = User(
+                phone_number=f"+54911{uuid.uuid4().int % 10**8:08d}",
+                name=f"Fields concurrent {suffix}",
+            )
+            setup.add(user)
+            await setup.flush()
+            setup.add_all(
+                Field(
+                    user_id=user.id,
+                    name=f"Slot {index} {suffix}",
+                    latitude=Decimal("-34.6"),
+                    longitude=Decimal("-58.4"),
+                )
+                for index in range(limit - 1)
+            )
+            user_id = user.id
+            await setup.commit()
+
+        headers = {"X-User-Id": str(user_id)}
+        async with (
+            AsyncClient(
+                transport=ASGITransport(app=_app_with_session(first_session)),
+                base_url="http://test",
+            ) as first,
+            AsyncClient(
+                transport=ASGITransport(app=_app_with_session(second_session)),
+                base_url="http://test",
+            ) as second,
+        ):
+            responses = await asyncio.gather(
+                first.post(
+                    API,
+                    json={"name": "Último lugar A", "latitude": -34.6, "longitude": -58.4},
+                    headers=headers,
+                ),
+                second.post(
+                    API,
+                    json={"name": "Último lugar B", "latitude": -34.6, "longitude": -58.4},
+                    headers=headers,
+                ),
+            )
+
+        assert sorted(response.status_code for response in responses) == [201, 409]
+        rejected = next(response for response in responses if response.status_code == 409)
+        assert rejected.json() == {"detail": "Field limit reached for this user"}
+
+        async with session_factory() as check:
+            stored = (
+                await check.execute(
+                    select(func.count()).select_from(Field).where(Field.user_id == user_id)
+                )
+            ).scalar_one()
+        assert stored == limit
+    finally:
+        await first_session.close()
+        await second_session.close()
+        if user_id is not None:
+            async with engine.begin() as conn:
+                await conn.execute(delete(User).where(User.id == user_id))
+        await engine.dispose()

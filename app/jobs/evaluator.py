@@ -10,9 +10,11 @@ Desde S12b (D1) la evaluación es **por episodio**: `alert_day_states` guarda, p
 llega al umbral dispara el episodio siguiente; un día disparado se re-arma cuando la
 probabilidad baja de `max(threshold - REARM_MARGIN, 1)`; entre esos dos valores está la
 banda de histéresis. `UNIQUE (alert_id, forecast_date, episode)` es la red de seguridad de
-idempotencia. Antes de evaluar se toma `pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)`: una
-sola réplica evalúa por vez, así dos snapshots distintos no re-arman y disparan el mismo
-día (episodio duplicado).
+idempotencia. Antes de evaluar se intenta `pg_try_advisory_xact_lock(EVALUATOR_LOCK_KEY)`: una
+sola réplica evalúa por vez, así dos snapshots distintos no re-arman y disparan el mismo día
+(episodio duplicado). Si el lock está tomado (otra réplica evaluando o un PATCH de alerta con
+el lock compartido abierto) el ciclo **no espera**: no evalúa, devuelve 0 y loguea
+`evaluation_skipped reason=lock_busy` (info), así el worker sigue al despacho del mismo ciclo.
 
 Desde S12a (D9) el "hoy" es **local de cada campo**: `(:now AT TIME ZONE fields.timezone)::date`,
 con `now` un `TIMESTAMPTZ` en UTC. Se evalúa `[hoy_local, hoy_local + horizon_days)`; el
@@ -74,7 +76,7 @@ from app.services.timezones import PG_TIMEZONE_NAMES
 
 logger = logging.getLogger(__name__)
 
-#: Clave del lock de evaluación (`pg_advisory_xact_lock`): una réplica evalúa por vez.
+#: Clave del lock de evaluación (`pg_try_advisory_xact_lock`): una réplica evalúa por vez.
 EVALUATOR_LOCK_KEY: int = 202611170008
 
 #: Columnas del INSERT ... SELECT de notificaciones, en el mismo orden que el `select`.
@@ -430,9 +432,15 @@ async def evaluate_alerts(
     Por episodio (D1, S12b): un día armado con `probability >= threshold` dispara el
     episodio `episode + 1`; un día disparado se re-arma cuando la probabilidad baja de
     `max(threshold - rearm_margin, 1)`; en la banda de histéresis no cambia nada. Todo en la
-    misma transacción del llamador, bajo `pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)` para
+    misma transacción del llamador, bajo `pg_try_advisory_xact_lock(EVALUATOR_LOCK_KEY)` para
     que dos réplicas no generen episodios duplicados. `UNIQUE (alert_id, forecast_date,
     episode)` es la red de seguridad de idempotencia.
+
+    Si el lock está tomado (otra réplica evaluando o un PATCH de alerta abierto con el lock
+    compartido) no se espera: devuelve 0 sin tocar nada y loguea
+    `evaluation_skipped reason=lock_busy` (info). La evaluación se hace en el ciclo siguiente
+    y el worker sigue al despacho del mismo ciclo (S14a): con `DB_LOCK_TIMEOUT_MS` /
+    `DB_STATEMENT_TIMEOUT_MS` una espera terminaría en error y cortaría también el despacho.
 
     Matchea por campo y tipo de evento y solo pronósticos dentro de la ventana de frescura
     (`issued_at >= now - max_forecast_age_hours`, borde incluido). Un `issued_at` posterior a
@@ -447,8 +455,14 @@ async def evaluate_alerts(
     notificaciones nuevas, contada por Postgres dentro de la misma sentencia (sin
     materializar el `RETURNING` en Python).
     """
-    # Una sola réplica evalúa por vez: la otra espera y su snapshot ve lo ya commiteado.
-    await session.execute(select(func.pg_advisory_xact_lock(EVALUATOR_LOCK_KEY)))
+    # Una sola réplica evalúa por vez. No se espera el lock (S14a): si otra evaluación o un
+    # PATCH lo tiene tomado, el ciclo se saltea y el worker sigue al despacho.
+    locked: bool = (
+        await session.execute(select(func.pg_try_advisory_xact_lock(EVALUATOR_LOCK_KEY)))
+    ).scalar_one()
+    if not locked:
+        logger.info("evaluation_skipped reason=lock_busy")
+        return 0
 
     rearmed: int = (
         await session.execute(

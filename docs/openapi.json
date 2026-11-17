@@ -1456,7 +1456,7 @@
                 }
               }
             },
-            "description": "Field name already exists"
+            "description": "Field name already exists. También Field limit reached for this user si el usuario ya tiene `MAX_FIELDS_PER_USER` (default 20) campos."
           },
           "422": {
             "content": {

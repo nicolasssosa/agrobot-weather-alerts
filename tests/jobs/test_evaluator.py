@@ -13,7 +13,7 @@ from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects import postgresql
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -121,6 +121,21 @@ async def _day_state(session: AsyncSession, alert_id: int, forecast_date: date) 
         )
     ).one_or_none()
     return INITIAL_STATE if row is None else DayState(episode=row.episode, armed=row.armed)
+
+
+async def _stored_day_state(
+    session_factory: async_sessionmaker[AsyncSession], alert_id: int
+) -> tuple[int, bool]:
+    """`(episode, armed)` del único día de la alerta, en una conexión nueva y commiteada."""
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                select(AlertDayState.episode, AlertDayState.armed).where(
+                    AlertDayState.alert_id == alert_id
+                )
+            )
+        ).one()
+    return int(row.episode), bool(row.armed)
 
 
 # --- Forma del SQL (CR-1, CR-2) ------------------------------------------
@@ -1176,6 +1191,109 @@ async def _evaluate_and_commit(
         return created
 
 
+async def test_a_busy_evaluation_lock_skips_the_cycle(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S14a: con el lock de evaluación tomado no se espera, no se evalúa y se loguea el skip.
+
+    Al liberarse el lock, el ciclo siguiente evalúa normalmente y dispara el episodio.
+    """
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=80)
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as holder:
+            # Como un PATCH de alerta con el lock compartido abierto (o otra réplica evaluando).
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:key)"),
+                {"key": EVALUATOR_LOCK_KEY},
+            )
+            caplog.set_level(logging.INFO, logger="app.jobs.evaluator")
+
+            assert await _evaluate(db_session) == 0
+            assert await _notifications(db_session) == []
+            assert await _day_states(db_session) == []
+            messages = [record.getMessage() for record in caplog.records]
+            assert "evaluation_skipped reason=lock_busy" in messages
+            await holder.rollback()
+
+        # Sin el lock, el ciclo siguiente evalúa y dispara el episodio.
+        caplog.clear()
+        assert await _evaluate(db_session) == 1
+        assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+    finally:
+        await engine.dispose()
+
+
+async def test_a_busy_lock_does_not_rearm_a_fired_day() -> None:
+    """S14a: el skip tampoco re-arma; el estado queda intacto hasta que el lock se libera."""
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    user_id: int | None = None
+    try:
+        user_id, field_id, (alert_id,) = await _seed_lock_scenario(session_factory)
+        assert await _evaluate_and_commit(session_factory, now=NOW) == 1
+
+        # El pronóstico baja del `rearm_level`: el próximo ciclo debería re-armar el día.
+        async with engine.begin() as conn:
+            await conn.execute(
+                update(WeatherForecast)
+                .where(WeatherForecast.field_id == field_id)
+                .values(probability=0)
+            )
+
+        async with engine.connect() as holder:
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:key)"),
+                {"key": EVALUATOR_LOCK_KEY},
+            )
+            assert await _evaluate_and_commit(session_factory, now=NOW) == 0
+            await holder.rollback()
+
+        assert await _stored_day_state(session_factory, alert_id) == (1, False)
+
+        # Sin el lock, el ciclo re-arma (y no crea notificaciones).
+        assert await _evaluate_and_commit(session_factory, now=NOW) == 0
+        assert await _stored_day_state(session_factory, alert_id) == (1, True)
+    finally:
+        await _cleanup_owner(engine, user_id)
+
+
+async def test_the_busy_lock_log_is_info_and_names_the_reason(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """El skip es normal (otra réplica o un PATCH en curso): se loguea en INFO, no en warning."""
+    caplog.set_level(logging.INFO, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=90)
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as holder:
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:key)"),
+                {"key": EVALUATOR_LOCK_KEY},
+            )
+            assert await _evaluate(db_session) == 0
+            await holder.rollback()
+    finally:
+        await engine.dispose()
+
+    [record] = [record for record in caplog.records if "evaluation_skipped" in record.getMessage()]
+    assert record.levelno == logging.INFO
+
+
 async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
     """Dos evaluadores en conexiones distintas y datos ya commiteados: la suma es el total
     exacto y no hay duplicados (RNF-03)."""
@@ -1251,9 +1369,10 @@ async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
 async def test_two_concurrent_evaluations_do_not_duplicate_episodes() -> None:
     """Dos conexiones separadas sobre los mismos datos: un episodio, una notificación.
 
-    Sin `pg_advisory_xact_lock` cada réplica podría re-armar y disparar el mismo día con su
-    propio snapshot (episodio duplicado). El lock serializa la evaluación; la red de
-    seguridad `UNIQUE (alert_id, forecast_date, episode)` quedaría como segunda barrera.
+    Con `pg_try_advisory_xact_lock` (S14a) una de las dos evaluaciones se saltea (devuelve 0)
+    en vez de esperar: la otra crea el episodio. Sin el lock, cada réplica podría re-armar y
+    disparar el mismo día con su propio snapshot (episodio duplicado); la red de seguridad
+    `UNIQUE (alert_id, forecast_date, episode)` quedaría como segunda barrera.
     """
     engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
     session_factory = async_sessionmaker(engine, expire_on_commit=False)

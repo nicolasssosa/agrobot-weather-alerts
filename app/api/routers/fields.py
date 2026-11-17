@@ -6,11 +6,22 @@ from fastapi import APIRouter, Depends, status
 
 from app.api.deps import CurrentUser, SessionDep
 from app.models import Field
-from app.schemas.common import PaginationParams, protected_responses
+from app.schemas.common import ErrorResponse, PaginationParams, protected_responses
 from app.schemas.field import FIELDS_422_RESPONSE, FieldCreate, FieldPage, FieldRead
-from app.services.fields import create_field, get_field, list_fields
+from app.services.fields import FIELD_LIMIT_DETAIL, create_field, get_field, list_fields
 
 router = APIRouter(prefix="/fields", tags=["fields"])
+
+#: 409 de POST /fields: unicidad de nombre y cuota por usuario comparten status, no detalle.
+_CREATE_FIELD_409 = {
+    "model": ErrorResponse,
+    "description": (
+        "Field name already exists. También "
+        f"{FIELD_LIMIT_DETAIL} si el usuario ya tiene `MAX_FIELDS_PER_USER` "
+        "(default 20) campos."
+    ),
+    "content": {"application/json": {"example": {"detail": "Field name already exists"}}},
+}
 
 
 @router.post(
@@ -19,7 +30,8 @@ router = APIRouter(prefix="/fields", tags=["fields"])
     status_code=status.HTTP_201_CREATED,
     summary="Crear un campo",
     responses={
-        **protected_responses((409, "Field name already exists")),
+        **protected_responses(),
+        409: _CREATE_FIELD_409,
         422: FIELDS_422_RESPONSE,
     },
 )

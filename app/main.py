@@ -2,7 +2,9 @@
 
 from fastapi import FastAPI
 
+from app.api.middleware import MaxRequestBodySizeMiddleware
 from app.api.routers import alerts, fields, forecasts, health, notifications, users
+from app.core.config import get_settings
 from app.core.errors import register_exception_handlers
 from app.core.logging import configure_logging
 
@@ -59,6 +61,11 @@ def create_app() -> FastAPI:
         openapi_tags=_OPENAPI_TAGS,
     )
     register_exception_handlers(app)
+    # Tamaño máximo del body de cualquier request (docs/API.md §Convenciones, S14a).
+    app.add_middleware(
+        MaxRequestBodySizeMiddleware,
+        max_body_bytes=get_settings().max_request_body_bytes,
+    )
     app.include_router(health.router)
     app.include_router(users.router, prefix=API_PREFIX)
     app.include_router(fields.router, prefix=API_PREFIX)
