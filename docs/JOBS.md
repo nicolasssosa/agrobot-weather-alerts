@@ -278,6 +278,141 @@ Formato exacto (tests lo verifican):
 ```
 Ej: `⚠️ Alerta de helada en "Lote Norte": 85% de probabilidad para el 18/11/2026 (tu umbral: 70%).`
 
+### Envío agrupado por usuario y horario de silencio (S13, D15)
+
+Desde S13 el dispatcher manda **un mensaje por usuario y lote** con todas sus notificaciones
+vencidas, y respeta el horario de silencio del usuario (`users.quiet_hours_start/end` en
+`users.timezone`, DATA_MODEL.md). Cada notificación conserva su estado individual (`sent`,
+reintento, `failed`, `cancelled`); lo único compartido es el envío.
+
+Firma nueva (agrega `digest_max_items`; el resto igual):
+
+```python
+async def dispatch_pending(
+    sessionmaker, notifier, *, now=None, clock=_utc_now, batch_size: int, max_attempts: int,
+    backoff_base_seconds: int, timeout_seconds: float, concurrency: int, lease_seconds: int,
+    max_forecast_age_hours: int, digest_max_items: int,
+) -> DispatchResult
+
+
+@dataclass(frozen=True, slots=True)
+class DispatchResult:
+    sent: int        # notificaciones (no mensajes)
+    retried: int
+    failed: int
+    cancelled: int = 0
+    deferred: int = 0  # notificaciones diferidas por horario de silencio
+    users: int = 0     # usuarios procesados en el lote (con envío, diferidos o todo cancelado)
+```
+
+`batch_size` pasa a ser la cantidad máxima de **usuarios (= mensajes)** por lote. La fórmula del
+lease (`ceil(batch_size / concurrency) * timeout_seconds`) sigue siendo correcta: hay un envío por
+usuario. Un lote reclama a lo sumo `batch_size * digest_max_items` notificaciones.
+
+**Transacción 1 (claim), reemplaza el SELECT de arriba:**
+
+1. **Usuarios del lote**, en una sentencia:
+   ```sql
+   SELECT u.id, u.phone_number, u.timezone, u.quiet_hours_start, u.quiet_hours_end
+   FROM users u
+   WHERE u.id IN (
+     SELECT f.user_id
+     FROM notifications n
+     JOIN alerts a ON a.id = n.alert_id
+     JOIN fields f ON f.id = a.field_id
+     WHERE n.status = 'pending' AND n.next_attempt_at <= :now
+     GROUP BY f.user_id
+     ORDER BY min(n.next_attempt_at), f.user_id
+     LIMIT :batch_size
+   )
+   ORDER BY u.id
+   FOR NO KEY UPDATE SKIP LOCKED
+   ```
+   El lock de la fila del usuario es lo que garantiza **un solo mensaje por usuario** con varias
+   réplicas: otra réplica que elige al mismo usuario lo saltea. `FOR NO KEY UPDATE` (no
+   `FOR UPDATE`) para no bloquear los INSERT de `fields` que validan la FK (`FOR KEY SHARE`).
+2. **Notificaciones de esos usuarios**: el mismo SELECT de validación de arriba (alerta, campo,
+   pronóstico vigente) más `f.user_id` y `f.timezone`, filtrado por `f.user_id IN (usuarios
+   lockeados)`, `status = 'pending'`, `next_attempt_at <= :now`, y **a lo sumo `digest_max_items`
+   por usuario**, las más antiguas primero (`next_attempt_at, id`; con `row_number() OVER
+   (PARTITION BY f.user_id ...)` en una subconsulta de ids, y el `FOR UPDATE OF n SKIP LOCKED` en la
+   consulta exterior, que no puede llevar funciones de ventana). El excedente queda `pending` y
+   vencido: sale en el próximo lote (el worker sigue mientras el lote venga lleno).
+3. **Validación** (`_cancellation_reason`), con un motivo nuevo **`forecast_date_passed`**: el día
+   pronosticado ya pasó en la zona del campo (`forecast_date < (now en fields.timezone).date()`).
+   Orden: `alert_deleted` → `alert_inactive` → `forecast_date_passed` → `below_current_threshold` →
+   `stale_forecast`. Una zona del campo que `zoneinfo` no reconoce saltea solo este chequeo.
+   Las canceladas se cuentan en `cancelled` como siempre.
+4. **Horario de silencio**, por usuario con notificaciones válidas:
+   `until = quiet_until(now, timezone=u.timezone, start=u.quiet_hours_start, end=u.quiet_hours_end)`.
+   - `until is not None` → sus notificaciones válidas quedan `pending` con
+     `next_attempt_at = until`, **sin** tocar `attempts` ni `last_error`; se cuentan en `deferred` y
+     no se envían.
+   - `until is None` → se arriendan (`next_attempt_at = lease_until`) igual que antes.
+5. Commit.
+
+`users` cuenta a cada usuario lockeado que tuvo al menos una notificación reclamada (enviada,
+diferida o cancelada).
+
+**Envío (fuera de transacción):** un `NotificationMessage` por usuario con notificaciones
+arrendadas, con `notification_id` = el **menor id** del grupo, el teléfono del usuario y el texto:
+- 1 notificación → `build_message_text(...)`, exacto como hoy.
+- 2 o más → `build_digest_text(items)` (formato abajo).
+
+Mismo semáforo, timeout y manejo de errores que antes (un timeout o excepción es un resultado
+fallido para todo el grupo; `CancelledError` se propaga).
+
+**Transacción 2 (resultados):** el resultado del envío se aplica a **cada** notificación del grupo
+por separado, con la misma guarda de lease y las mismas reglas de antes usando **sus propios**
+`attempts` (una puede pasar a `failed` y otra quedar en reintento con su backoff). `last_error` con
+el teléfono enmascarado, igual que antes. `sent`/`retried`/`failed` cuentan notificaciones.
+
+Log: `dispatch_done users=.. sent=.. retried=.. failed=.. cancelled=.. deferred=.. duration_ms=..`.
+
+**Función pura — `app/jobs/quiet_hours.py`:**
+
+```python
+def quiet_until(
+    now: datetime, *, timezone: str, start: time | None, end: time | None
+) -> datetime | None:
+    """Si `now` cae en el horario de silencio, la hora UTC en que termina; si no, None."""
+```
+
+- `start is None or end is None` → `None` (sin silencio).
+- `local = now.astimezone(ZoneInfo(timezone))`, `t = local.time()` (sin tz). Ventana semiabierta
+  `[start, end)` en hora local:
+  - `start < end` (ej. 13:00–15:00): adentro si `start <= t < end`; termina hoy a `end`.
+  - `start > end` (cruza medianoche, ej. 22:00–07:00): adentro si `t >= start` (termina **mañana**
+    a `end`) o `t < end` (termina **hoy** a `end`).
+- Fin = `datetime.combine(fecha_fin_local, end, tzinfo=ZoneInfo(timezone)).astimezone(UTC)`
+  (`fold=0`; en un salto de DST `zoneinfo` resuelve la hora inexistente).
+- Si el fin calculado es `<= now` (borde de DST) → `None`.
+- Zona que `zoneinfo` no reconoce → `None` y `logger.warning("invalid_user_timezone user_id=<id>")`
+  lo loguea el **dispatcher** (la función pura lanza `ZoneInfoNotFoundError` y el dispatcher la
+  captura).
+- `now` sin zona → `ValueError`.
+
+Cambiar el horario de silencio (PATCH) **no adelanta** las notificaciones ya diferidas: salen a la
+hora de fin con la que se difirieron (a lo sumo 24 h después). Si al llegar esa hora el usuario
+extendió el silencio, el claim las vuelve a diferir.
+
+**Texto del digest** — `build_digest_text(items: Sequence[ClaimedNotification]) -> str` (exacto,
+lo verifican los tests; `ValueError` con menos de 2 items). Líneas ordenadas por
+`(forecast_date, field_name, event_type.value, threshold, id)`, separadas por `\n`, sin `\n` final:
+
+```
+⚠️ Tenés {n} alertas climáticas:
+• {Label_es} en "{field_name}": {probability}% de probabilidad para el {dd/mm/yyyy} (tu umbral: {threshold}%).
+```
+
+`{Label_es}` = `event_type.label_es` con la primera letra en mayúscula (`Helada`, `Ola de calor`).
+Ej.:
+```
+⚠️ Tenés 2 alertas climáticas:
+• Helada en "Lote Norte": 85% de probabilidad para el 18/11/2026 (tu umbral: 70%).
+• Granizo en "Lote Sur": 60% de probabilidad para el 19/11/2026 (tu umbral: 50%).
+```
+
 ## Worker — `app/jobs/worker.py`
 
 ```python
@@ -289,8 +424,8 @@ async def run_cycle(
 1. `now = now or datetime.now(UTC)`.
 2. `async with sessionmaker() as s:` → `created = await evaluate_alerts(s, now=now, ..., rearm_margin=settings.rearm_margin)` → `await s.commit()`.
 3. Despachar en lotes hasta vaciar la cola vencida: llamar
-   `dispatch_pending(sessionmaker, notifier, ...)` (maneja sus propias transacciones) mientras el
-   lote haya venido lleno (`sent + retried + failed == batch_size`), **con un `now` fresco
+   `dispatch_pending(sessionmaker, notifier, ..., digest_max_items=settings.digest_max_items)` (maneja sus propias transacciones) mientras el
+   lote haya venido lleno (desde S13: `dispatch.users == batch_size`), **con un `now` fresco
    (`datetime.now(UTC)`) en cada llamada** (S6 SEC-3). Acumular el `DispatchResult`.
    **Si `stop_event` está seteado, no arrancar un lote nuevo** (S7 SEC-2): el shutdown no espera
    a drenar toda la cola; lo pendiente queda para el próximo arranque.

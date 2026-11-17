@@ -65,11 +65,17 @@ Usuario de Agrobot. En producción se identifica por su número de WhatsApp.
 | id           | BIGINT        | no   | identity| PK                                        |
 | phone_number | VARCHAR(20)   | no   |         | E.164 (`+5491100000001`), **UNIQUE**      |
 | name         | VARCHAR(120)  | no   |         |                                           |
+| timezone     | VARCHAR(64)   | no   | 'America/Argentina/Buenos_Aires' | zona IANA del usuario; define su horario de silencio (S13, migración 0009). Se valida igual que `fields.timezone` |
+| quiet_hours_start | TIME     | sí   |         | inicio del horario de silencio, hora local (S13) |
+| quiet_hours_end   | TIME     | sí   |         | fin (excluido) del horario de silencio; si es menor que el inicio, cruza la medianoche (S13) |
 | created_at   | TIMESTAMPTZ   | no   | now()   |                                           |
 | updated_at   | TIMESTAMPTZ   | no   | now()   |                                           |
 
 Constraints: `UNIQUE (phone_number)`; CHECK `phone_number ~ '^\+[1-9][0-9]{7,14}$'` (name=`phone_number_e164`,
 migración `0002`): el formato E.164 lo garantiza la DB, así el UNIQUE es unicidad real del número.
+CHECK `(quiet_hours_start IS NULL) = (quiet_hours_end IS NULL)` (name=`quiet_hours_both_or_none`) y
+CHECK `quiet_hours_start <> quiet_hours_end` (name=`quiet_hours_not_empty`) (migración `0009`): o se
+configuran los dos extremos o ninguno, y una ventana vacía no tiene sentido.
 
 ## fields
 
@@ -193,6 +199,19 @@ las búsquedas por `alert_id` del re-armado). Modelo: `app/models/alert_day_stat
 `AlertDayState`.
 
 > Las filas de días pasados no se borran; la purga entra en el job de retención (S14).
+
+## Migración 0009 — horario de silencio por usuario (S13)
+
+- Archivo `migrations/versions/20261117_0009_user_quiet_hours.py`, `revision = "0009"`,
+  `down_revision = "0008"`.
+- `users.timezone VARCHAR(64) NOT NULL DEFAULT 'America/Argentina/Buenos_Aires'` (server default:
+  las filas existentes la toman sin backfill).
+- `users.quiet_hours_start TIME NULL`, `users.quiet_hours_end TIME NULL` (sin silencio por defecto).
+- CHECKs `quiet_hours_both_or_none` y `quiet_hours_not_empty` (tabla de arriba; la naming
+  convention los convierte en `ck_users_quiet_hours_both_or_none` / `ck_users_quiet_hours_not_empty`).
+- `downgrade()`: elimina los CHECK y las tres columnas.
+- Modelo `User`: mismas columnas (`Mapped[time | None]` para las horas) y `CheckConstraint`s;
+  `alembic check` limpio.
 
 ## Migración 0008 — episodios de notificación (S12b)
 

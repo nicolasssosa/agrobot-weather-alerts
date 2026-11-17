@@ -135,8 +135,25 @@ API.md §PATCH alerts y §notifications.
 - [x] Test de concurrencia: dos evaluaciones en conexiones separadas sobre los mismos datos no generan episodios duplicados.
 - [x] `NotificationRead.episode` en la API y en `docs/openapi.json`.
 
-## S13 — Envío agrupado por usuario + horario de silencio · D15
-- [ ] Un mensaje por usuario y ciclo con todas sus notificaciones; cada notificación conserva su estado individual. Horario de silencio configurable: se difiere el envío hasta que termine.
+## S13 — Envío agrupado por usuario + horario de silencio · RF-07, RNF-03, D15
+Archivos: `migrations/versions/20261117_0009_user_quiet_hours.py` (nuevo), `app/models/user.py`,
+`app/schemas/user.py`, `app/services/users.py`, `app/api/routers/users.py`,
+`app/jobs/quiet_hours.py` (nuevo), `app/jobs/dispatcher.py`, `app/jobs/worker.py`,
+`app/core/config.py` (solo `digest_max_items`), `.env.example`, `docs/openapi.json`, tests.
+Contrato: DATA_MODEL.md §users y §Migración 0009, API.md §users, JOBS.md §Envío agrupado por
+usuario y horario de silencio y §Worker.
+- [ ] Migración 0009 (`users.timezone`, `quiet_hours_start/end`, CHECKs) con downgrade; modelo igual; `alembic check` limpio.
+- [ ] `PATCH /users/me` (timezone y quiet_hours; `{}` → 422; `null` desactiva; omitir no cambia; `start == end`, segundos o zona en la hora → 422; zona desconocida → 422); `POST /users` acepta ambos opcionales; `UserRead` con `timezone` y `quiet_hours` (`"HH:MM"` o `null`).
+- [ ] `app/jobs/quiet_hours.py`: `quiet_until` exacto según JOBS.md, con tests unitarios: sin config, ventana del mismo día (adentro, afuera, borde `start` incluido, borde `end` excluido), ventana que cruza la medianoche (antes y después de las 00:00), conversión desde UTC con una zona no-UTC, `now` sin zona → `ValueError`.
+- [ ] Dispatcher: un mensaje por usuario y lote (claim por usuario con `FOR NO KEY UPDATE SKIP LOCKED`), tope `digest_max_items` por mensaje (el excedente sale en el lote siguiente), `notification_id` = menor id, 1 notificación → texto de siempre, ≥ 2 → `build_digest_text` exacto.
+- [ ] Resultados por notificación: un envío fallido aplica reintento/`failed` a cada una según sus propios `attempts`; la guarda de lease se mantiene por fila.
+- [ ] Horario de silencio: usuario en silencio → sus notificaciones válidas quedan `pending` con `next_attempt_at` = fin del silencio, sin tocar `attempts`, contadas en `deferred`, sin enviar; al llegar la hora salen en un solo mensaje. Las que ya no corresponden se cancelan igual durante el silencio.
+- [ ] Cancelación nueva `forecast_date_passed` (día pronosticado anterior al "hoy" del campo), en el orden de JOBS.md.
+- [ ] `DispatchResult.deferred` y `.users`; log `dispatch_done` con ambos; el worker sigue drenando mientras `users == batch_size`.
+- [ ] `DIGEST_MAX_ITEMS` (`Settings.digest_max_items`, default 10, rango 1..20) en config, `.env.example` y pasado por el worker.
+- [ ] Concurrencia: dos `dispatch_pending` en conexiones separadas sobre el mismo usuario con varias notificaciones → un solo mensaje para ese usuario y ninguna notificación enviada dos veces.
+- [ ] Los tests existentes del dispatcher y el worker siguen verdes (se ajustan solo los que asumían un mensaje por notificación para un mismo usuario; justificarlo en el reporte).
+- [ ] OpenAPI regenerado (`make openapi`) y test de contrato verde.
 
 ## S14 — Operación · D16
 - [ ] `statement_timeout`/`lock_timeout`; cuotas por usuario; notificaciones `failed` reintentables; job de retención (pronósticos pasados, `alert_day_states` de días pasados, claves de idempotencia vencidas); límite de tamaño de request y de cantidad de errores en el 422 (follow-ups S4).
