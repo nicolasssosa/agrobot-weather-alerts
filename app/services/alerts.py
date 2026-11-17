@@ -39,11 +39,17 @@ def _owned_alerts(user_id: int, *, include_deleted: bool = False) -> Select[tupl
     return query
 
 
-async def create_alert(session: AsyncSession, user_id: int, data: AlertCreate) -> Alert:
+async def create_alert(
+    session: AsyncSession, user_id: int, data: AlertCreate, *, commit: bool = True
+) -> Alert:
     """Crea una alerta del usuario.
 
     Campo ajeno/inexistente -> 404; duplicado -> 409; campo con
     `max_alerts_per_field` alertas vivas -> 409 (docs/API.md §alerts, "Límite").
+
+    El duplicado se detecta con `flush()` (índice único parcial, sqlstate 23505). Con
+    `commit=False` la fila queda en la transacción abierta para la idempotencia
+    (docs/API.md §Idempotency-Key).
     """
     # Valida rango BIGINT y ownership: un id fuera de rango no se consulta (sería un 500).
     field = await get_field(session, user_id, data.field_id)
@@ -64,7 +70,7 @@ async def create_alert(session: AsyncSession, user_id: int, data: AlertCreate) -
     alert = Alert(field_id=field.id, event_type=data.event_type, threshold=data.threshold)
     session.add(alert)
     try:
-        await session.commit()
+        await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         if not is_unique_violation(exc):
@@ -73,6 +79,8 @@ async def create_alert(session: AsyncSession, user_id: int, data: AlertCreate) -
         # detectado con la constraint, no con un SELECT previo. Una alerta borrada se puede
         # recrear con el mismo umbral.
         raise ConflictError(DUPLICATE_ALERT_DETAIL) from None
+    if commit:
+        await session.commit()
     return alert
 
 

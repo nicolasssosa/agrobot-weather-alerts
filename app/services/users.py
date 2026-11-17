@@ -10,17 +10,24 @@ from app.schemas.user import UserCreate
 from app.services._db_errors import is_unique_violation
 
 
-async def create_user(session: AsyncSession, data: UserCreate) -> User:
-    """Crea un usuario. Teléfono duplicado -> `ConflictError`."""
+async def create_user(session: AsyncSession, data: UserCreate, *, commit: bool = True) -> User:
+    """Crea un usuario. Teléfono duplicado -> `ConflictError`.
+
+    La unicidad se detecta con `flush()` (sqlstate 23505), no con el commit. Con
+    `commit=False` la fila queda en la transacción abierta: la usa la idempotencia para
+    guardar la respuesta en la misma transacción (docs/API.md §Idempotency-Key).
+    """
     user = User(phone_number=data.phone_number, name=data.name)
     session.add(user)
     try:
-        await session.commit()
+        await session.flush()
     except IntegrityError as exc:
         await session.rollback()
         if not is_unique_violation(exc):
             raise
         raise ConflictError("User with this phone number already exists") from None
+    if commit:
+        await session.commit()
     return user
 
 
