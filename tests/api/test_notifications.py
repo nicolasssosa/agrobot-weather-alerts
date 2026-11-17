@@ -327,6 +327,30 @@ async def test_an_offset_past_the_last_row_returns_an_empty_page(
     assert response.json() == {"items": [], "limit": 50, "offset": 10}
 
 
+async def test_listing_with_an_out_of_range_alert_id_returns_422_not_500(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    """S12c: el tope técnico de BIGINT da 422 (no deja que el driver falle con 500)."""
+    user = await make_user()
+
+    response = await client.get(f"{API}?alert_id={BIGINT_MAX + 1}", headers=auth(user))
+
+    assert response.status_code == 422
+    assert response.json()["detail"][0]["msg"] == f"Value error, must be at most {BIGINT_MAX}"
+
+
+async def test_listing_with_the_biggest_alert_id_returns_an_empty_page(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    """S12c: el mayor id válido de BIGINT no explota; no existe y devuelve lista vacía."""
+    user = await make_user()
+
+    response = await client.get(f"{API}?alert_id={BIGINT_MAX}", headers=auth(user))
+
+    assert response.status_code == 200
+    assert response.json() == {"items": [], "limit": 50, "offset": 0}
+
+
 async def test_an_empty_histogram_returns_the_default_page(
     client: AsyncClient, make_user: MakeUser
 ) -> None:

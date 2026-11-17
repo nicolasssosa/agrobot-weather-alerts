@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, Query
 
 from app.api.deps import CurrentUser, SessionDep
 from app.models import NotificationStatus
-from app.schemas.common import BIGINT_MAX, PaginationParams, protected_responses
+from app.schemas.common import BigIntId, PaginationParams, protected_responses
 from app.schemas.notification import NotificationPage, NotificationRead
 from app.services.notifications import list_notifications
 
@@ -24,7 +24,7 @@ async def list_notifications_endpoint(
     session: SessionDep,
     pagination: Annotated[PaginationParams, Depends()],
     status: Annotated[NotificationStatus | None, Query()] = None,
-    alert_id: Annotated[int | None, Query(ge=1, le=BIGINT_MAX)] = None,
+    alert_id: BigIntId | None = None,
 ) -> NotificationPage:
     """Historial paginado de las notificaciones del usuario autenticado."""
     notifications = await list_notifications(

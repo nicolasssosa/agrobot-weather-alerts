@@ -7,6 +7,7 @@
 """
 
 import json
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -82,6 +83,27 @@ def _operations(spec: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
         for method, operation in path_item.items()
         if method in _HTTP_METHODS
     ]
+
+
+def _iter_maxima(node: Any, pointer: str = "#") -> Iterator[tuple[str, Any]]:
+    """Recorre el schema y devuelve cada `maximum` publicado con su puntero JSON."""
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "maximum":
+                yield pointer, value
+            else:
+                yield from _iter_maxima(value, f"{pointer}/{key}")
+    elif isinstance(node, list):
+        for index, item in enumerate(node):
+            yield from _iter_maxima(item, f"{pointer}/{index}")
+
+
+def test_no_published_maximum_exceeds_the_pagination_ceiling() -> None:
+    """S12c: el tope técnico de BIGINT no se publica; ningún `maximum` supera 10000."""
+    maxima = list(_iter_maxima(_spec()))
+
+    assert maxima, "El schema no publica ningún `maximum`: el test no está verificando nada"
+    assert [(pointer, value) for pointer, value in maxima if value > 10000] == []
 
 
 def test_openapi_json_is_in_sync() -> None:
