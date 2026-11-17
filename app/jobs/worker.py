@@ -84,10 +84,10 @@ async def run_cycle(
     async with sessionmaker() as session:
         created = await evaluate_alerts(
             session,
-            today=cycle_now.date(),
             now=cycle_now,
+            horizon_days=settings.alert_horizon_days,
             max_forecast_age_hours=settings.max_forecast_age_hours,
-            forecast_future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
+            future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
         )
         await session.commit()
 

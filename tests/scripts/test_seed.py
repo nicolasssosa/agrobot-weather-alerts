@@ -260,3 +260,26 @@ async def test_seed_stamps_the_model_run_on_every_forecast(
 
     assert summary.forecast_rows == EXPECTED_FORECASTS
     assert issued == {NOW}
+
+
+async def test_seed_forwards_the_configured_future_tolerance(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SEC-3: el seed pasa la tolerancia del setting a la ingesta, no el default del código."""
+    captured: dict[str, object] = {}
+
+    async def _fake_ingest(session: object, provider: object, **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr("app.scripts.seed.ingest_forecasts", _fake_ingest)
+    monkeypatch.setattr(
+        "app.scripts.seed.get_settings",
+        lambda: Settings(forecast_future_tolerance_minutes=23),
+    )
+
+    summary = await seed(test_sessionmaker, now=NOW)
+
+    assert summary.forecast_rows == 0
+    assert captured["future_tolerance_minutes"] == 23

@@ -73,7 +73,9 @@ Request `FieldCreate`:
 {"name": "Lote Norte", "latitude": -34.6037, "longitude": -58.3816, "timezone": "America/Argentina/Buenos_Aires"}
 ```
 - `name` 1..120 (strip), `latitude` [-90, 90], `longitude` [-180, 180] (`float` en el schema).
-- `timezone` opcional (default `America/Argentina/Buenos_Aires`): zona IANA válida; inválida → 422.
+- `timezone` opcional (default `America/Argentina/Buenos_Aires`): zona IANA que **PostgreSQL reconozca**
+  (se valida contra `pg_timezone_names`, coincidencia exacta; `localtime`, `posixrules`, `Factory`,
+  variantes de mayúsculas o Unicode y nombres desconocidos → 422).
   Define el "hoy" del campo para evaluar sus alertas.
 
 Respuesta **201** `FieldRead`: `{"id", "name", "latitude", "longitude", "timezone", "created_at"}`.

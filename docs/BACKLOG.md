@@ -108,10 +108,10 @@ Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.p
 - [ ] `POST /users` y `POST /fields` sin soporte de `Idempotency-Key` (el header se ignora) y sin el código especial de `/users` (scope por body, reconstrucción sin PII).
 - [ ] Migración 0006 según DATA_MODEL.md; OpenAPI con el header **requerido** en `POST /alerts` y sin header en los otros dos.
 
-## S12a — Zona horaria por campo y horizonte configurable · D2, D9
-- [ ] `fields.timezone` (IANA, validada; default `America/Argentina/Buenos_Aires`), en `FieldCreate` (opcional) y `FieldRead`; migración 0007.
-- [ ] El evaluador calcula "hoy" **por campo** en su zona horaria y evalúa `[hoy_local, hoy_local + ALERT_HORIZON_DAYS)` (0 = sin límite).
-- [ ] Follow-ups de S11: los scripts `ingest`/`seed` usan `FORECAST_FUTURE_TOLERANCE_MINUTES` del setting (SEC-3); warning `future_forecasts count=<n> fields=<m>` cuando el evaluador excluye pronósticos con `issued_at` adelantado (SEC-4); la validación al enviar compara contra la probabilidad del **pronóstico vigente** (SEC-5).
+## S12a — Zona horaria por campo y horizonte configurable · D2, D9 · ✅
+- [x] `fields.timezone` (IANA, validada; default `America/Argentina/Buenos_Aires`), en `FieldCreate` (opcional) y `FieldRead`; migración 0007.
+- [x] El evaluador calcula "hoy" **por campo** en su zona horaria y evalúa `[hoy_local, hoy_local + ALERT_HORIZON_DAYS)` (0 = sin límite).
+- [x] Follow-ups de S11: los scripts `ingest`/`seed` usan `FORECAST_FUTURE_TOLERANCE_MINUTES` del setting (SEC-3); warning `future_forecasts count=<n> fields=<m>` cuando el evaluador excluye pronósticos con `issued_at` adelantado (SEC-4); la validación al enviar compara contra la probabilidad del **pronóstico vigente** (SEC-5).
 
 ## S12b — Re-aviso por episodio · D1
 - [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa.

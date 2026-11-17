@@ -54,3 +54,25 @@ def test_forecast_future_tolerance_accepts_the_documented_range(value: int) -> N
 def test_forecast_future_tolerance_rejects_out_of_range_values(value: object) -> None:
     with pytest.raises(ValidationError):
         Settings(forecast_future_tolerance_minutes=value)  # type: ignore[arg-type]
+
+
+def test_alert_horizon_days_defaults_to_7() -> None:
+    """D2: horizonte de evaluación por defecto de 7 días (S12a)."""
+    assert Settings().alert_horizon_days == 7
+
+
+@pytest.mark.parametrize("value", [0, 1, 7, 365])
+def test_alert_horizon_days_accepts_the_documented_range(value: int) -> None:
+    """`0` = sin límite y los bordes 1..365 son válidos (inclusive)."""
+    assert Settings(alert_horizon_days=value).alert_horizon_days == value
+
+
+@pytest.mark.parametrize("value", [-1, 366, 1000, "abc"])
+def test_alert_horizon_days_rejects_out_of_range_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(alert_horizon_days=value)  # type: ignore[arg-type]
+
+
+def test_alert_horizon_days_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("ALERT_HORIZON_DAYS", "0")
+    assert Settings().alert_horizon_days == 0

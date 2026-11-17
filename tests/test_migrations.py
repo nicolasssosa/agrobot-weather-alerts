@@ -134,6 +134,102 @@ def test_migration_0006_upgrade_and_downgrade_are_clean() -> None:
     command.upgrade(cfg, "head")
 
 
+def test_migration_0007_upgrade_and_downgrade_are_clean() -> None:
+    """La migración `0007` se revierte y se vuelve a aplicar sin errores."""
+    cfg = _config()
+
+    command.downgrade(cfg, "0006")
+    command.upgrade(cfg, "head")
+
+
+def test_migration_0007_backfills_timezone_for_existing_rows_and_downgrade_drops_it() -> None:
+    """`0007`: las filas previas toman el default; `downgrade()` elimina la columna (S12a)."""
+    cfg = _config()
+    phone_number = f"+54{uuid.uuid4().int % 10**12:012d}"
+    default_timezone = "America/Argentina/Buenos_Aires"
+
+    async def _insert_legacy_field() -> int:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                user_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO users (phone_number, name)"
+                            " VALUES (:phone, 'Timezone probe') RETURNING id"
+                        ),
+                        {"phone": phone_number},
+                    )
+                ).scalar_one()
+                # Sin `timezone`: la columna todavía no existe antes de `0007`.
+                field_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO fields (user_id, name, latitude, longitude)"
+                            " VALUES (:user_id, 'Probe', -34.6, -58.4) RETURNING id"
+                        ),
+                        {"user_id": user_id},
+                    )
+                ).scalar_one()
+                return int(field_id)
+        finally:
+            await engine.dispose()
+
+    async def _timezone(field_id: int) -> str:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.connect() as conn:
+                value = (
+                    await conn.execute(
+                        text("SELECT timezone FROM fields WHERE id = :field_id"),
+                        {"field_id": field_id},
+                    )
+                ).scalar_one()
+                assert isinstance(value, str)
+                return value
+        finally:
+            await engine.dispose()
+
+    async def _column_exists() -> bool:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.connect() as conn:
+                count = (
+                    await conn.execute(
+                        text(
+                            "SELECT count(*) FROM information_schema.columns"
+                            " WHERE table_name = 'fields' AND column_name = 'timezone'"
+                        )
+                    )
+                ).scalar_one()
+                return bool(count)
+        finally:
+            await engine.dispose()
+
+    async def _cleanup() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM users WHERE phone_number = :phone"),
+                    {"phone": phone_number},
+                )
+        finally:
+            await engine.dispose()
+
+    command.downgrade(cfg, "0006")
+    try:
+        field_id = asyncio.run(_insert_legacy_field())
+        command.upgrade(cfg, "head")
+        assert asyncio.run(_timezone(field_id)) == default_timezone
+        command.downgrade(cfg, "0006")
+        assert asyncio.run(_column_exists()) is False
+    finally:
+        # La base tiene que quedar en `head` para el resto de la suite.
+        command.upgrade(cfg, "head")
+        asyncio.run(_cleanup())
+
+
 def test_migration_0006_removes_non_alert_keys_and_makes_user_id_not_null() -> None:
     """`0006`: borra las claves de users/fields y deja `user_id NOT NULL`."""
     cfg = _config()

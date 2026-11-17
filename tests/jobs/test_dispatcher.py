@@ -82,10 +82,13 @@ async def _make_notification(
     sent_at: datetime | None = None,
     last_error: str | None = None,
     probability: int = 85,
+    forecast_probability: int | None = None,
     forecast_issued_at: datetime | None = NOW,
 ) -> Notification:
     """Crea la notificación y, si corresponde, el pronóstico vigente que la respalda.
 
+    `probability` es el snapshot de la notificación; `forecast_probability` (default: el mismo)
+    es la probabilidad del pronóstico vigente, que manda en la re-validación de umbral (SEC-5).
     `forecast_issued_at=None` simula un pronóstico que ya no existe; otra hora simula uno
     emitido antes (vencido) o después (fresco) del corte. Los tests nunca usan el reloj real.
     """
@@ -103,7 +106,9 @@ async def _make_notification(
                     field_id=alert.field_id,
                     forecast_date=forecast_date,
                     event_type=alert.event_type,
-                    probability=probability,
+                    probability=probability
+                    if forecast_probability is None
+                    else forecast_probability,
                     source="mock",
                     issued_at=forecast_issued_at,
                     fetched_at=NOW,
@@ -1238,6 +1243,80 @@ async def test_probability_equal_to_the_current_threshold_is_not_cancelled(
     assert notification.status == NotificationStatus.SENT
 
 
+async def test_the_current_forecast_probability_equal_to_the_threshold_is_sent(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """SEC-5: el borde `==` se compara contra el pronóstico vigente y no cancela.
+
+    El snapshot de la notificación quedó en 85% (lo que disparó el evaluador), pero la ingesta
+    bajó el pronóstico del día a 70%: con umbral 70% el aviso sigue correspondiendo.
+    """
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_probability=70
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert [message.notification_id for message in notifier.sent] == [notification.id]
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    assert notification.last_error is None
+
+
+async def test_the_current_forecast_probability_below_the_threshold_cancels(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """SEC-5: manda la probabilidad del pronóstico vigente, no el snapshot de la notificación.
+
+    El evaluador avisó con 85%, pero la ingesta bajó el pronóstico del día a 60% y el umbral
+    vigente es 70%: la notificación se cancela sin enviarse.
+    """
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_probability=60
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.CANCELLED
+    assert notification.last_error == "below_current_threshold"
+    assert notification.sent_at is None
+
+
+async def test_the_current_forecast_probability_above_the_threshold_is_sent(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """SEC-5: si el pronóstico vigente sigue sobre el umbral, el aviso se envía."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=72, forecast_probability=85
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert [message.notification_id for message in notifier.sent] == [notification.id]
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+
+
 # --- Frescura del pronóstico en el claim (S11 CR-2) ------------------------
 
 
@@ -1287,6 +1366,30 @@ async def test_a_pending_notification_without_a_forecast_is_cancelled_as_stale(
     assert notifier.calls == 0
     await db_session.refresh(notification)
     assert notification.last_error == "stale_forecast"
+
+
+async def test_a_pending_notification_whose_forecast_was_deleted_is_cancelled_as_stale(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S12a: la ingesta borró la fila del pronóstico vigente → `stale_forecast`, no se envía."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(db_session, alert, probability=85)
+    await db_session.execute(
+        delete(WeatherForecast).where(WeatherForecast.field_id == alert.field_id)
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.CANCELLED
+    assert notification.last_error == "stale_forecast"
+    assert notification.attempts == 0
 
 
 async def test_a_pending_notification_at_the_freshness_boundary_is_sent(

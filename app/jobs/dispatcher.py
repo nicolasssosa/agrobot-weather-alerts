@@ -109,16 +109,17 @@ def _backoff_seconds(attempts: int, backoff_base_seconds: int) -> int:
 
 def _claim_statement(
     now: datetime, batch_size: int, max_forecast_age_hours: int
-) -> Select[tuple[Notification, str, str, datetime | None, bool, int, datetime | None]]:
+) -> Select[tuple[Notification, str, str, datetime | None, bool, int, datetime | None, int | None]]:
     """SELECT del lote vencido, con teléfono, campo y estado actual de la alerta (sin N+1).
 
     El predicado de estado es una igualdad (`status == PENDING`) para que el planner pueda
     usar el índice parcial `ix_notifications_pending_due ... WHERE status = 'pending'`.
     `FOR UPDATE OF notifications` lockea solo la cola: `alerts`/`fields`/`users` no se lockean.
     Se traen `deleted_at`, `is_active` y `threshold` de la alerta para la re-validación (D12)
-    y el `issued_at` del pronóstico vigente para la de frescura (S11, D14), todo en la misma
-    transacción del claim. El LEFT JOIN no cambia la fila base: la clave natural
-    `(field_id, forecast_date, event_type)` es única en `weather_forecasts`.
+    y `issued_at`/`probability` del pronóstico vigente para la de frescura (S11, D14) y de
+    umbral (S12a SEC-5), todo en la misma transacción del claim. El LEFT JOIN no cambia la fila
+    base: la clave natural `(field_id, forecast_date, event_type)` es única en
+    `weather_forecasts`.
     """
     statement = (
         select(
@@ -129,6 +130,7 @@ def _claim_statement(
             Alert.is_active,
             Alert.threshold,
             WeatherForecast.issued_at,
+            WeatherForecast.probability,
         )
         .join(Alert, Alert.id == Notification.alert_id)
         .join(Field, Field.id == Alert.field_id)
@@ -147,8 +149,8 @@ def _claim_statement(
         .limit(batch_size)
         .with_for_update(of=Notification, skip_locked=True)
     )
-    # SQLAlchemy tipa `issued_at` como no nulo; el `LEFT JOIN` lo vuelve opcional cuando el
-    # pronóstico vigente ya no existe (CR-2).
+    # SQLAlchemy tipa `issued_at`/`probability` como no nulos; el `LEFT JOIN` los vuelve
+    # opcionales cuando el pronóstico vigente ya no existe (CR-2).
     return statement  # type: ignore[return-value]
 
 
@@ -156,15 +158,17 @@ def _cancellation_reason(
     *,
     alert_deleted_at: datetime | None,
     alert_is_active: bool,
-    probability: int,
     alert_threshold: int,
+    forecast_probability: int | None,
     forecast_issued_at: datetime | None,
     stale_forecast_before: datetime,
 ) -> str | None:
-    """Motivo por el que una notificación reclamada ya no corresponde enviarse (D12/S11).
+    """Motivo por el que una notificación reclamada ya no corresponde enviarse (D12/S11/S12a).
 
     El orden importa: una alerta borrada gana sobre una inactiva, una inactiva gana sobre el
     umbral y el estado de la alerta gana sobre la frescura (así `last_error` es determinístico).
+    El umbral se compara contra la probabilidad del **pronóstico vigente** (S12a SEC-5), no
+    contra el snapshot de la notificación: si el pronóstico bajó, el aviso ya no corresponde.
     Un pronóstico ausente o emitido antes de `now - max_forecast_age_hours` ya no sirve para
     el aviso: la notificación se cancela como `stale_forecast` sin enviarse.
     """
@@ -172,7 +176,11 @@ def _cancellation_reason(
         return "alert_deleted"
     if not alert_is_active:
         return "alert_inactive"
-    if probability < alert_threshold:
+    if (
+        forecast_probability is not None
+        and forecast_issued_at is not None
+        and forecast_probability < alert_threshold
+    ):
         return "below_current_threshold"
     if forecast_issued_at is None or forecast_issued_at < stale_forecast_before:
         return "stale_forecast"
@@ -189,11 +197,11 @@ async def _claim_batch(
 ) -> tuple[list[ClaimedNotification], int]:
     """Transacción 1: reclama el lote con `SKIP LOCKED`, valida y arrienda; commitea.
 
-    Además del lease, re-verifica contra la alerta **actual** (S9, D12) y contra la frescura
-    del pronóstico vigente (S11, D14): las notificaciones cuya alerta está borrada, inactiva,
-    ya no alcanza el umbral vigente, o cuyo pronóstico no existe o es más viejo que
-    `now - max_forecast_age_hours` pasan a `cancelled` con su motivo en `last_error` y no se
-    envían. Todo ocurre en esta misma transacción corta.
+    Además del lease, re-verifica contra la alerta **actual** (S9, D12), contra la probabilidad
+    del **pronóstico vigente** (S12a SEC-5) y contra su frescura (S11, D14): las notificaciones
+    cuya alerta está borrada o inactiva, cuyo pronóstico vigente bajó del umbral actual, o cuyo
+    pronóstico no existe / venció (`now - max_forecast_age_hours`) pasan a `cancelled` con su
+    motivo en `last_error` y no se envían. Todo ocurre en esta misma transacción corta.
 
     El commit libera los locks: nadie espera a la red con una transacción abierta.
     `lease_until = now + lease_seconds` se calcula una sola vez por lote; ese valor exacto es el
@@ -216,12 +224,13 @@ async def _claim_batch(
             alert_is_active,
             alert_threshold,
             forecast_issued_at,
+            forecast_probability,
         ) in rows:
             reason = _cancellation_reason(
                 alert_deleted_at=alert_deleted_at,
                 alert_is_active=alert_is_active,
-                probability=notification.probability,
                 alert_threshold=alert_threshold,
+                forecast_probability=forecast_probability,
                 forecast_issued_at=forecast_issued_at,
                 stale_forecast_before=stale_forecast_before,
             )
@@ -387,9 +396,10 @@ async def dispatch_pending(
 ) -> DispatchResult:
     """Envía hasta `batch_size` notificaciones pendientes vencidas (patrón lease).
 
-    1. Claim + lease + validación contra la alerta actual y la frescura del pronóstico en una
-       transacción corta: las que ya no corresponden (alerta borrada/inactiva/umbral o
-       `stale_forecast`) pasan a `cancelled` sin enviarse (se cuentan en `cancelled`).
+    1. Claim + lease + validación contra la alerta actual, la probabilidad del pronóstico
+       vigente y su frescura en una transacción corta: las que ya no corresponden (alerta
+       borrada/inactiva, pronóstico bajo el umbral actual o `stale_forecast`) pasan a
+       `cancelled` sin enviarse (se cuentan en `cancelled`).
     2. Envío en paralelo acotado (`concurrency`) con timeout por mensaje, sin transacción.
     3. Resultados en otra transacción corta: `sent`, reintento con backoff exponencial o
        `failed` al agotar `max_attempts`.

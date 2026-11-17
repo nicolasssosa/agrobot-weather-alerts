@@ -162,6 +162,7 @@ async def seed(
     otros campos (S7 SEC-1). No es seguro ante dos corridas concurrentes (S7 CR-1).
     """
     _ensure_environment_is_safe()
+    settings = get_settings()
     moment = now if now is not None else datetime.now(UTC)
     start = moment.date()
     async with sessionmaker() as session:
@@ -200,6 +201,7 @@ async def seed(
             days=days,
             field_ids=[field.id for field in fields_by_key.values()],
             now=moment,
+            future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
         )
         await session.commit()
 

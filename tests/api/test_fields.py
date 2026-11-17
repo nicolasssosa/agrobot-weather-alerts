@@ -1,14 +1,20 @@
 """Tests de `/fields`. Ver docs/TESTING.md §test_fields y docs/API.md §fields."""
 
+from datetime import UTC, datetime
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.jobs.evaluator import evaluate_alerts
+from app.models import EventType, Field, Notification
 from app.schemas.common import BIGINT_MAX
 from app.schemas.field import FieldCreate
-from app.services.fields import create_field
-from tests.conftest import MakeField, MakeUser, auth
+from app.services.fields import InvalidTimezoneError, create_field
+from tests.conftest import MakeAlert, MakeField, MakeForecast, MakeUser, auth
 
 API = "/api/v1/fields"
 
@@ -254,7 +260,92 @@ async def test_field_read_exposes_only_the_documented_fields(
     )
 
     assert response.status_code == 201
-    assert set(response.json()) == {"id", "name", "latitude", "longitude", "created_at"}
+    assert set(response.json()) == {
+        "id",
+        "name",
+        "latitude",
+        "longitude",
+        "timezone",
+        "created_at",
+    }
+
+
+async def test_field_timezone_defaults_to_buenos_aires(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    """Omitir `timezone` guarda el default de D9/E7 y lo devuelve en `FieldRead`."""
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={"name": "Lote", "latitude": -34.6, "longitude": -58.4},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["timezone"] == "America/Argentina/Buenos_Aires"
+    field_id = response.json()["id"]
+    read = await client.get(f"{API}/{field_id}", headers=auth(user))
+    assert read.status_code == 200
+    assert read.json()["timezone"] == "America/Argentina/Buenos_Aires"
+
+
+@pytest.mark.parametrize("timezone", ["UTC", "Asia/Tokyo", "Etc/GMT+3"])
+async def test_create_field_persists_a_valid_iana_timezone(
+    client: AsyncClient, make_user: MakeUser, timezone: str
+) -> None:
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={
+            "name": f"Lote {timezone}",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": timezone,
+        },
+        headers=auth(user),
+    )
+
+    assert response.status_code == 201
+    assert response.json()["timezone"] == timezone
+    listing = await client.get(API, headers=auth(user))
+    assert [item["timezone"] for item in listing.json()["items"]] == [timezone]
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        "",
+        "   ",
+        "Buenos Aires",
+        "America/Argentina/../Buenos_Aires",
+        "/etc/passwd",
+        "../etc/passwd",
+        "Mars/Olympus_Mons",
+        "UTC+3",
+    ],
+)
+async def test_create_field_with_an_invalid_timezone_returns_422(
+    client: AsyncClient, make_user: MakeUser, timezone: str
+) -> None:
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={
+            "name": "Lote",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": timezone,
+        },
+        headers=auth(user),
+    )
+
+    assert response.status_code == 422
+    fields = response.json()["detail"]
+    assert any("timezone" in error["loc"] for error in fields)
+    assert "IANA" in fields[0]["msg"]
 
 
 async def test_create_field_with_a_120_character_name_is_accepted(
@@ -377,3 +468,214 @@ async def test_non_unique_integrity_error_is_not_mapped_to_409(db_session: Async
     # FK inexistente (sqlstate 23503): no es un duplicado, así que no debe ser un 409.
     with pytest.raises(IntegrityError):
         await create_field(db_session, 999_999_999_999, payload)
+
+
+async def test_the_service_rejects_a_timezone_postgres_does_not_know(
+    db_session: AsyncSession, make_user: MakeUser
+) -> None:
+    """La seguridad no depende del schema: el service valida contra `pg_timezone_names`.
+
+    `model_construct` saltea los validadores de Pydantic (como haría un llamador interno):
+    el service igual debe rechazar la zona y no insertar nada (S12a CR-1/SEC-1).
+    """
+    user = await make_user()
+    payload = FieldCreate.model_construct(
+        name="Lote",
+        latitude=-34.6,
+        longitude=-58.4,
+        timezone="america/argentina/buenos_aires",
+    )
+
+    with pytest.raises(InvalidTimezoneError) as error:
+        await create_field(db_session, user.id, payload)
+
+    assert "pg_timezone_names" in str(error.value)
+    assert list((await db_session.execute(select(Field))).scalars().all()) == []
+
+
+# --- Zona IANA: formatos no válidos y alias de la tz database (S12a) --------
+
+
+def _zoneinfo_resolves(key: str) -> bool:
+    """¿La tz database de este SO conoce la clave? Es la misma fuente que usa el schema."""
+    try:
+        ZoneInfo(key)
+    except (ZoneInfoNotFoundError, ValueError):
+        return False
+    return True
+
+
+@pytest.mark.parametrize("timezone", ["../../etc/passwd", "GMT-3", "Local"])
+async def test_create_field_rejects_non_iana_timezone_formats(
+    client: AsyncClient, make_user: MakeUser, timezone: str
+) -> None:
+    """Rutas con `..`, offsets con signo y el nombre legado de glibc no son zonas IANA."""
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={
+            "name": "Lote",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": timezone,
+        },
+        headers=auth(user),
+    )
+
+    assert response.status_code == 422
+    errors = response.json()["detail"]
+    assert any("timezone" in error["loc"] for error in errors)
+
+
+async def test_a_timezone_longer_than_the_column_limit_returns_422(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    """El schema limita a 64 caracteres, como `fields.timezone VARCHAR(64)`."""
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={
+            "name": "Lote",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": "A" * 65,
+        },
+        headers=auth(user),
+    )
+
+    assert response.status_code == 422
+    assert any("timezone" in error["loc"] for error in response.json()["detail"])
+
+
+@pytest.mark.parametrize(
+    "timezone",
+    [
+        # Archivo del sistema, no un nombre de la tz database.
+        "localtime",
+        # Placeholder de tzdata / archivo suelto: Postgres los resuelve pero no son regiones.
+        "posixrules",
+        "Factory",
+        # Unicode: el long s (U+017F) casefoldea a `s` en un filesystem case-insensitive.
+        "america/argentina/buenos_aire\u017f",
+        # Minúsculas: `pg_timezone_names` compara exacto y case-sensitive.
+        "america/argentina/buenos_aires",
+        "AMERICA/ARGENTINA/BUENOS_AIRES",
+    ],
+)
+async def test_create_field_rejects_zones_that_postgres_does_not_know_exactly(
+    client: AsyncClient, make_user: MakeUser, timezone: str
+) -> None:
+    """La fuente de verdad es `pg_timezone_names` (S12a CR-1/SEC-1), no `zoneinfo`.
+
+    `zoneinfo` puede resolver estas variantes según el sistema de archivos (macOS las acepta
+    por case-folding), pero Postgres no las reconoce con coincidencia exacta: aceptarlas
+    rompería `AT TIME ZONE` y con él la evaluación de **todos** los campos.
+    """
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={
+            "name": "Lote",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": timezone,
+        },
+        headers=auth(user),
+    )
+
+    assert response.status_code == 422
+    detail = response.json()["detail"]
+    if isinstance(detail, str):
+        assert "timezone" in detail.lower()
+    else:
+        assert any("timezone" in error["loc"] for error in detail)
+    assert (await client.get(API, headers=auth(user))).json()["items"] == []
+
+
+@pytest.mark.parametrize(
+    ("timezone", "expected"),
+    [
+        # Nombre canónico y alias histórico de la tz database: Postgres los conoce.
+        ("America/Argentina/Buenos_Aires", 201),
+        ("America/Buenos_Aires", 201),
+        ("UTC", 201),
+    ],
+)
+async def test_timezone_acceptance_is_an_exact_match_against_pg_timezone_names(
+    client: AsyncClient, make_user: MakeUser, timezone: str, expected: int
+) -> None:
+    """Cross-check con la fuente real: lo que la API acepta, el evaluador lo puede usar."""
+    user = await make_user()
+
+    response = await client.post(
+        API,
+        json={
+            "name": f"Lote {timezone}",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": timezone,
+        },
+        headers=auth(user),
+    )
+
+    assert response.status_code == expected
+    if expected == 201:
+        assert response.json()["timezone"] == timezone
+
+
+@pytest.mark.skipif(
+    not _zoneinfo_resolves("America/Buenos_Aires"),
+    reason="la tz database de este SO no trae el alias legacy",
+)
+async def test_a_legacy_alias_accepted_by_the_api_is_usable_by_the_evaluator(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Cross-check: si `zoneinfo` acepta el alias, Postgres también sabe interpretarlo.
+
+    El evaluador resuelve el "hoy" con `AT TIME ZONE fields.timezone`: una zona aceptada por
+    la API pero desconocida para la tz database de Postgres rompería todos los ciclos.
+    """
+    user = await make_user()
+    response = await client.post(
+        API,
+        json={
+            "name": "Lote alias",
+            "latitude": -34.6,
+            "longitude": -58.4,
+            "timezone": "America/Buenos_Aires",
+        },
+        headers=auth(user),
+    )
+    assert response.status_code == 201
+
+    field = await db_session.get(Field, response.json()["id"])
+    assert field is not None
+    now = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+    await make_alert(field, event_type=EventType.FROST, threshold=50)
+    await make_forecast(
+        field,
+        forecast_date=now.date(),
+        event_type=EventType.FROST,
+        probability=80,
+        issued_at=now,
+    )
+
+    created = await evaluate_alerts(
+        db_session,
+        now=now,
+        horizon_days=7,
+        max_forecast_age_hours=24,
+        future_tolerance_minutes=60,
+    )
+
+    assert created == 1
+    notification = await db_session.scalar(select(Notification))
+    assert notification is not None
+    assert notification.forecast_date == now.date()

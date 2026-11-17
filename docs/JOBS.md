@@ -35,13 +35,28 @@ JOIN weather_forecasts wf
   ON wf.field_id = a.field_id
  AND wf.event_type = a.event_type
 WHERE a.is_active AND a.deleted_at IS NULL   -- predicado igual al del índice parcial ix_alerts_active_field_event (S9)
-  AND wf.forecast_date >= (:now AT TIME ZONE f.timezone)::date                -- "hoy" LOCAL del campo (S12a, D9)
+  AND wf.forecast_date >= (:now)::date - 1          -- prefiltro con valor fijo: permite usar el índice (S12a CR-2)
+  AND f.timezone IN (SELECT name FROM pg_timezone_names)   -- saltea campos con zona desconocida
+  AND wf.forecast_date >= local_today                       -- "hoy" LOCAL del campo (S12a, D9)
   AND (:horizon_days = 0
-       OR wf.forecast_date < (:now AT TIME ZONE f.timezone)::date + :horizon_days)  -- horizonte (D2)
+       OR wf.forecast_date < local_today + :horizon_days)    -- horizonte (D2)
   AND wf.probability   >= a.threshold                 -- "a partir de" => >=
 ON CONFLICT (alert_id, forecast_date) DO NOTHING
 RETURNING id;
 ```
+
+donde `local_today` es la expresión protegida:
+
+```sql
+CASE WHEN f.timezone IN (SELECT name FROM pg_timezone_names)
+     THEN (:now AT TIME ZONE f.timezone)::date
+END
+```
+
+El `IN` del `WHERE` solo no alcanza: Postgres no garantiza en qué orden evalúa las condiciones y
+puede calcular `AT TIME ZONE` (que lanza error con una zona desconocida) antes de descartar la fila.
+El `CASE` sí garantiza el orden por fila: con una zona desconocida da `NULL`, la comparación da
+falso y el resto de los campos se evalúa igual. Una zona desconocida nunca aborta el ciclo.
 
 Implementación: con SQLAlchemy Core
 (`sqlalchemy.dialects.postgresql.insert(Notification).from_select([...], select_stmt)
@@ -72,7 +87,9 @@ Reglas de negocio (cubiertas por tests):
 
 `now` lo calcula el worker (`datetime.now(UTC)`) y se inyecta (testeable); "hoy" se deriva por campo en SQL.
 Además del warning de viejos, si se excluyen pronósticos con `issued_at` adelantado se loguea
-`future_forecasts count=<n> fields=<m> tolerance_minutes=<t>` (S12a).
+`future_forecasts count=<n> fields=<m> tolerance_minutes=<t>` (S12a). Ambos warnings salen de **una sola**
+consulta agregada con `FILTER`. Si hay campos con alertas activas cuya zona Postgres no reconoce, se
+saltean y se loguea `invalid_timezone_fields count=<n>`.
 
 ## Dispatcher — `app/jobs/dispatcher.py` (patrón lease)
 

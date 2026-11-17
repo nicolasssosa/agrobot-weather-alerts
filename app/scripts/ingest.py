@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import func, select
 
+from app.core.config import get_settings
 from app.core.db import get_engine, get_sessionmaker
 from app.core.logging import configure_logging
 from app.models import Field
@@ -40,11 +41,17 @@ async def _run(days: int) -> int:
     """Ingesta desde hoy (UTC), commitea y loguea el resultado."""
     now = datetime.now(UTC)
     start = now.date()
+    settings = get_settings()
     try:
         async with get_sessionmaker()() as session:
             field_count = await session.scalar(select(func.count()).select_from(Field))
             rows = await ingest_forecasts(
-                session, MockWeatherProvider(now=now), start=start, days=days, now=now
+                session,
+                MockWeatherProvider(now=now),
+                start=start,
+                days=days,
+                now=now,
+                future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
             )
             await session.commit()
         logger.info("forecasts_ingested rows=%d fields=%d", rows, field_count or 0)

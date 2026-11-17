@@ -7,7 +7,7 @@ from fastapi import APIRouter, Depends, status
 from app.api.deps import CurrentUser, SessionDep
 from app.models import Field
 from app.schemas.common import PaginationParams, protected_responses
-from app.schemas.field import FieldCreate, FieldPage, FieldRead
+from app.schemas.field import FIELDS_422_RESPONSE, FieldCreate, FieldPage, FieldRead
 from app.services.fields import create_field, get_field, list_fields
 
 router = APIRouter(prefix="/fields", tags=["fields"])
@@ -18,7 +18,10 @@ router = APIRouter(prefix="/fields", tags=["fields"])
     response_model=FieldRead,
     status_code=status.HTTP_201_CREATED,
     summary="Crear un campo",
-    responses=protected_responses((409, "Field name already exists")),
+    responses={
+        **protected_responses((409, "Field name already exists")),
+        422: FIELDS_422_RESPONSE,
+    },
 )
 async def create_field_endpoint(
     payload: FieldCreate,
