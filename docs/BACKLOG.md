@@ -172,8 +172,7 @@ Contrato: API.md §Convenciones y §fields, JOBS.md §Evaluador (paso 0).
 - [ ] 422 acotado: como máximo 20 errores en `detail` (los primeros, en el orden de FastAPI); si hay más, se agrega un último elemento `{"loc": [], "msg": "<n> more errors omitted", "type": "too_many_errors"}` con `n` = cantidad omitida. Con 20 o menos, la respuesta no cambia.
 - [ ] Settings nuevos en `config.py` y `.env.example`. OpenAPI regenerado si cambia algún texto; test de contrato verde.
 
-## S14b — Reintento manual de `failed` y job de retención · D16
-- [ ] `POST /api/v1/notifications/{id}/retry`: `failed` → `pending` (attempts 0, `next_attempt_at = now`); otro estado → 409; ajena → 404. Sigue valiendo la validación al enviar (D12).
+## S14b — Job de retención y follow-ups de S14a · D16
 - [ ] Job de retención en el worker con `RETENTION_DAYS` (default 30): borra `weather_forecasts` y `alert_day_states` con fecha anterior a hoy UTC − `RETENTION_DAYS` y las claves de idempotencia vencidas; las notificaciones se conservan.
 
 ## S15 — Observabilidad
