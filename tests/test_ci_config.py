@@ -303,6 +303,12 @@ def test_site_pins_swagger_ui_to_an_exact_version(site_html: str) -> None:
     assert len(set(versions)) == 1, "el CSS y el bundle deben usar la misma versión"
 
 
+def test_site_loads_swagger_ui_with_subresource_integrity(site_html: str) -> None:
+    """S16 SEC-2: el CSS y el bundle del CDN llevan `integrity` sha384 y `crossorigin`."""
+    assert len(re.findall(r'integrity="sha384-[A-Za-z0-9+/=]+"', site_html)) == 2
+    assert site_html.count('crossorigin="anonymous"') == 2
+
+
 def test_site_disables_try_it_out(site_html: str) -> None:
     """Criterio: sin "Try it out" (no hay backend público): `supportedSubmitMethods: []`."""
     assert re.search(r"supportedSubmitMethods:\s*\[\s*\]", site_html)
@@ -354,12 +360,12 @@ def test_pre_commit_is_not_a_project_dependency() -> None:
 
 
 def test_coverage_threshold_is_a_multiple_of_five() -> None:
-    """Criterio: `fail_under` en `[tool.coverage.report]`, múltiplo de 5."""
+    """Criterio: `fail_under` en `[tool.coverage.report]`, múltiplo de 5 y con un piso de 90."""
     data = tomllib.loads(PYPROJECT_PATH.read_text(encoding="utf-8"))
     fail_under = data["tool"]["coverage"]["report"]["fail_under"]
 
     assert isinstance(fail_under, int)
-    assert 0 < fail_under <= 100
+    assert 90 <= fail_under <= 100
     assert fail_under % 5 == 0
 
 
