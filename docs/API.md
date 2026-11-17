@@ -11,7 +11,11 @@ Base: `/api/v1` (excepto `/health`). JSON en todos lados. OpenAPI en `/docs`.
   no lo requieren.
 - **Ownership:** un recurso de otro usuario responde **404** (igual que si no existiera).
 - **Errores:** `{"detail": "..."}`. 404 `NotFoundError`, 409 `ConflictError`, 422 validación de FastAPI.
-- **Paginación** en listados: query `limit` (1..100, default 50) y `offset` (≥0, default 0).
+- **Paginación** en listados: query `limit` (1..100, default 50) y `offset` (0..10000, default 0).
+  Un `offset` mayor → 422: recorrer y descartar tantas filas es caro; más allá se pagina con filtros.
+- **Filtros por id** (`field_id`, `alert_id` en query): entero ≥ 1. Un valor fuera del rango BIGINT
+  → 422, pero ese tope es una validación interna y **no aparece como `maximum` en OpenAPI** (es un
+  límite técnico de la columna, no una regla para el cliente).
   Respuesta: `{"items": [...], "limit": 50, "offset": 0}` (schema genérico `Page[T]`).
 - **Fechas:** `date` ISO (`2026-11-20`); `datetime` ISO 8601 con zona.
 - Requests con campos desconocidos → 422 (`extra="forbid"`).
