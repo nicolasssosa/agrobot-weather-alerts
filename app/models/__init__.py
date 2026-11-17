@@ -4,6 +4,7 @@ from app.models.alert import Alert
 from app.models.base import Base
 from app.models.enums import EventType, NotificationStatus
 from app.models.field import Field
+from app.models.idempotency import IdempotencyKey
 from app.models.notification import Notification
 from app.models.user import User
 from app.models.weather import WeatherForecast
@@ -13,6 +14,7 @@ __all__ = [
     "Base",
     "EventType",
     "Field",
+    "IdempotencyKey",
     "Notification",
     "NotificationStatus",
     "User",

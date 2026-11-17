@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     # Tope de alertas vivas por campo (docs/API.md §alerts, "Límite").
     max_alerts_per_field: int = Field(default=10, ge=1, le=100)
 
+    # Vigencia de las respuestas guardadas con `Idempotency-Key` (docs/API.md).
+    idempotency_ttl_hours: int = Field(default=24, ge=1, le=168)
+
     # Background job
     worker_interval_seconds: PositiveInt = 60
     dispatch_batch_size: int = Field(default=100, ge=1, le=1000)

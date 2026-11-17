@@ -1,15 +1,17 @@
 """Dependencies compartidas de la API. Ver docs/API.md §Autenticación (simulada)."""
 
 import re
-from typing import Annotated
+from typing import Annotated, Any
 
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import Depends, Header, HTTPException, Security, status
+from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.db import get_session
 from app.models import User
 from app.schemas.common import AUTH_ERROR_DETAIL, BIGINT_MAX
+from app.services.idempotency import INVALID_KEY_DETAIL, IdempotentResult
 from app.services.users import get_user
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -60,3 +62,66 @@ async def get_current_user(
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
+
+# --- Idempotency-Key (docs/API.md §Idempotency-Key) --------------------------
+
+#: Header opcional: 1..255 caracteres ASCII imprimibles, sin espacios (ni controles).
+_IDEMPOTENCY_KEY_PATTERN = re.compile(r"[\x21-\x7E]{1,255}")
+
+#: Header de respuesta que marca un replay (solo en las respuestas repetidas).
+IDEMPOTENT_REPLAYED_HEADER: dict[str, Any] = {
+    "description": (
+        "`true` solo cuando el body es el replay de una respuesta guardada con el mismo "
+        "`Idempotency-Key` (no se volvió a ejecutar la operación)."
+    ),
+    "schema": {"type": "string", "enum": ["true"]},
+}
+
+
+def validate_idempotency_key(value: str) -> str:
+    """Valida el header; si no cumple, 422 con el `detail` exacto de la API."""
+    if _IDEMPOTENCY_KEY_PATTERN.fullmatch(value) is None:
+        # 422 literal: `status.HTTP_422_UNPROCESSABLE_ENTITY` está deprecado en Starlette.
+        raise HTTPException(status_code=422, detail=INVALID_KEY_DETAIL)
+    return value
+
+
+async def get_idempotency_key(
+    idempotency_key: Annotated[
+        str | None,
+        Header(
+            alias="Idempotency-Key",
+            description=(
+                "Header `Idempotency-Key` opcional para reintentos seguros "
+                "(1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el "
+                "mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); "
+                "con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave "
+                "es por usuario y por endpoint."
+            ),
+            examples=["7f5c2b1e-4a9d-4c3e-9f2a-1b8e6d0c4a51"],
+        ),
+    ] = None,
+) -> str | None:
+    """Resuelve y valida el header opcional `Idempotency-Key`."""
+    if idempotency_key is None:
+        return None
+    return validate_idempotency_key(idempotency_key)
+
+
+IdempotencyKeyDep = Annotated[str | None, Depends(get_idempotency_key)]
+
+
+def render_json_body(body: dict[str, Any]) -> str:
+    """Serializa el body con el mismo encoder que `JSONResponse` (replay byte a byte)."""
+    return bytes(JSONResponse(content=body).body).decode("utf-8")
+
+
+def idempotent_response(result: IdempotentResult) -> Response:
+    """Arma la respuesta con el status y el body guardados (o los recién generados)."""
+    headers = {"Idempotent-Replayed": "true"} if result.replayed else None
+    return Response(
+        content=result.body,
+        status_code=result.status_code,
+        media_type="application/json",
+        headers=headers,
+    )

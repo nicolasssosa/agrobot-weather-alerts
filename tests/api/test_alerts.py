@@ -881,26 +881,29 @@ async def test_the_409_comes_from_the_unique_violation_of_the_insert(
 ) -> None:
     """El duplicado se detecta capturando el IntegrityError del INSERT (no un SELECT previo).
 
-    Con un `commit` que falla con sqlstate 23505 (y `get_field` resuelto), el service solo
-    puede responder `ConflictError` si captura la violación de unicidad en el commit.
+    Con un `flush` que falla con sqlstate 23505 (y `get_field` resuelto), el service solo
+    puede responder `ConflictError` si captura la violación de unicidad al insertar.
     """
     user = await make_user()
     field = await make_field(user=user)
     payload = AlertCreate(field_id=field.id, event_type=EventType.FROST, threshold=70)
     unique_violation = IntegrityError("INSERT", {}, SimpleNamespace(sqlstate="23505"))
 
-    class _FailingCommitSession:
+    class _FailingFlushSession:
         rolled_back = False
 
         def add(self, instance: object) -> None:
             pass
 
         async def execute(self, _statement: object) -> SimpleNamespace:
-            # Lock/conteo de `create_alert`: el test solo ejercita add/commit/rollback.
+            # Lock/conteo de `create_alert`: el test solo ejercita add/flush/rollback.
             return SimpleNamespace(scalar_one=lambda: 0)
 
-        async def commit(self) -> None:
+        async def flush(self) -> None:
             raise unique_violation
+
+        async def commit(self) -> None:
+            pass
 
         async def rollback(self) -> None:
             self.rolled_back = True
@@ -909,10 +912,10 @@ async def test_the_409_comes_from_the_unique_violation_of_the_insert(
         return field
 
     monkeypatch.setattr("app.services.alerts.get_field", _fake_get_field)
-    session = _FailingCommitSession()
+    session = _FailingFlushSession()
 
     with pytest.raises(ConflictError) as exc_info:
-        # Sesión duck-typed: el test solo ejercita add/commit/rollback.
+        # Sesión duck-typed: el test solo ejercita add/flush/rollback.
         await create_alert(session, user.id, payload)  # type: ignore[arg-type]
 
     assert exc_info.value.detail == (

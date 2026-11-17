@@ -76,6 +76,17 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
         ("created_at", "timestamp with time zone", "NO", None, None, None),
         ("updated_at", "timestamp with time zone", "NO", None, None, None),
     ],
+    "idempotency_keys": [
+        ("id", "bigint", "NO", None, 64, 0),
+        ("user_id", "bigint", "YES", None, 64, 0),
+        ("scope", "character varying", "NO", 64, None, None),
+        ("key", "character varying", "NO", 255, None, None),
+        ("request_hash", "character", "NO", 64, None, None),
+        ("status_code", "smallint", "NO", None, 16, 0),
+        ("response_body", "text", "NO", None, None, None),
+        ("created_at", "timestamp with time zone", "NO", None, None, None),
+        ("expires_at", "timestamp with time zone", "NO", None, None, None),
+    ],
 }
 
 EXPECTED_UNIQUES: dict[str, set[frozenset[str]]] = {
@@ -85,6 +96,8 @@ EXPECTED_UNIQUES: dict[str, set[frozenset[str]]] = {
     # La unicidad de alerts pasó a un índice único parcial en `0003` (no es un constraint).
     "alerts": set(),
     "notifications": {frozenset({"alert_id", "forecast_date"})},
+    # `0004`: NULLS NOT DISTINCT (POST /users guarda user_id NULL).
+    "idempotency_keys": {frozenset({"user_id", "scope", "key"})},
 }
 
 EXPECTED_FKS = {
@@ -97,6 +110,13 @@ EXPECTED_FKS = {
         ("field_id",),
     ),
     ("alerts", "fk_alerts_field_id_fields", "fields", "c", ("field_id",)),
+    (
+        "idempotency_keys",
+        "fk_idempotency_keys_user_id_users",
+        "users",
+        "c",
+        ("user_id",),
+    ),
     (
         "notifications",
         "fk_notifications_alert_id_alerts",
@@ -140,6 +160,11 @@ EXPECTED_INDEXES = {
         "uq_notifications_alert_id_forecast_date",
         "ix_notifications_alert_id_created_at",
         "ix_notifications_pending_due",
+    },
+    "idempotency_keys": {
+        "pk_idempotency_keys",
+        "uq_idempotency_keys_user_id_scope_key",
+        "ix_idempotency_keys_expires_at",
     },
 }
 
@@ -187,6 +212,7 @@ async def test_primary_keys_are_bigint_identity_columns(db_session: AsyncSession
     assert [tuple(row) for row in rows] == [
         ("alerts", "id", "bigint", "BY DEFAULT"),
         ("fields", "id", "bigint", "BY DEFAULT"),
+        ("idempotency_keys", "id", "bigint", "BY DEFAULT"),
         ("notifications", "id", "bigint", "BY DEFAULT"),
         ("users", "id", "bigint", "BY DEFAULT"),
         ("weather_forecasts", "id", "bigint", "BY DEFAULT"),
@@ -293,6 +319,8 @@ async def test_required_column_defaults_match_data_model(db_session: AsyncSessio
     assert defaults[("notifications", "next_attempt_at")] == "now()"
     assert defaults[("notifications", "last_error")] is None
     assert defaults[("notifications", "sent_at")] is None
+    assert defaults[("idempotency_keys", "created_at")] == "now()"
+    assert defaults[("idempotency_keys", "expires_at")] is None
 
     # Las PK usan IDENTITY, no un DEFAULT.
     for table in EXPECTED_COLUMNS:
@@ -379,11 +407,11 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_then_0002_then_0003() -> None:
+def test_migration_chain_is_0001_then_0002_then_0003_then_0004() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0003"
+    assert script.get_current_head() == "0004"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
@@ -393,3 +421,6 @@ def test_migration_chain_is_0001_then_0002_then_0003() -> None:
     soft_delete = script.get_revision("0003")
     assert soft_delete is not None
     assert soft_delete.down_revision == "0002"
+    idempotency = script.get_revision("0004")
+    assert idempotency is not None
+    assert idempotency.down_revision == "0003"

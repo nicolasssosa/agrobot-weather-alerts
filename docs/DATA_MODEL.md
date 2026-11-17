@@ -179,7 +179,7 @@ Respuestas guardadas de los POST con `Idempotency-Key` (ver API.md §Idempotency
 | key            | VARCHAR(255) | no   | valor del header                                            |
 | request_hash   | CHAR(64)     | no   | SHA-256 del body validado y normalizado                     |
 | status_code    | SMALLINT     | no   | status de la respuesta guardada                             |
-| response_body  | JSONB        | no   | body de la respuesta guardada                               |
+| response_body  | TEXT         | no   | body serializado tal cual se respondió (replay byte a byte). En `POST /users` guarda solo `{"id": …}` (sin PII): el replay reconstruye la respuesta leyendo el usuario; si ya no existe, la clave se trata como nueva |
 | created_at     | TIMESTAMPTZ  | no   | default now()                                               |
 | expires_at     | TIMESTAMPTZ  | no   | `created_at + IDEMPOTENCY_TTL_HOURS`                        |
 

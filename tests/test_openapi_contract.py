@@ -144,6 +144,42 @@ def test_post_alerts_409_documents_the_per_field_limit() -> None:
     }
 
 
+_IDEMPOTENT_PATHS = ("/api/v1/users", "/api/v1/fields", "/api/v1/alerts")
+
+
+@pytest.mark.parametrize("path", _IDEMPOTENT_PATHS)
+def test_idempotent_posts_declare_the_key_and_replay_headers(path: str) -> None:
+    """S10: los tres POST documentan `Idempotency-Key` y `Idempotent-Replayed`."""
+    operation = _spec()["paths"][path]["post"]
+    key_headers = [
+        parameter
+        for parameter in operation.get("parameters", [])
+        if parameter["in"] == "header" and parameter["name"] == "Idempotency-Key"
+    ]
+    assert len(key_headers) == 1
+    key_header = key_headers[0]
+    assert key_header["required"] is False
+    assert "Idempotency-Key" in key_header["description"]
+    assert key_header["schema"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+
+    replay = operation["responses"]["201"]["headers"]["Idempotent-Replayed"]
+    assert replay["schema"] == {"type": "string", "enum": ["true"]}
+    assert "replay" in replay["description"]
+
+
+def test_only_idempotent_posts_declare_the_key_header() -> None:
+    spec = _spec()
+    declared = {
+        (method, path)
+        for method, path, operation in _operations(spec)
+        if any(
+            parameter["in"] == "header" and parameter["name"] == "Idempotency-Key"
+            for parameter in operation.get("parameters", [])
+        )
+    }
+    assert declared == {("post", path) for path in _IDEMPOTENT_PATHS}
+
+
 @pytest.mark.parametrize(("schema_name", "model"), _SCHEMA_MODELS.items())
 def test_examples_validate_against_their_models(schema_name: str, model: type[Any]) -> None:
     examples = _spec()["components"]["schemas"][schema_name].get("examples")

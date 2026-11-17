@@ -97,7 +97,7 @@ Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.p
 - [ ] Estado `cancelled` en notificaciones. El dispatcher, en el claim, cancela (sin enviar) las que ya no corresponden: alerta borrada, inactiva o probabilidad < umbral actual.
 - [ ] OpenAPI regenerado y contrato actualizado.
 
-## S10 — Idempotency-Key en los POST · D13
+## S10 — Idempotency-Key en los POST · D13 · ✅
 - [ ] Header opcional `Idempotency-Key` en `POST /users`, `/fields`, `/alerts`: replay de la respuesta original, 422 si el body cambió, vigencia 24 h, seguro ante requests concurrentes con la misma clave. Documentado en OpenAPI.
 
 ## S11 — Calidad de pronósticos · D14
@@ -156,3 +156,4 @@ Archivos: `.github/workflows/ci.yml`.
 | S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S16** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
 | S9 CR-2 | nit | Migración 0003 transaccional (bloquea escrituras mientras crea el índice); en producción con tablas grandes usar `CONCURRENTLY` / `NOT VALID` (documentado en DATA_MODEL) | — |
+| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | **S15** (logs) |

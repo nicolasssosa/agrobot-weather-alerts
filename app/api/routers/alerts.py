@@ -3,8 +3,16 @@
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, status
+from fastapi.responses import Response
 
-from app.api.deps import CurrentUser, SessionDep
+from app.api.deps import (
+    IDEMPOTENT_REPLAYED_HEADER,
+    CurrentUser,
+    IdempotencyKeyDep,
+    SessionDep,
+    idempotent_response,
+    render_json_body,
+)
 from app.models import Alert, EventType
 from app.schemas.alert import AlertCreate, AlertPage, AlertRead, AlertUpdate
 from app.schemas.common import (
@@ -22,8 +30,12 @@ from app.services.alerts import (
     list_alerts,
     update_alert,
 )
+from app.services.idempotency import run_idempotent
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
+
+#: Alcance de la clave de idempotencia: método + ruta (docs/API.md §Idempotency-Key).
+IDEMPOTENCY_SCOPE = "POST /api/v1/alerts"
 
 #: 409 de POST /alerts: unicidad y tope por campo comparten status pero no detalle.
 _CREATE_ALERT_409 = {
@@ -49,13 +61,31 @@ _CREATE_ALERT_409 = {
     responses={
         **protected_responses((404, "Field not found")),
         409: _CREATE_ALERT_409,
+        201: {"headers": {"Idempotent-Replayed": IDEMPOTENT_REPLAYED_HEADER}},
     },
 )
 async def create_alert_endpoint(
-    payload: AlertCreate, user: CurrentUser, session: SessionDep
-) -> Alert:
+    payload: AlertCreate,
+    user: CurrentUser,
+    session: SessionDep,
+    idempotency_key: IdempotencyKeyDep,
+) -> Alert | Response:
     """Crea una alerta del usuario autenticado."""
-    return await create_alert(session, user.id, payload)
+    if idempotency_key is None:
+        return await create_alert(session, user.id, payload)
+    result = await run_idempotent(
+        session,
+        user_id=user.id,
+        scope=IDEMPOTENCY_SCOPE,
+        key=idempotency_key,
+        request_model=payload,
+        operation=lambda: create_alert(session, user.id, payload, commit=False),
+        serializer=lambda alert: render_json_body(
+            AlertRead.model_validate(alert).model_dump(mode="json")
+        ),
+        status_code=status.HTTP_201_CREATED,
+    )
+    return idempotent_response(result)
 
 
 @router.get(

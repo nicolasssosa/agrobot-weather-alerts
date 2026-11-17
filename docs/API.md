@@ -42,7 +42,11 @@ de WhatsApp ante un corte de red.
 | Clave vencida (`IDEMPOTENCY_TTL_HOURS`, default 24) | Se trata como nueva |
 
 La clave es por usuario (`X-User-Id`) y por endpoint: la misma clave en otro endpoint o de otro
-usuario es independiente. En `POST /users` (sin autenticación) el alcance es el endpoint.
+usuario es independiente. En `POST /users` (sin autenticación) el alcance es el endpoint **más el
+contenido del body**: nadie puede ocupar la clave de otro cliente con un body distinto (en `/users`,
+misma clave + otro body se trata como una clave nueva, no como 422).
+El replay devuelve **exactamente los mismos bytes** que la respuesta original.
+Usá claves **aleatorias e impredecibles** (por ejemplo un UUID v4).
 "Mismo body" se compara sobre el request ya validado y normalizado (no importan espacios ni el
 orden de las claves del JSON).
 
