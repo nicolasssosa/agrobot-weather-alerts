@@ -99,6 +99,7 @@ refleja el último pronóstico.
 | event_type    | VARCHAR(32)   | no   | CHECK enum `event_type`                                    |
 | probability   | SMALLINT      | no   | CHECK `probability BETWEEN 0 AND 100` (name=`probability_range`) |
 | source        | VARCHAR(50)   | no   | proveedor que lo informó (ej. `mock`)                      |
+| issued_at     | TIMESTAMPTZ   | no   | cuándo lo **emitió el proveedor** (corrida del modelo). Mide la frescura del dato y ordena las actualizaciones (S11, migración 0005) |
 | fetched_at    | TIMESTAMPTZ   | no   | cuándo lo obtuvo la ingesta                                |
 | created_at    | TIMESTAMPTZ   | no   |                                                            |
 | updated_at    | TIMESTAMPTZ   | no   |                                                            |
@@ -166,6 +167,13 @@ Constraints / índices:
 - Índice `ix_notifications_alert_id_created_at` en `(alert_id, created_at)` (listado por usuario).
   El UNIQUE `(alert_id, forecast_date)` ya cubre búsquedas por `alert_id`, así que este es opcional;
   incluirlo.
+
+## Migración 0005 — frescura de pronósticos (S11)
+
+- `revision = "0005"`, `down_revision = "0004"`.
+- `weather_forecasts.issued_at TIMESTAMPTZ`: se agrega nullable, se completa con `fetched_at` para
+  las filas existentes y se pasa a `NOT NULL`.
+- `downgrade()`: elimina la columna.
 
 ## idempotency_keys (S10, migración 0004)
 

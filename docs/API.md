@@ -91,7 +91,7 @@ Query (todas opcionales): `date_from: date`, `date_to: date`, `event_type: Event
 Respuesta 200: `list[ForecastRead]`:
 ```json
 [{"forecast_date": "2026-11-17", "event_type": "frost", "probability": 72,
-  "source": "mock", "fetched_at": "2026-11-16T12:00:00Z"}]
+  "source": "mock", "issued_at": "2026-11-16T12:00:00Z", "fetched_at": "2026-11-16T12:05:13Z"}]
 ```
 404 si el campo no existe / no es del usuario.
 

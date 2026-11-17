@@ -17,7 +17,9 @@ idempotentes y seguros con varias réplicas del worker en paralelo.
 ## Evaluador — `app/jobs/evaluator.py`
 
 ```python
-async def evaluate_alerts(session: AsyncSession, *, today: date) -> int
+async def evaluate_alerts(
+    session: AsyncSession, *, today: date, now: datetime, max_forecast_age_hours: int,
+) -> int
 ```
 
 Una sola sentencia set-based (nada de traer filas a Python y loopear):
@@ -53,8 +55,13 @@ Reglas de negocio (cubiertas por tests):
 5. Correr dos veces no duplica (`UNIQUE (alert_id, forecast_date)`).
 6. Si la probabilidad baja y vuelve a subir para el mismo día, **no** se re-notifica (limitación
    documentada en README).
+7. **Pronósticos desactualizados no disparan** (S11, D14): solo se evalúan pronósticos con
+   `issued_at >= now - max_forecast_age_hours` (`MAX_FORECAST_AGE_HOURS`, default 24). Si para
+   alertas activas hay pronósticos en la ventana que quedaron afuera por viejos, se loguea un
+   **warning** `stale_forecasts count=<n> fields=<m> max_age_hours=<h>` (señal de que la ingesta no
+   está trayendo datos frescos). Se cuentan con una consulta agregada aparte (sin traer filas).
 
-`today` lo calcula el worker como `datetime.now(UTC).date()` y se inyecta (testeable).
+`today` y `now` los calcula el worker (`now = datetime.now(UTC)`, `today = now.date()`) y se inyectan (testeable).
 
 ## Dispatcher — `app/jobs/dispatcher.py` (patrón lease)
 
@@ -186,8 +193,14 @@ en `[start, start+days)` y **cada** `EventType`, una probabilidad determinístic
 `ingest_forecasts(session, provider, start=, days=, source="mock", field_ids=None) -> int`
 (`field_ids` opcional: si se pasa, solo ingesta esos campos):
 - Itera todos los `fields` ordenados por id, de a 500 (`.limit(500)` + `where id > last_id`).
-- Upsert con `postgresql.insert(...).on_conflict_do_update(index_elements=[field_id, forecast_date, event_type], set_={probability, source, fetched_at: func.now(), updated_at: func.now()})`.
-- Devuelve filas procesadas. No commitea.
+- Cada `ForecastPoint` trae `issued_at` (cuándo emitió el proveedor). El mock usa la hora de la
+  corrida del modelo: `now` UTC truncado a la hora.
+- Upsert **condicional** (S11, D14): `postgresql.insert(...).on_conflict_do_update(
+  index_elements=[field_id, forecast_date, event_type], set_={probability, source, issued_at,
+  fetched_at: func.now(), updated_at: func.now()}, where=WeatherForecast.issued_at < excluded.issued_at)`.
+  Un dato **igual o más viejo** que el guardado no lo pisa (lotes atrasados, reintentos).
+- Devuelve las filas **escritas** (insertadas o actualizadas); las descartadas por viejas se loguean
+  como `forecasts_skipped_older count=<n>`. No commitea.
 
 `python -m app.scripts.ingest [--days 14]`: ingesta desde `datetime.now(UTC).date()` y commit.
 
