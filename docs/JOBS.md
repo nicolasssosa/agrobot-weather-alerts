@@ -18,7 +18,8 @@ idempotentes y seguros con varias réplicas del worker en paralelo.
 
 ```python
 async def evaluate_alerts(
-    session: AsyncSession, *, today: date, now: datetime, max_forecast_age_hours: int,
+    session: AsyncSession, *, now: datetime, horizon_days: int, max_forecast_age_hours: int,
+    future_tolerance_minutes: int,
 ) -> int
 ```
 
@@ -29,11 +30,14 @@ INSERT INTO notifications
     (alert_id, forecast_date, event_type, probability, threshold, status, next_attempt_at)
 SELECT a.id, wf.forecast_date, wf.event_type, wf.probability, a.threshold, 'pending', now()
 FROM alerts a
+JOIN fields f ON f.id = a.field_id   -- zona horaria del campo (S12a)
 JOIN weather_forecasts wf
   ON wf.field_id = a.field_id
  AND wf.event_type = a.event_type
 WHERE a.is_active AND a.deleted_at IS NULL   -- predicado igual al del índice parcial ix_alerts_active_field_event (S9)
-  AND wf.forecast_date >= :today                      -- todos los días futuros (incluye hoy)
+  AND wf.forecast_date >= (:now AT TIME ZONE f.timezone)::date                -- "hoy" LOCAL del campo (S12a, D9)
+  AND (:horizon_days = 0
+       OR wf.forecast_date < (:now AT TIME ZONE f.timezone)::date + :horizon_days)  -- horizonte (D2)
   AND wf.probability   >= a.threshold                 -- "a partir de" => >=
 ON CONFLICT (alert_id, forecast_date) DO NOTHING
 RETURNING id;
@@ -50,7 +54,9 @@ Contar **sin materializar** las filas: envolver el insert en un CTE y contar en 
 Reglas de negocio (cubiertas por tests):
 1. `probability >= threshold` dispara; `probability < threshold` no.
 2. Alertas inactivas no disparan.
-3. Fechas pasadas (`< today`) no disparan; **todas** las futuras sí (el enunciado no define horizonte).
+3. Fechas pasadas respecto del **"hoy" local del campo** no disparan; se evalúan los días en
+   `[hoy_local, hoy_local + ALERT_HORIZON_DAYS)` (default 7; `0` = sin límite). Ejemplo: a las 22:00
+   de Buenos Aires (01:00 UTC del día siguiente) "hoy" sigue siendo el día local.
 4. Solo matchea mismo campo y mismo `event_type`.
 5. Correr dos veces no duplica (`UNIQUE (alert_id, forecast_date)`).
 6. Si la probabilidad baja y vuelve a subir para el mismo día, **no** se re-notifica (limitación
@@ -64,7 +70,9 @@ Reglas de negocio (cubiertas por tests):
    (`probability >= threshold`) de no ser viejos; `fields` = campos distintos.
    Defensa adicional: tampoco se evalúan pronósticos con `issued_at > now + FORECAST_FUTURE_TOLERANCE_MINUTES`.
 
-`today` y `now` los calcula el worker (`now = datetime.now(UTC)`, `today = now.date()`) y se inyectan (testeable).
+`now` lo calcula el worker (`datetime.now(UTC)`) y se inyecta (testeable); "hoy" se deriva por campo en SQL.
+Además del warning de viejos, si se excluyen pronósticos con `issued_at` adelantado se loguea
+`future_forecasts count=<n> fields=<m> tolerance_minutes=<t>` (S12a).
 
 ## Dispatcher — `app/jobs/dispatcher.py` (patrón lease)
 

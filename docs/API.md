@@ -70,11 +70,13 @@ Respuesta **201** `UserRead`: `{"id", "phone_number", "name", "created_at"}`.
 ### `POST /api/v1/fields`
 Request `FieldCreate`:
 ```json
-{"name": "Lote Norte", "latitude": -34.6037, "longitude": -58.3816}
+{"name": "Lote Norte", "latitude": -34.6037, "longitude": -58.3816, "timezone": "America/Argentina/Buenos_Aires"}
 ```
 - `name` 1..120 (strip), `latitude` [-90, 90], `longitude` [-180, 180] (`float` en el schema).
+- `timezone` opcional (default `America/Argentina/Buenos_Aires`): zona IANA válida; inválida → 422.
+  Define el "hoy" del campo para evaluar sus alertas.
 
-Respuesta **201** `FieldRead`: `{"id", "name", "latitude", "longitude", "created_at"}`.
+Respuesta **201** `FieldRead`: `{"id", "name", "latitude", "longitude", "timezone", "created_at"}`.
 409 si el usuario ya tiene un campo con ese nombre.
 
 ### `GET /api/v1/fields` → 200 `Page[FieldRead]`

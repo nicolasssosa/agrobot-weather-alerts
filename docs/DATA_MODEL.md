@@ -80,6 +80,7 @@ Campo (lote/establecimiento) de un usuario.
 | name       | VARCHAR(120)  | no   |                                         |
 | latitude   | NUMERIC(9,6)  | no   | CHECK `latitude BETWEEN -90 AND 90` (name=`latitude_range`)     |
 | longitude  | NUMERIC(9,6)  | no   | CHECK `longitude BETWEEN -180 AND 180` (name=`longitude_range`) |
+| timezone   | VARCHAR(64)   | no   | zona IANA del campo (default `America/Argentina/Buenos_Aires`); define el "hoy" local del campo (S12a, migración 0007). Se valida en la API con `zoneinfo` |
 | created_at | TIMESTAMPTZ   | no   |                                         |
 | updated_at | TIMESTAMPTZ   | no   |                                         |
 
@@ -167,6 +168,13 @@ Constraints / índices:
 - Índice `ix_notifications_alert_id_created_at` en `(alert_id, created_at)` (listado por usuario).
   El UNIQUE `(alert_id, forecast_date)` ya cubre búsquedas por `alert_id`, así que este es opcional;
   incluirlo.
+
+## Migración 0007 — zona horaria por campo (S12a)
+
+- `revision = "0007"`, `down_revision = "0006"`.
+- `fields.timezone VARCHAR(64) NOT NULL DEFAULT 'America/Argentina/Buenos_Aires'` (server default:
+  las filas existentes la toman sin backfill explícito).
+- `downgrade()`: elimina la columna.
 
 ## Migración 0005 — frescura de pronósticos (S11)
 
