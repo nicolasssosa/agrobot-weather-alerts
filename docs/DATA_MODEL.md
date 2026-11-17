@@ -167,6 +167,25 @@ Constraints / índices:
   El UNIQUE `(alert_id, forecast_date)` ya cubre búsquedas por `alert_id`, así que este es opcional;
   incluirlo.
 
+## idempotency_keys (S10, migración 0004)
+
+Respuestas guardadas de los POST con `Idempotency-Key` (ver API.md §Idempotency-Key).
+
+| columna        | tipo         | null | notas                                                       |
+|----------------|--------------|------|-------------------------------------------------------------|
+| id             | BIGINT       | no   | PK identity                                                 |
+| user_id        | BIGINT       | sí   | FK → users.id ON DELETE CASCADE; NULL en `POST /users`      |
+| scope          | VARCHAR(64)  | no   | método + ruta, ej. `POST /api/v1/alerts`                    |
+| key            | VARCHAR(255) | no   | valor del header                                            |
+| request_hash   | CHAR(64)     | no   | SHA-256 del body validado y normalizado                     |
+| status_code    | SMALLINT     | no   | status de la respuesta guardada                             |
+| response_body  | JSONB        | no   | body de la respuesta guardada                               |
+| created_at     | TIMESTAMPTZ  | no   | default now()                                               |
+| expires_at     | TIMESTAMPTZ  | no   | `created_at + IDEMPOTENCY_TTL_HOURS`                        |
+
+- `UNIQUE (user_id, scope, key) NULLS NOT DISTINCT` (PostgreSQL ≥ 15).
+- Índice en `expires_at` (purga en S14).
+
 ## Migración 0003 — alertas: borrado lógico y varios umbrales (S9)
 
 - `revision = "0003"`, `down_revision = "0002"`.

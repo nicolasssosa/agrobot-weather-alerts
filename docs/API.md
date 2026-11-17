@@ -25,6 +25,27 @@ Ejecuta `SELECT 1` contra la base.
 - 200 `{"status": "ok"}`
 - 503 `{"status": "unavailable"}` si la query falla (capturar la excepción, loguearla).
 
+## Idempotency-Key (S10)
+
+`POST /api/v1/users`, `POST /api/v1/fields` y `POST /api/v1/alerts` aceptan el header opcional
+`Idempotency-Key` (1–255 caracteres ASCII imprimibles, sin espacios; si no cumple → 422
+`{"detail": "Invalid Idempotency-Key"}`). Pensado para clientes que reintentan, como el gateway
+de WhatsApp ante un corte de red.
+
+| Caso | Respuesta |
+|------|-----------|
+| Primera vez con la clave | Se ejecuta normalmente; si responde 2xx se guarda la respuesta |
+| Misma clave + mismo body (dentro de la vigencia) | **La misma respuesta guardada** (status y body), sin volver a ejecutar; header `Idempotent-Replayed: true` |
+| Misma clave + body distinto | 422 `{"detail": "Idempotency-Key reused with a different request"}` |
+| Dos requests simultáneos con la misma clave | Se serializan: uno ejecuta, el otro recibe el replay |
+| La operación falla (404/409/422) | No se guarda la clave: el cliente puede corregir y reintentar con la misma |
+| Clave vencida (`IDEMPOTENCY_TTL_HOURS`, default 24) | Se trata como nueva |
+
+La clave es por usuario (`X-User-Id`) y por endpoint: la misma clave en otro endpoint o de otro
+usuario es independiente. En `POST /users` (sin autenticación) el alcance es el endpoint.
+"Mismo body" se compara sobre el request ya validado y normalizado (no importan espacios ni el
+orden de las claves del JSON).
+
 ## users
 
 ### `POST /api/v1/users` — sin auth
