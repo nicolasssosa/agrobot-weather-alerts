@@ -1,0 +1,137 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Una corrida por rama: un push nuevo al mismo PR cancela la corrida vieja. En `main` no se
+# cancelan: un deploy de Pages en curso debe terminar.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# Permisos mínimos a nivel workflow; solo el job de deploy agrega los de Pages (solo lectura).
+permissions:
+  contents: read
+
+env:
+  # El service de abajo crea esta base: no hace falta el init script del compose local.
+  TEST_DATABASE_URL: postgresql+asyncpg://postgres:postgres@localhost:5432/agrobot_test
+  ENVIRONMENT: test
+
+jobs:
+  test:
+    name: Lint, typecheck y tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: agrobot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d agrobot_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar uv (con cache)
+        uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+
+      - name: Instalar dependencias (Python según .python-version)
+        run: uv sync --frozen
+
+      - name: ruff check
+        run: uv run ruff check .
+
+      - name: ruff format --check
+        run: uv run ruff format --check .
+
+      - name: mypy
+        run: uv run mypy app
+
+      - name: Contrato OpenAPI
+        run: uv run pytest tests/test_openapi_contract.py
+
+      - name: Tests con cobertura
+        run: >-
+          uv run pytest
+          --cov=app
+          --cov-report=term
+          --cov-report=xml
+          --cov-report=html
+
+      - name: Subir el reporte HTML de cobertura
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-html
+          path: htmlcov/
+          retention-days: 7
+
+  docker:
+    name: Docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: docker build (sin push)
+        run: docker build --tag agrobot-alerts:ci .
+
+  pages-build:
+    name: Armar el sitio de GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [test, docker]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bajar el HTML de cobertura del job de tests
+        uses: actions/download-artifact@v4
+        with:
+          name: coverage-html
+          path: _site/coverage
+
+      - name: Armar _site (Swagger UI + OpenAPI + cobertura)
+        run: |
+          mkdir -p _site
+          cp site/index.html _site/index.html
+          cp docs/openapi.json _site/openapi.json
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  pages-deploy:
+    name: Deploy a GitHub Pages
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: pages-build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    # Sin cancelar: un deploy en curso nunca se interrumpe.
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

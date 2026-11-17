@@ -132,15 +132,31 @@ Archivos: `app/schemas/common.py`, `app/api/routers/alerts.py`, `app/api/routers
 ## S15 — Observabilidad
 - [ ] Logs JSON estructurados con `request_id`; métricas Prometheus (`/metrics`); `GET /health/live` y `/health/ready` (DB + heartbeat del worker).
 
-## S16 — CI (GitHub Actions) + pre-commit + cobertura · RNF-07
-Archivos: `.github/workflows/ci.yml`.
-- [ ] Trigger en `pull_request` y `push` a `main`.
-- [ ] Job con service `postgres:16-alpine` (crea `agrobot_test`), `astral-sh/setup-uv`, `uv sync --frozen`, `ruff check`, `ruff format --check`, `mypy app`, `pytest`.
-- [ ] Job `docker build` (sin push) para validar el Dockerfile.
-- [ ] Permisos mínimos (`permissions: contents: read`), acciones pinneadas por versión mayor, cache de uv.
-- [ ] Job que verifica el contrato OpenAPI (corre el test de contrato de S8).
-- [ ] Follow-up S7 SEC-3: `worker --once` le pasa `stop_event` a `run_cycle` (+ test).
-- [ ] Follow-up S7 SEC-5: declarar `ENVIRONMENT` explícito en el `app-env` del compose y que el seed exija `ENVIRONMENT` definida (o flag `--yes-demo`).
+## S16 — CI (GitHub Actions) + pre-commit + cobertura + GitHub Pages · RNF-07
+Archivos: `.github/workflows/ci.yml` (nuevo), `site/index.html` (nuevo), `.pre-commit-config.yaml` (nuevo),
+`pyproject.toml` + `uv.lock` (dependencia dev `pytest-cov` y config de cobertura), `Makefile` (target `cov`),
+`.gitignore` (salidas de cobertura), `app/jobs/worker.py` (SEC-3), `app/scripts/seed.py` (SEC-5),
+`docker-compose.yml` (SEC-5), tests.
+
+CI:
+- [ ] Trigger en `pull_request` y `push` a `main`; `concurrency` por ref que cancela corridas viejas del mismo PR.
+- [ ] Job `test`: service `postgres:16-alpine` con healthcheck, crea `agrobot_test`; `astral-sh/setup-uv` con cache de uv; `uv sync --frozen`; `ruff check`, `ruff format --check`, `mypy app`, `pytest` con cobertura (`--cov=app`, reporte en terminal, XML y HTML). `TEST_DATABASE_URL` apunta al service.
+- [ ] Cobertura con umbral mínimo en `pyproject.toml` (`[tool.coverage.report] fail_under`): el valor medido en esta historia redondeado hacia abajo al múltiplo de 5. El HTML se sube como artifact del workflow.
+- [ ] El test de contrato OpenAPI de S8 corre como paso propio y visible (`pytest tests/test_openapi_contract.py`) antes de la suite completa.
+- [ ] Job `docker`: `docker build` (sin push) para validar el Dockerfile.
+- [ ] Permisos mínimos: `permissions: contents: read` a nivel workflow; solo el job de deploy agrega `pages: write` e `id-token: write`. Acciones pinneadas por versión mayor. Sin secretos.
+
+GitHub Pages (solo en `push` a `main`, después de que `test` y `docker` pasen):
+- [ ] Job `pages-build`: arma el sitio en `_site/` con `site/index.html` (Swagger UI estático que carga `openapi.json`), `docs/openapi.json` copiado a `_site/openapi.json` y el reporte HTML de cobertura en `_site/coverage/`; lo sube con `actions/upload-pages-artifact`.
+- [ ] Job `pages-deploy`: `actions/deploy-pages`, `environment: github-pages`, `concurrency: pages` sin cancelar un deploy en curso.
+- [ ] `site/index.html`: Swagger UI desde un CDN con versión exacta pinneada (`swagger-ui-dist@<x.y.z>`), sin "Try it out" (no hay backend público: `supportedSubmitMethods: []`), link visible al reporte de cobertura. Funciona servido desde un subpath (`/<repo>/`): rutas relativas.
+
+Pre-commit:
+- [ ] `.pre-commit-config.yaml` con los hooks de ruff (check con `--fix` y format) pinneados por tag; `pre-commit` no se agrega como dependencia del proyecto (se instala aparte, documentado en el propio archivo).
+
+Follow-ups:
+- [ ] S7 SEC-3: `worker --once` le pasa `stop_event` a `run_cycle` (+ test: con el evento seteado no arranca un lote nuevo).
+- [ ] S7 SEC-5: el seed exige `ENVIRONMENT` definida explícitamente (variable de entorno o `.env`; se detecta con `model_fields_set` de los settings) o el flag `--yes-demo`; si no, aborta con mensaje claro y exit code ≠ 0. `ENVIRONMENT: local` declarado en el `app-env` del compose. Tests de los tres casos.
 
 ## S17 — README final, `make demo`, Postman y review integral · Owner: PM
 - [ ] README: cómo correr (compose y local), arquitectura, decisiones (de `REQUIREMENTS.md` §6), trade-offs, qué faltó / próximos pasos.
@@ -172,3 +188,5 @@ Archivos: `.github/workflows/ci.yml`.
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
 | S9 CR-2 | nit | Migración 0003 transaccional (bloquea escrituras mientras crea el índice); en producción con tablas grandes usar `CONCURRENTLY` / `NOT VALID` (documentado en DATA_MODEL) | — |
 | S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | **S15** (logs) |
+| S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | S17 |
+| S16 CR-1 | minor | El primer deploy de Pages requiere Pages habilitado con source "GitHub Actions" (el `GITHUB_TOKEN` no puede habilitarlo) | paso único al hacer público el repo |

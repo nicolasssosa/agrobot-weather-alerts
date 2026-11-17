@@ -22,6 +22,7 @@ services:
     build: .
     command: ["alembic", "upgrade", "head"]
     environment: &app-env
+      ENVIRONMENT: local
       DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/agrobot
       LOG_LEVEL: INFO
       WORKER_INTERVAL_SECONDS: 30

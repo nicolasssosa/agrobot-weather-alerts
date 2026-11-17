@@ -1,0 +1,19 @@
+# Hooks de ruff para correr antes de cada commit.
+#
+# `pre-commit` NO es dependencia del proyecto (no está en `pyproject.toml`): se instala
+# aparte y se activa en cada clone.
+#
+#   uv tool install pre-commit   # o: pipx install pre-commit
+#   pre-commit install
+#
+# Correr sobre todo el repo una vez: `pre-commit run --all-files`.
+# El `rev` sigue a la versión de ruff fijada en uv.lock.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.5
+    hooks:
+      - id: ruff
+        name: ruff check (--fix)
+        args: [--fix]
+      - id: ruff-format
+        name: ruff format

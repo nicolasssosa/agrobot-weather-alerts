@@ -4,7 +4,8 @@ Crea los usuarios, campos y alertas de docs/JOBS.md §Seed, corre la ingesta moc
 desde hoy (UTC) **solo sobre los 3 campos del seed** y commitea. Es idempotente: busca cada
 fila por su clave natural antes de crearla, así que correrlo N veces no duplica ni falla.
 
-Guarda de entorno: en `staging`/`production` sale con error sin tocar la base (S7 SEC-1).
+Guarda de entorno: exige `ENVIRONMENT` explícita (variable de entorno o `.env`) o el flag
+`--yes-demo`, y sale con error sin tocar la base en `staging`/`production` (S7 SEC-1/SEC-5).
 
 Limitación: no es seguro ante dos corridas concurrentes (check-then-insert). Es un script de
 demo one-shot; no se diseñó para ejecutarse en paralelo (S7 CR-1).
@@ -97,13 +98,25 @@ class SeedSummary:
     forecast_rows: int
 
 
-def _ensure_environment_is_safe() -> None:
-    """Aborta en `staging`/`production`: el seed es de demo y pisa pronósticos reales."""
-    environment = get_settings().environment
+def _ensure_environment_is_safe(*, yes_demo: bool = False) -> None:
+    """Aborta en `staging`/`production` y exige una `ENVIRONMENT` explícita (S7 SEC-5).
+
+    `environment` tiene default `local`, así que una denylist sola dejaría pasar una corrida
+    sin configurar contra una base que puede no ser de demo. Se exige que el valor venga de la
+    variable de entorno o del `.env` (`model_fields_set` lo delata) o el flag `--yes-demo`.
+    """
+    settings = get_settings()
+    environment = settings.environment
     if environment in _UNSAFE_ENVIRONMENTS:
         raise SystemExit(
             f"seed abortado: environment={environment!r} no está permitido. "
             "Este script es solo para demo local/test."
+        )
+    if not yes_demo and "environment" not in settings.model_fields_set:
+        raise SystemExit(
+            "seed abortado: ENVIRONMENT no está definida explícitamente. "
+            "Exportala (por ejemplo ENVIRONMENT=local) o corré el seed con --yes-demo "
+            "si sabés que la base es de demo."
         )
 
 
@@ -153,15 +166,17 @@ async def seed(
     *,
     now: datetime | None = None,
     days: int = SEED_DAYS,
+    yes_demo: bool = False,
 ) -> SeedSummary:
     """Crea (o reutiliza) los datos demo, ingesta pronósticos y commitea.
 
     `now` fija el día de inicio de la ingesta (en producción, hoy UTC). No commitea antes de
     terminar, así una falla de la ingesta no deja medios datos sueltos: el seed es una sola
     transacción. La ingesta mock se limita a los campos del seed, así no pisa pronósticos de
-    otros campos (S7 SEC-1). No es seguro ante dos corridas concurrentes (S7 CR-1).
+    otros campos (S7 SEC-1). Exige `ENVIRONMENT` explícita o `yes_demo=True` (S7 SEC-5).
+    No es seguro ante dos corridas concurrentes (S7 CR-1).
     """
-    _ensure_environment_is_safe()
+    _ensure_environment_is_safe(yes_demo=yes_demo)
     settings = get_settings()
     moment = now if now is not None else datetime.now(UTC)
     start = moment.date()
@@ -258,10 +273,10 @@ def _print_summary(summary: SeedSummary) -> None:
         )
 
 
-async def _run(now: datetime | None = None) -> SeedSummary:
+async def _run(now: datetime | None = None, *, yes_demo: bool = False) -> SeedSummary:
     """Ejecuta el seed y libera el engine del proceso."""
     try:
-        return await seed(get_sessionmaker(), now=now)
+        return await seed(get_sessionmaker(), now=now, yes_demo=yes_demo)
     finally:
         await get_engine().dispose()
         # Igual que ingest.py: un segundo `main()` en el mismo proceso no debe reusar el pool
@@ -274,8 +289,13 @@ def main(argv: Sequence[str] | None = None) -> None:
     """Punto de entrada del script."""
     configure_logging()
     parser = argparse.ArgumentParser(description="Crea los datos demo y los pronósticos mock")
-    parser.parse_args(argv)
-    _print_summary(asyncio.run(_run()))
+    parser.add_argument(
+        "--yes-demo",
+        action="store_true",
+        help="corre el seed sin ENVIRONMENT explícita (solo si la base es de demo)",
+    )
+    args = parser.parse_args(argv)
+    _print_summary(asyncio.run(_run(yes_demo=args.yes_demo)))
 
 
 if __name__ == "__main__":

@@ -6,6 +6,7 @@ que las cantidades absolutas son las del seed y no las de la base compartida.
 
 from datetime import UTC, datetime
 from decimal import Decimal
+from pathlib import Path
 
 import pytest
 from sqlalchemy import func, select
@@ -29,6 +30,7 @@ from app.scripts.seed import (
     SeedSummary,
     SeedUser,
     _print_summary,
+    main,
     seed,
 )
 from tests.conftest import FakeNotifier
@@ -38,6 +40,16 @@ NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
 #: ventana de frescura del pronóstico emitido en `NOW` (S11).
 CLAIM_NOW = datetime(2030, 1, 1, 12, 1, tzinfo=UTC)
 EXPECTED_FORECASTS = 14 * 5 * 3
+
+
+@pytest.fixture(autouse=True)
+def _explicit_demo_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Los tests de este módulo corren como una demo con `ENVIRONMENT` explícita (S7 SEC-5).
+
+    Los casos de la guarda la pisan o la quitan según lo que prueban.
+    """
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: Settings(_env_file=None))
 
 
 async def test_seed_then_one_worker_cycle_sends_notifications(
@@ -137,6 +149,125 @@ async def test_seed_aborts_in_unsafe_environments_without_touching_the_database(
 
     assert await db_session.scalar(select(func.count()).select_from(User)) == 0
     assert await db_session.scalar(select(func.count()).select_from(WeatherForecast)) == 0
+
+
+async def test_seed_requires_an_explicit_environment(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S7 SEC-5: sin `ENVIRONMENT` (ni `.env`) y sin `--yes-demo` aborta antes de tocar la base."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: Settings(_env_file=None))
+
+    with pytest.raises(SystemExit) as excinfo:
+        await seed(test_sessionmaker, now=NOW)
+
+    message = str(excinfo.value)
+    assert "ENVIRONMENT" in message
+    assert "--yes-demo" in message
+    assert await db_session.scalar(select(func.count()).select_from(User)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(WeatherForecast)) == 0
+
+
+async def test_seed_runs_with_an_explicit_environment(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S7 SEC-5: con `ENVIRONMENT` definida explícitamente el seed corre sin el flag."""
+    monkeypatch.setenv("ENVIRONMENT", "local")
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: Settings(_env_file=None))
+
+    summary = await seed(test_sessionmaker, now=NOW)
+
+    assert summary.forecast_rows == EXPECTED_FORECASTS
+    assert len((await db_session.scalars(select(User))).all()) == 2
+
+
+async def test_seed_runs_with_yes_demo_without_an_environment(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S7 SEC-5: `--yes-demo` (acá `yes_demo=True`) es la salida explícita para una demo."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    settings = Settings(_env_file=None)
+    assert "environment" not in settings.model_fields_set
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: settings)
+
+    summary = await seed(test_sessionmaker, now=NOW, yes_demo=True)
+
+    assert summary.forecast_rows == EXPECTED_FORECASTS
+    assert len((await db_session.scalars(select(Alert))).all()) == 4
+
+
+async def test_seed_counts_an_environment_from_the_env_file_as_explicit(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """S7 SEC-5: `ENVIRONMENT` en `.env` es explícita; no hace falta exportarla ni el flag."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    env_file = tmp_path / ".env"
+    env_file.write_text("ENVIRONMENT=test\n", encoding="utf-8")
+    settings = Settings(_env_file=env_file)
+    assert "environment" in settings.model_fields_set
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: settings)
+
+    summary = await seed(test_sessionmaker, now=NOW)
+
+    assert summary.forecast_rows == EXPECTED_FORECASTS
+    assert len((await db_session.scalars(select(User))).all()) == 2
+
+
+@pytest.mark.parametrize("environment", ["staging", "production"])
+async def test_yes_demo_does_not_bypass_the_unsafe_environment_guard(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    monkeypatch: pytest.MonkeyPatch,
+    environment: str,
+) -> None:
+    """S7 SEC-5: `--yes-demo` habilita la demo, no la denylist de staging/production."""
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: Settings(environment=environment))
+
+    with pytest.raises(SystemExit, match=environment):
+        await seed(test_sessionmaker, now=NOW, yes_demo=True)
+
+    assert await db_session.scalar(select(func.count()).select_from(User)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(WeatherForecast)) == 0
+
+
+def test_main_forwards_yes_demo_to_the_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S7 SEC-5: el CLI `--yes-demo` llega al seed; sin el flag queda en `False`."""
+    captured: list[bool] = []
+
+    async def fake_run(now: datetime | None = None, *, yes_demo: bool = False) -> SeedSummary:
+        captured.append(yes_demo)
+        return SeedSummary(users=(), fields=(), alerts=(), forecast_rows=0)
+
+    monkeypatch.setattr("app.scripts.seed._run", fake_run)
+    monkeypatch.setattr("app.scripts.seed._print_summary", lambda summary: None)
+    monkeypatch.setattr("app.scripts.seed.configure_logging", lambda: None)
+
+    main(["--yes-demo"])
+    main([])
+
+    assert captured == [True, False]
+
+
+def test_main_without_environment_exits_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:
+    """S7 SEC-5: el CLI aborta con exit code ≠ 0 si `ENVIRONMENT` no está definida."""
+    monkeypatch.delenv("ENVIRONMENT", raising=False)
+    monkeypatch.setattr("app.scripts.seed.get_settings", lambda: Settings(_env_file=None))
+    monkeypatch.setattr("app.scripts.seed.configure_logging", lambda: None)
+
+    with pytest.raises(SystemExit) as excinfo:
+        main([])
+
+    assert excinfo.value.code not in (0, None)
+    assert "ENVIRONMENT" in str(excinfo.value)
 
 
 async def test_seed_does_not_touch_forecasts_of_foreign_fields(
@@ -276,7 +407,7 @@ async def test_seed_forwards_the_configured_future_tolerance(
     monkeypatch.setattr("app.scripts.seed.ingest_forecasts", _fake_ingest)
     monkeypatch.setattr(
         "app.scripts.seed.get_settings",
-        lambda: Settings(forecast_future_tolerance_minutes=23),
+        lambda: Settings(environment="local", forecast_future_tolerance_minutes=23),
     )
 
     summary = await seed(test_sessionmaker, now=NOW)

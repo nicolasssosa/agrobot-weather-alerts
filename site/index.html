@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Agrobot — Alertas Climáticas · API</title>
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui.css"
+      integrity="sha384-wxLW6kwyHktdDGr6Pv1zgm/VGJh99lfUbzSn6HNHBENZlCN7W602k9VkGdxuFvPn"
+      crossorigin="anonymous"
+    />
+    <style>
+      body {
+        margin: 0;
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      }
+
+      .site-header {
+        padding: 1.25rem 2rem;
+        background: #14210f;
+        color: #f4f7f1;
+        border-bottom: 4px solid #4c9a2a;
+      }
+
+      .site-header h1 {
+        margin: 0 0 0.35rem;
+        font-size: 1.35rem;
+      }
+
+      .site-header p {
+        margin: 0.25rem 0;
+        color: #cdd8c6;
+        font-size: 0.9rem;
+      }
+
+      .site-header a {
+        color: #a8e063;
+        font-weight: 600;
+        text-decoration: underline;
+      }
+    </style>
+  </head>
+  <body>
+    <header class="site-header">
+      <h1>Agrobot — Alertas Climáticas</h1>
+      <p>
+        Contrato OpenAPI de la API. Sitio estático: no hay backend público, así que
+        <strong>“Try it out” está deshabilitado</strong>.
+      </p>
+      <p><a href="coverage/index.html">Ver el reporte de cobertura de tests</a></p>
+    </header>
+    <div id="swagger-ui"></div>
+    <script
+      src="https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.17.14/swagger-ui-bundle.js"
+      integrity="sha384-wmyclcVGX/WhUkdkATwhaK1X1JtiNrr2EoYJ+diV3vj4v6OC5yCeSu+yW13SYJep"
+      crossorigin="anonymous"
+    ></script>
+    <script>
+      // Rutas relativas: el sitio se sirve desde `/<repo>/` en GitHub Pages.
+      window.ui = SwaggerUIBundle({
+        url: "openapi.json",
+        dom_id: "#swagger-ui",
+        supportedSubmitMethods: [],
+        presets: [SwaggerUIBundle.presets.apis],
+        layout: "BaseLayout",
+        deepLinking: true,
+      });
+    </script>
+  </body>
+</html>

@@ -612,7 +612,14 @@ async def test_create_field_rejects_zones_that_postgres_does_not_know_exactly(
     [
         # Nombre canónico y alias histórico de la tz database: Postgres los conoce.
         ("America/Argentina/Buenos_Aires", 201),
-        ("America/Buenos_Aires", 201),
+        pytest.param(
+            "America/Buenos_Aires",
+            201,
+            marks=pytest.mark.skipif(
+                not _zoneinfo_resolves("America/Buenos_Aires"),
+                reason="la tz database de este SO no trae el alias legacy",
+            ),
+        ),
         ("UTC", 201),
     ],
 )

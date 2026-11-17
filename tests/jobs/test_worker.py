@@ -253,6 +253,39 @@ async def test_run_cycle_does_not_start_a_new_batch_after_stop_event(
     assert statuses.count(NotificationStatus.PENDING) == 2
 
 
+async def test_run_cycle_skips_all_batches_when_the_event_is_set_during_evaluation(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    fake_notifier: FakeNotifier,
+    monkeypatch,
+) -> None:  # type: ignore[no-untyped-def]
+    """S7 SEC-3: un SIGTERM durante la evaluación no arranca ni el primer lote."""
+    stop_event = asyncio.Event()
+    dispatch_calls: list[dict[str, object]] = []
+
+    async def evaluate_and_stop(session, **kwargs):  # type: ignore[no-untyped-def]
+        stop_event.set()
+        return 0
+
+    async def dispatch_that_must_not_run(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
+        dispatch_calls.append(kwargs)
+        return DispatchResult(sent=0, retried=0, failed=0)
+
+    monkeypatch.setattr(worker, "evaluate_alerts", evaluate_and_stop)
+    monkeypatch.setattr(worker, "dispatch_pending", dispatch_that_must_not_run)
+
+    result = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        _settings(),
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+        stop_event=stop_event,
+    )
+
+    assert result.dispatch == DispatchResult(sent=0, retried=0, failed=0)
+    assert dispatch_calls == []
+
+
 async def test_run_cycle_stops_draining_when_a_batch_changes_nothing(
     test_sessionmaker: async_sessionmaker[AsyncSession],
     fake_notifier: FakeNotifier,
@@ -681,9 +714,11 @@ def test_sigint_and_sigterm_set_the_stop_event() -> None:
 def test_main_once_runs_a_single_cycle(monkeypatch) -> None:  # type: ignore[no-untyped-def]
     """`main(["--once"])` corre un ciclo y sale (sin loop infinito ni DB real)."""
     calls: list[Settings] = []
+    stop_events: list[asyncio.Event | None] = []
 
-    async def fake_cycle(sessionmaker, notifier, settings):  # type: ignore[no-untyped-def]
+    async def fake_cycle(sessionmaker, notifier, settings, *, stop_event=None):
         calls.append(settings)
+        stop_events.append(stop_event)
         return CycleResult(created=3, dispatch=DispatchResult(0, 0, 0))
 
     monkeypatch.setattr(worker, "run_cycle", fake_cycle)
@@ -692,6 +727,94 @@ def test_main_once_runs_a_single_cycle(monkeypatch) -> None:  # type: ignore[no-
     worker.main(["--once"])
 
     assert len(calls) == 1
+    # S7 SEC-3: `--once` pasa el evento real de shutdown al ciclo.
+    assert len(stop_events) == 1
+    assert isinstance(stop_events[0], asyncio.Event)
+
+
+def test_main_once_hands_the_cycle_the_event_wired_to_the_signals(monkeypatch) -> None:
+    """S7 SEC-3: el evento de `--once` es el mismo que setean SIGINT/SIGTERM."""
+    installed: list[asyncio.Event] = []
+    received: list[asyncio.Event | None] = []
+
+    real_install = worker._install_stop_handlers
+
+    def spy_install(stop_event, loop=None):  # type: ignore[no-untyped-def]
+        installed.append(stop_event)
+        real_install(stop_event, loop)
+
+    async def fake_cycle(sessionmaker, notifier, settings, *, stop_event=None):  # type: ignore[no-untyped-def]
+        received.append(stop_event)
+        return CycleResult(created=0, dispatch=DispatchResult(0, 0, 0))
+
+    monkeypatch.setattr(worker, "_install_stop_handlers", spy_install)
+    monkeypatch.setattr(worker, "run_cycle", fake_cycle)
+    monkeypatch.setattr(worker, "configure_logging", lambda: None)
+
+    worker.main(["--once"])
+
+    assert len(installed) == 1
+    assert len(received) == 1
+    assert received[0] is installed[0]
+    assert isinstance(installed[0], asyncio.Event)
+
+
+def test_main_once_with_the_stop_event_set_starts_no_dispatch_batch(monkeypatch) -> None:
+    """S7 SEC-3: con el `stop_event` seteado, el ciclo de `--once` no arranca ningún lote."""
+    batches: list[int] = []
+
+    async def fake_evaluate(session: object, **kwargs: object) -> int:
+        return 0
+
+    async def recording_dispatch(sessionmaker, notifier, **kwargs):
+        batches.append(1)
+        return DispatchResult(sent=0, retried=0, failed=0)
+
+    real_run_cycle = worker.run_cycle
+
+    async def cycle_that_gets_sigterm(sessionmaker, notifier, settings, **kwargs):
+        stop_event = kwargs["stop_event"]
+        assert isinstance(stop_event, asyncio.Event)
+        stop_event.set()  # SIGTERM justo al arrancar el único ciclo
+        return await real_run_cycle(sessionmaker, notifier, settings, **kwargs)
+
+    class _NoopSession:
+        """Sesión mínima para el ciclo real: solo necesita `commit()` y el contexto async."""
+
+        async def __aenter__(self) -> "_NoopSession":
+            return self
+
+        async def __aexit__(self, *exc_info: object) -> None:
+            return None
+
+        async def commit(self) -> None:
+            return None
+
+    class _FakeEngine:
+        async def dispose(self) -> None:
+            return None
+
+    def fake_get_engine() -> _FakeEngine:
+        return _FakeEngine()
+
+    fake_get_engine.cache_clear = lambda: None  # type: ignore[attr-defined]
+
+    def fake_get_sessionmaker() -> Callable[[], _NoopSession]:
+        return _NoopSession
+
+    fake_get_sessionmaker.cache_clear = lambda: None  # type: ignore[attr-defined]
+
+    monkeypatch.setattr(worker, "evaluate_alerts", fake_evaluate)
+    monkeypatch.setattr(worker, "dispatch_pending", recording_dispatch)
+    monkeypatch.setattr(worker, "run_cycle", cycle_that_gets_sigterm)
+    monkeypatch.setattr(worker, "get_engine", fake_get_engine)
+    monkeypatch.setattr(worker, "get_sessionmaker", fake_get_sessionmaker)
+    monkeypatch.setattr(worker, "get_settings", lambda: _settings())
+    monkeypatch.setattr(worker, "configure_logging", lambda: None)
+
+    worker.main(["--once"])
+
+    assert batches == []
 
 
 def test_main_once_disposes_the_engine_when_the_cycle_fails(monkeypatch) -> None:  # type: ignore[no-untyped-def]
@@ -713,7 +836,7 @@ def test_main_once_disposes_the_engine_when_the_cycle_fails(monkeypatch) -> None
 
     fake_get_sessionmaker.cache_clear = lambda: None  # type: ignore[attr-defined]
 
-    async def failing_cycle(smaker, notifier, settings):  # type: ignore[no-untyped-def]
+    async def failing_cycle(smaker, notifier, settings, **kwargs):  # type: ignore[no-untyped-def]
         assert smaker is sessionmaker
         raise RuntimeError("boom")
 

@@ -182,7 +182,7 @@ async def _run(settings: Settings, notifier: Notifier, *, once: bool) -> None:
     _install_stop_handlers(stop_event, loop)
     try:
         if once:
-            await run_cycle(sessionmaker, notifier, settings)
+            await run_cycle(sessionmaker, notifier, settings, stop_event=stop_event)
         else:
             await run_forever(sessionmaker, notifier, settings, stop_event)
     finally:
