@@ -198,9 +198,14 @@ Follow-ups:
 - [ ] S7 SEC-3: `worker --once` le pasa `stop_event` a `run_cycle` (+ test: con el evento seteado no arranca un lote nuevo).
 - [ ] S7 SEC-5: el seed exige `ENVIRONMENT` definida explícitamente (variable de entorno o `.env`; se detecta con `model_fields_set` de los settings) o el flag `--yes-demo`; si no, aborta con mensaje claro y exit code ≠ 0. `ENVIRONMENT: local` declarado en el `app-env` del compose. Tests de los tres casos.
 
-## S17 — README final, `make demo`, Postman y review integral · Owner: PM
-- [ ] README: cómo correr (compose y local), arquitectura, decisiones (de `REQUIREMENTS.md` §6), trade-offs, qué faltó / próximos pasos.
-- [ ] Verificación end-to-end con `docker compose up --build`.
+## S17 — README final, `make demo` y cierre · RNF-09 · Owner: PM · ✅
+Archivos: `README.md`, `Makefile` (target `demo`), `.github/workflows/ci.yml` (S16 SEC-1),
+`.github/dependabot.yml` (nuevo), `tests/test_ci_config.py` (contrato de pinneo), `docs/`.
+- [x] README: cómo levantarlo (un comando, compose y local), cómo probar la API, problemas comunes, arquitectura y flujo de punta a punta (Mermaid), episodios, ciclo de vida de una notificación, modelo de datos, garantías de concurrencia, configuración y decisiones.
+- [x] `make demo`: stack en Docker + seed + un ciclo del job + notificaciones enviadas; idempotente.
+- [x] Colección para Postman/Insomnia: se importa `docs/openapi.json` (con ejemplos válidos, verificado por el test de contrato); no se mantiene una colección aparte.
+- [x] Verificación end-to-end con `docker compose up --build` sobre un volumen nuevo: migraciones, health, seed idempotente, alta de usuario/campo/alerta, replay de `Idempotency-Key`, 401/404/422, ingesta, ciclo del worker con digest por usuario, `GET /notifications` y apagado limpio con SIGTERM.
+- [x] Follow-up S16 SEC-1: acciones pinneadas por SHA con la versión exacta en comentario + Dependabot para `github-actions` (tests de contrato).
 
 ---
 
@@ -213,23 +218,23 @@ Follow-ups:
 | S1 CR-2 | nit | Derivar la lista de valores del CHECK de `event_type` de `EventType` en vez de repetirla | próxima migración |
 | S1 CR-1 | nit | Migración: nombres de PK/UQ/FK explícitos vs. CHECK en forma base (inconsistencia sin impacto) | — |
 | S2 SEC-4 | minor | Surrogate UTF-16 suelto en un string → el 422 de FastAPI no serializa → 500. Fix: handler global de `RequestValidationError` que sanee `input` (cubre también NaN/surrogates en schemas futuros) | ✅ resuelto en S4 |
-| S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | README §Próximos pasos |
+| S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | aceptado (abierto) |
 | S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | ✅ documentado en API.md §Convenciones |
 | S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | ✅ resuelto en S4 |
-| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
+| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | aceptado (abierto) |
 | S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | **S14a** |
 | S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | **S14a** (`MAX_FIELDS_PER_USER`; el horizonte ya está en S12a) |
-| S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
-| S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | README §Limitaciones |
-| S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | README §Próximos pasos |
+| S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | aceptado (abierto) |
+| S5 CR-4 | nit | Carrera con PATCH `is_active=false`: una corrida en curso puede notificar una alerta recién pausada (aislamiento por snapshot, at-least-once) | aceptado (abierto) |
+| S6 SEC-5 | minor | Enmascarado de `last_error` optimizado para Argentina: formatos nacionales de otros países y separadores Unicode raros pueden quedar en claro. Fix: fallback que enmascare toda secuencia de ≥ 8 dígitos | aceptado (abierto) |
 | S7 SEC-3 | minor | `worker --once` no le pasa `stop_event` a `run_cycle`: un SIGTERM espera a drenar toda la cola (riesgo de SIGKILL y reenvío al vencer el lease). Fix de una línea + test | **S16** |
-| S7 SEC-4 | minor | El seed reutiliza un usuario existente con el teléfono demo (aunque sea real) y le agrega datos mock. Fix: abortar si el nombre no coincide o usar un rango de teléfonos no asignable | README §Limitaciones |
+| S7 SEC-4 | minor | El seed reutiliza un usuario existente con el teléfono demo (aunque sea real) y le agrega datos mock. Fix: abortar si el nombre no coincide o usar un rango de teléfonos no asignable | aceptado (abierto) |
 | S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S16** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
 | S9 CR-2 | nit | Migración 0003 transaccional (bloquea escrituras mientras crea el índice); en producción con tablas grandes usar `CONCURRENTLY` / `NOT VALID` (documentado en DATA_MODEL) | — |
-| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | README §Próximos pasos |
-| S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | S17 |
+| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | aceptado (abierto) |
+| S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | ✅ resuelto en S17 |
 | S16 CR-1 | minor | El primer deploy de Pages requiere Pages habilitado con source "GitHub Actions" (el `GITHUB_TOKEN` no puede habilitarlo) | paso único al hacer público el repo |
-| S12b CR-2 | nit | Tests de lock/carrera de S12b: si una regresión deja un PATCH colgado, el cleanup puede bloquearse en vez de fallar (agregar `statement_timeout` en el cleanup o cancelar la task) | S17 (S16 ya mergeada) |
-| S14a CR-4 | minor | `update_alert` decide el re-armado con la lectura previa al lock compartido: dos PATCH simultáneos sobre la misma alerta pueden perder un re-armado (re-aviso perdido hasta que la probabilidad baje del margen) o hacer uno de más. Fix: releer la alerta con `FOR UPDATE` bajo el lock | README §Limitaciones |
-| S14a CR-5 | nit | Si el `rollback()` del worker tras `evaluation_failed` lanza (conexión caída), ese ciclo no despacha. Fix: proteger el rollback con su propio try/except | README §Limitaciones |
+| S12b CR-2 | nit | Tests de lock/carrera de S12b: si una regresión deja un PATCH colgado, el cleanup puede bloquearse en vez de fallar (agregar `statement_timeout` en el cleanup o cancelar la task) | abierto (solo afecta a los tests) |
+| S14a CR-4 | minor | `update_alert` decide el re-armado con la lectura previa al lock compartido: dos PATCH simultáneos sobre la misma alerta pueden perder un re-armado (re-aviso perdido hasta que la probabilidad baje del margen) o hacer uno de más. Fix: releer la alerta con `FOR UPDATE` bajo el lock | aceptado (abierto) |
+| S14a CR-5 | nit | Si el `rollback()` del worker tras `evaluation_failed` lanza (conexión caída), ese ciclo no despacha. Fix: proteger el rollback con su propio try/except | aceptado (abierto) |

@@ -1,6 +1,6 @@
 # Requerimientos — Sistema de Alertas Climáticas
 
-Owner: PM · Estado: **Aprobado para desarrollo** (pendiente de sign-off del usuario) · 2026-11-16
+Owner: PM · Estado: **Implementado** (S1–S17) · 2026-11-17
 
 ## 1. Contexto
 
@@ -91,7 +91,7 @@ una notificación cuando los pronósticos almacenados superen ese umbral.
 - `docker compose up --build` levanta db + migraciones + api + worker sin pasos manuales.
 - `make seed && make jobs-once` genera notificaciones `sent` visibles en `GET /api/v1/notifications`.
 - `make check` (lint + typecheck + tests) en verde, y CI en verde en cada PR.
-- README explica cómo correrlo, las decisiones y lo que quedó afuera.
+- README explica cómo correrlo, cómo funciona y las decisiones.
 
 ## 9. Trazabilidad
 
