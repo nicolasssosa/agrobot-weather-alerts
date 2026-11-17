@@ -55,6 +55,8 @@ class WeatherForecast(Base, TimestampMixin):
     )
     probability: Mapped[int] = mapped_column(SmallInteger, nullable=False)
     source: Mapped[str] = mapped_column(String(50), nullable=False)
+    #: Corrida del modelo que emitió el dato (S11): mide la frescura y ordena el upsert.
+    issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
     field: Mapped["Field"] = relationship(back_populates="forecasts", lazy="raise")

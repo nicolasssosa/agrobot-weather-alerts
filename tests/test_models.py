@@ -272,8 +272,8 @@ async def test_latitude_and_longitude_boundaries_are_accepted(make_field: MakeFi
     [
         (
             "INSERT INTO weather_forecasts"
-            " (field_id, forecast_date, event_type, probability, source, fetched_at)"
-            " VALUES (:field_id, :day, 'tornado', 50, 'mock', now())"
+            " (field_id, forecast_date, event_type, probability, source, issued_at, fetched_at)"
+            " VALUES (:field_id, :day, 'tornado', 50, 'mock', now(), now())"
         ),
         "INSERT INTO alerts (field_id, event_type, threshold) VALUES (:field_id, 'tornado', 50)",
         (

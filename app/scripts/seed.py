@@ -162,7 +162,8 @@ async def seed(
     otros campos (S7 SEC-1). No es seguro ante dos corridas concurrentes (S7 CR-1).
     """
     _ensure_environment_is_safe()
-    start = (now if now is not None else datetime.now(UTC)).date()
+    moment = now if now is not None else datetime.now(UTC)
+    start = moment.date()
     async with sessionmaker() as session:
         users_by_phone: dict[str, User] = {}
         for phone_number, name in _USER_SEEDS:
@@ -193,10 +194,12 @@ async def seed(
 
         forecast_rows = await ingest_forecasts(
             session,
-            MockWeatherProvider(),
+            # La corrida del seed es la corrida del modelo: `issued_at` determinista (S11).
+            MockWeatherProvider(now=moment),
             start=start,
             days=days,
             field_ids=[field.id for field in fields_by_key.values()],
+            now=moment,
         )
         await session.commit()
 

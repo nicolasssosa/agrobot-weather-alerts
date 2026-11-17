@@ -64,7 +64,8 @@ class ForecastRead(BaseModel):
                     "event_type": "frost",
                     "probability": 72,
                     "source": "mock",
-                    "fetched_at": "2026-11-16T12:00:00Z",
+                    "issued_at": "2026-11-16T12:00:00Z",
+                    "fetched_at": "2026-11-16T12:05:13Z",
                 }
             ],
         },
@@ -74,4 +75,5 @@ class ForecastRead(BaseModel):
     event_type: EventType
     probability: int
     source: str
+    issued_at: datetime
     fetched_at: datetime

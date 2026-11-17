@@ -3,13 +3,17 @@
 Ver docs/TESTING.md §test_forecasts y docs/API.md §forecasts.
 """
 
-from datetime import date, datetime, timedelta
+import random
+from datetime import UTC, date, datetime, timedelta
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import EventType
+from app.models import EventType, User
 from app.schemas.common import BIGINT_MAX
+from app.weather.ingestion import ingest_forecasts
+from app.weather.provider import MockWeatherProvider
 from tests.conftest import MakeField, MakeForecast, MakeUser, auth
 
 DAY = date(2026, 11, 16)
@@ -397,11 +401,30 @@ async def test_response_exposes_only_the_documented_fields(
     body = response.json()
     assert len(body) == 1
     item = body[0]
-    assert set(item) == {"forecast_date", "event_type", "probability", "source", "fetched_at"}
+    assert set(item) == {
+        "forecast_date",
+        "event_type",
+        "probability",
+        "source",
+        "issued_at",
+        "fetched_at",
+    }
+    # Orden del ejemplo de docs/API.md §forecasts.
+    assert list(item) == [
+        "forecast_date",
+        "event_type",
+        "probability",
+        "source",
+        "issued_at",
+        "fetched_at",
+    ]
     assert item["forecast_date"] == DAY.isoformat()
     assert item["event_type"] == "heat_wave"
     assert item["probability"] == 72
     assert item["source"] == "mock"
+    issued_at = datetime.fromisoformat(item["issued_at"].replace("Z", "+00:00"))
+    assert issued_at.tzinfo is not None
+    assert abs((issued_at - forecast.issued_at).total_seconds()) < 1
     fetched_at = datetime.fromisoformat(item["fetched_at"].replace("Z", "+00:00"))
     assert fetched_at.tzinfo is not None
     assert abs((fetched_at - forecast.fetched_at).total_seconds()) < 1
@@ -456,3 +479,70 @@ async def test_date_range_is_validated_before_ownership(
     # El 422 del query param gana sobre el 404 del ownership (docs/API.md §forecasts).
     assert response.status_code == 422
     assert response.json() == {"detail": "date_from must be <= date_to"}
+
+
+# --- `issued_at` visible y actualizado por la ingesta (S11, D14) --------------
+
+
+ISSUED_AT = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+LATER = datetime(2026, 11, 16, 13, 0, tzinfo=UTC)
+EARLIER = datetime(2026, 11, 16, 11, 0, tzinfo=UTC)
+
+
+async def _frost_row(client: AsyncClient, field_id: int, user: User) -> tuple[datetime, int]:
+    """Devuelve `(issued_at, probability)` del único pronóstico de helada del campo."""
+    response = await client.get(
+        f"{_url(field_id)}?event_type={EventType.FROST.value}", headers=auth(user)
+    )
+    assert response.status_code == 200
+    [item] = response.json()
+    issued_at = datetime.fromisoformat(item["issued_at"].replace("Z", "+00:00"))
+    return issued_at, item["probability"]
+
+
+async def test_issued_at_is_updated_by_a_newer_reingest_and_kept_by_an_older_one(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+) -> None:
+    """`GET /forecasts` expone el `issued_at` vigente: sube con una reingesta nueva y no
+    retrocede con un lote atrasado (S11, D14)."""
+    user = await make_user()
+    field = await make_field(user=user)
+
+    await ingest_forecasts(
+        db_session,
+        MockWeatherProvider(seed=1, now=ISSUED_AT),
+        start=DAY,
+        days=1,
+        field_ids=[field.id],
+        now=LATER,
+    )
+    assert (await _frost_row(client, field.id, user))[0] == ISSUED_AT
+
+    await ingest_forecasts(
+        db_session,
+        MockWeatherProvider(seed=2, now=LATER),
+        start=DAY,
+        days=1,
+        source="newer",
+        field_ids=[field.id],
+        now=LATER,
+    )
+    newer_issued_at, newer_probability = await _frost_row(client, field.id, user)
+    assert newer_issued_at == LATER
+    assert newer_probability == random.Random(
+        f"2:{field.id}:{DAY.isoformat()}:{EventType.FROST.value}"
+    ).randint(0, 100)
+
+    await ingest_forecasts(
+        db_session,
+        MockWeatherProvider(seed=3, now=EARLIER),
+        start=DAY,
+        days=1,
+        source="older",
+        field_ids=[field.id],
+        now=LATER,
+    )
+    assert await _frost_row(client, field.id, user) == (newer_issued_at, newer_probability)

@@ -19,7 +19,15 @@ from sqlalchemy import Select, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from app.core.pii import mask_phone_in_text
-from app.models import Alert, EventType, Field, Notification, NotificationStatus, User
+from app.models import (
+    Alert,
+    EventType,
+    Field,
+    Notification,
+    NotificationStatus,
+    User,
+    WeatherForecast,
+)
 from app.notifiers.base import NotificationMessage, Notifier
 
 logger = logging.getLogger(__name__)
@@ -40,7 +48,8 @@ class DispatchResult:
     sent: int
     retried: int
     failed: int
-    #: Notificaciones que ya no correspondía enviar (alerta borrada/inactiva/umbral).
+    #: Notificaciones que ya no correspondía enviar (alerta borrada/inactiva/umbral o
+    #: pronóstico vencido).
     cancelled: int = 0
 
 
@@ -99,17 +108,19 @@ def _backoff_seconds(attempts: int, backoff_base_seconds: int) -> int:
 
 
 def _claim_statement(
-    now: datetime, batch_size: int
-) -> Select[tuple[Notification, str, str, datetime | None, bool, int]]:
+    now: datetime, batch_size: int, max_forecast_age_hours: int
+) -> Select[tuple[Notification, str, str, datetime | None, bool, int, datetime | None]]:
     """SELECT del lote vencido, con teléfono, campo y estado actual de la alerta (sin N+1).
 
     El predicado de estado es una igualdad (`status == PENDING`) para que el planner pueda
     usar el índice parcial `ix_notifications_pending_due ... WHERE status = 'pending'`.
     `FOR UPDATE OF notifications` lockea solo la cola: `alerts`/`fields`/`users` no se lockean.
     Se traen `deleted_at`, `is_active` y `threshold` de la alerta para la re-validación (D12)
-    dentro de la misma transacción del claim.
+    y el `issued_at` del pronóstico vigente para la de frescura (S11, D14), todo en la misma
+    transacción del claim. El LEFT JOIN no cambia la fila base: la clave natural
+    `(field_id, forecast_date, event_type)` es única en `weather_forecasts`.
     """
-    return (
+    statement = (
         select(
             Notification,
             User.phone_number,
@@ -117,10 +128,17 @@ def _claim_statement(
             Alert.deleted_at,
             Alert.is_active,
             Alert.threshold,
+            WeatherForecast.issued_at,
         )
         .join(Alert, Alert.id == Notification.alert_id)
         .join(Field, Field.id == Alert.field_id)
         .join(User, User.id == Field.user_id)
+        .outerjoin(
+            WeatherForecast,
+            (WeatherForecast.field_id == Alert.field_id)
+            & (WeatherForecast.event_type == Notification.event_type)
+            & (WeatherForecast.forecast_date == Notification.forecast_date),
+        )
         .where(
             Notification.status == NotificationStatus.PENDING,
             Notification.next_attempt_at <= now,
@@ -129,6 +147,9 @@ def _claim_statement(
         .limit(batch_size)
         .with_for_update(of=Notification, skip_locked=True)
     )
+    # SQLAlchemy tipa `issued_at` como no nulo; el `LEFT JOIN` lo vuelve opcional cuando el
+    # pronóstico vigente ya no existe (CR-2).
+    return statement  # type: ignore[return-value]
 
 
 def _cancellation_reason(
@@ -137,11 +158,15 @@ def _cancellation_reason(
     alert_is_active: bool,
     probability: int,
     alert_threshold: int,
+    forecast_issued_at: datetime | None,
+    stale_forecast_before: datetime,
 ) -> str | None:
-    """Motivo por el que una notificación reclamada ya no corresponde enviarse (D12).
+    """Motivo por el que una notificación reclamada ya no corresponde enviarse (D12/S11).
 
-    El orden importa: una alerta borrada gana sobre una inactiva, y una inactiva gana sobre el
-    umbral (así `last_error` es determinístico).
+    El orden importa: una alerta borrada gana sobre una inactiva, una inactiva gana sobre el
+    umbral y el estado de la alerta gana sobre la frescura (así `last_error` es determinístico).
+    Un pronóstico ausente o emitido antes de `now - max_forecast_age_hours` ya no sirve para
+    el aviso: la notificación se cancela como `stale_forecast` sin enviarse.
     """
     if alert_deleted_at is not None:
         return "alert_deleted"
@@ -149,6 +174,8 @@ def _cancellation_reason(
         return "alert_inactive"
     if probability < alert_threshold:
         return "below_current_threshold"
+    if forecast_issued_at is None or forecast_issued_at < stale_forecast_before:
+        return "stale_forecast"
     return None
 
 
@@ -158,12 +185,15 @@ async def _claim_batch(
     now: datetime,
     batch_size: int,
     lease_seconds: int,
+    max_forecast_age_hours: int,
 ) -> tuple[list[ClaimedNotification], int]:
     """Transacción 1: reclama el lote con `SKIP LOCKED`, valida y arrienda; commitea.
 
-    Además del lease, re-verifica contra la alerta **actual** (S9, D12): las notificaciones
-    cuya alerta está borrada, inactiva o ya no alcanza el umbral vigente pasan a `cancelled`
-    con su motivo en `last_error` y no se envían. Todo ocurre en esta misma transacción corta.
+    Además del lease, re-verifica contra la alerta **actual** (S9, D12) y contra la frescura
+    del pronóstico vigente (S11, D14): las notificaciones cuya alerta está borrada, inactiva,
+    ya no alcanza el umbral vigente, o cuyo pronóstico no existe o es más viejo que
+    `now - max_forecast_age_hours` pasan a `cancelled` con su motivo en `last_error` y no se
+    envían. Todo ocurre en esta misma transacción corta.
 
     El commit libera los locks: nadie espera a la red con una transacción abierta.
     `lease_until = now + lease_seconds` se calcula una sola vez por lote; ese valor exacto es el
@@ -171,10 +201,13 @@ async def _claim_batch(
     real del claim: reusar un `now` viejo haría nacer el lease ya vencido.
     """
     lease_until = now + timedelta(seconds=lease_seconds)
+    stale_forecast_before = now - timedelta(hours=max_forecast_age_hours)
     claimed: list[ClaimedNotification] = []
     cancellations: dict[str, list[int]] = {}
     async with sessionmaker() as session:
-        rows = (await session.execute(_claim_statement(now, batch_size))).all()
+        rows = (
+            await session.execute(_claim_statement(now, batch_size, max_forecast_age_hours))
+        ).all()
         for (
             notification,
             phone_number,
@@ -182,12 +215,15 @@ async def _claim_batch(
             alert_deleted_at,
             alert_is_active,
             alert_threshold,
+            forecast_issued_at,
         ) in rows:
             reason = _cancellation_reason(
                 alert_deleted_at=alert_deleted_at,
                 alert_is_active=alert_is_active,
                 probability=notification.probability,
                 alert_threshold=alert_threshold,
+                forecast_issued_at=forecast_issued_at,
+                stale_forecast_before=stale_forecast_before,
             )
             if reason is not None:
                 cancellations.setdefault(reason, []).append(notification.id)
@@ -347,11 +383,13 @@ async def dispatch_pending(
     timeout_seconds: float,
     concurrency: int,
     lease_seconds: int,
+    max_forecast_age_hours: int,
 ) -> DispatchResult:
     """Envía hasta `batch_size` notificaciones pendientes vencidas (patrón lease).
 
-    1. Claim + lease + validación contra la alerta actual en una transacción corta: las que
-       ya no corresponden pasan a `cancelled` sin enviarse (se cuentan en `cancelled`).
+    1. Claim + lease + validación contra la alerta actual y la frescura del pronóstico en una
+       transacción corta: las que ya no corresponden (alerta borrada/inactiva/umbral o
+       `stale_forecast`) pasan a `cancelled` sin enviarse (se cuentan en `cancelled`).
     2. Envío en paralelo acotado (`concurrency`) con timeout por mensaje, sin transacción.
     3. Resultados en otra transacción corta: `sent`, reintento con backoff exponencial o
        `failed` al agotar `max_attempts`.
@@ -359,13 +397,18 @@ async def dispatch_pending(
     `now` es la hora del claim y debe ser la hora real de ese momento: **nunca** se reutiliza
     entre lotes, porque el lease se calcula como `now + lease_seconds` y uno viejo nacería
     vencido. Si es `None` se toma `clock()`. `clock()` es además la hora real con la que se
-    registran `sent_at` y el backoff. `CancelledError` se propaga (shutdown); las filas
-    arrendadas se reintentan al vencer el lease.
+    registran `sent_at` y el backoff. `max_forecast_age_hours` define la frescura mínima del
+    pronóstico vigente al momento del claim (S11, D14). `CancelledError` se propaga (shutdown);
+    las filas arrendadas se reintentan al vencer el lease.
     """
     claim_now = now if now is not None else clock()
     started = time.perf_counter()
     claimed, cancelled = await _claim_batch(
-        sessionmaker, now=claim_now, batch_size=batch_size, lease_seconds=lease_seconds
+        sessionmaker,
+        now=claim_now,
+        batch_size=batch_size,
+        lease_seconds=lease_seconds,
+        max_forecast_age_hours=max_forecast_age_hours,
     )
     if claimed:
         outcomes = await _send_batch(

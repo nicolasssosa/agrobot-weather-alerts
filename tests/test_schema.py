@@ -49,6 +49,8 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
         ("fetched_at", "timestamp with time zone", "NO", None, None, None),
         ("created_at", "timestamp with time zone", "NO", None, None, None),
         ("updated_at", "timestamp with time zone", "NO", None, None, None),
+        # `0005` agrega la columna al final (ADD COLUMN): el orden físico es el de la migración.
+        ("issued_at", "timestamp with time zone", "NO", None, None, None),
     ],
     "alerts": [
         ("id", "bigint", "NO", None, 64, 0),
@@ -407,11 +409,11 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_then_0002_then_0003_then_0004() -> None:
+def test_migration_chain_is_0001_then_0002_then_0003_then_0004_then_0005() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0004"
+    assert script.get_current_head() == "0005"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
@@ -424,3 +426,6 @@ def test_migration_chain_is_0001_then_0002_then_0003_then_0004() -> None:
     idempotency = script.get_revision("0004")
     assert idempotency is not None
     assert idempotency.down_revision == "0003"
+    forecast_freshness = script.get_revision("0005")
+    assert forecast_freshness is not None
+    assert forecast_freshness.down_revision == "0004"

@@ -33,9 +33,10 @@ from app.scripts.seed import (
 )
 from tests.conftest import FakeNotifier
 
-NOW = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
-#: Hora de claim del worker, posterior a cualquier `now()` real del test.
-CLAIM_NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+#: Hora de claim del worker, posterior a cualquier `now()` real del test y dentro de la
+#: ventana de frescura del pronóstico emitido en `NOW` (S11).
+CLAIM_NOW = datetime(2030, 1, 1, 12, 1, tzinfo=UTC)
 EXPECTED_FORECASTS = 14 * 5 * 3
 
 
@@ -104,10 +105,16 @@ async def test_seed_is_idempotent_and_creates_the_documented_data(
     assert la_esperanza.latitude == Decimal("-31.42")
     assert la_esperanza.longitude == Decimal("-64.18")
 
-    # Segunda corrida: mismas entidades y cantidades, sin duplicados ni errores.
+    # Segunda corrida: mismas entidades y cantidades, sin duplicados ni errores. La ingesta
+    # no escribe filas porque la corrida del seed tiene el mismo `issued_at` (S11).
     second = await seed(test_sessionmaker, now=NOW)
 
-    assert second == first
+    assert second.forecast_rows == 0
+    assert (second.users, second.fields, second.alerts) == (
+        first.users,
+        first.fields,
+        first.alerts,
+    )
     assert len((await db_session.scalars(select(User))).all()) == 2
     assert len((await db_session.scalars(select(Field))).all()) == 3
     assert len((await db_session.scalars(select(Alert))).all()) == 4
@@ -240,3 +247,16 @@ async def test_seed_reuses_an_existing_user_with_another_name(
     assert ana.id == existing.id
     assert len(summary.users) == 2
     assert {user.id for user in summary.users} == {user.id for user in users}
+
+
+async def test_seed_stamps_the_model_run_on_every_forecast(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    """La ingesta del seed usa su `now` como corrida del modelo, no el reloj (S11)."""
+    summary = await seed(test_sessionmaker, now=NOW)
+
+    issued = set((await db_session.scalars(select(WeatherForecast.issued_at))).all())
+
+    assert summary.forecast_rows == EXPECTED_FORECASTS
+    assert issued == {NOW}

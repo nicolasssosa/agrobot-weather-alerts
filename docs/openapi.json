@@ -316,8 +316,9 @@
         "examples": [
           {
             "event_type": "frost",
-            "fetched_at": "2026-11-16T12:00:00Z",
+            "fetched_at": "2026-11-16T12:05:13Z",
             "forecast_date": "2026-11-17",
+            "issued_at": "2026-11-16T12:00:00Z",
             "probability": 72,
             "source": "mock"
           }
@@ -336,6 +337,11 @@
             "title": "Forecast Date",
             "type": "string"
           },
+          "issued_at": {
+            "format": "date-time",
+            "title": "Issued At",
+            "type": "string"
+          },
           "probability": {
             "title": "Probability",
             "type": "integer"
@@ -350,6 +356,7 @@
           "event_type",
           "probability",
           "source",
+          "issued_at",
           "fetched_at"
         ],
         "title": "ForecastRead",

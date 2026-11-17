@@ -62,8 +62,9 @@ async def run_cycle(
 ) -> CycleResult:
     """Corre un ciclo completo: evalúa las alertas y drena la cola vencida.
 
-    1. `now` (o `clock()`) da el día a evaluar; la evaluación corre en su propia sesión y
-       commitea, porque el dispatcher maneja sus propias transacciones.
+    1. `now` (o `clock()`) da el día a evaluar y el corte de frescura de los pronósticos; la
+       evaluación corre en su propia sesión y commitea, porque el dispatcher maneja sus propias
+       transacciones.
     2. Se despacha en lotes mientras el lote vuelva lleno. Cada llamada obtiene un `now`
        **fresco** de `clock()`: el lease se calcula desde el momento real del claim.
     3. Si `stop_event` está seteado no se arranca un lote nuevo (S7 SEC-2): el shutdown no
@@ -81,7 +82,13 @@ async def run_cycle(
     cycle_now = now if now is not None else clock()
 
     async with sessionmaker() as session:
-        created = await evaluate_alerts(session, today=cycle_now.date())
+        created = await evaluate_alerts(
+            session,
+            today=cycle_now.date(),
+            now=cycle_now,
+            max_forecast_age_hours=settings.max_forecast_age_hours,
+            forecast_future_tolerance_minutes=settings.forecast_future_tolerance_minutes,
+        )
         await session.commit()
 
     sent = retried = failed = cancelled = 0
@@ -100,6 +107,7 @@ async def run_cycle(
             timeout_seconds=settings.notifier_timeout_seconds,
             concurrency=settings.dispatch_concurrency,
             lease_seconds=settings.dispatch_lease_seconds,
+            max_forecast_age_hours=settings.max_forecast_age_hours,
         )
         batches += 1
         sent += batch.sent

@@ -38,12 +38,13 @@ from tests.conftest import (
     MakeUser,
 )
 
-#: Día evaluado (fijo).
-EVAL_NOW = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
-#: Hora de claim (fija y posterior a cualquier `now()` real del test): las notificaciones
-#: creadas por el evaluador con la hora de la DB ya están vencidas.
-CLAIM_NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
-FORECAST_DATE = date(2026, 11, 18)
+#: Día evaluado (fijo). Lejano al reloj real para que las notificaciones del evaluador
+#: (`next_attempt_at = now()` de Postgres) ya estén vencidas al reclamar.
+EVAL_NOW = datetime(2030, 1, 1, 12, 0, tzinfo=UTC)
+#: Hora de claim (fija y posterior a cualquier `now()` real del test, y dentro de la ventana
+#: de frescura del pronóstico emitido en `EVAL_NOW`).
+CLAIM_NOW = datetime(2030, 1, 1, 12, 1, tzinfo=UTC)
+FORECAST_DATE = date(2030, 1, 3)
 
 
 def _settings(*, batch_size: int = 10, interval: int = 60) -> Settings:
@@ -98,6 +99,7 @@ async def test_run_cycle_evaluates_and_sends_end_to_end(
         forecast_date=FORECAST_DATE,
         event_type=EventType.FROST,
         probability=85,
+        issued_at=EVAL_NOW,
     )
     # Bajo el umbral: no debe generar notificación.
     await make_forecast(
@@ -105,6 +107,7 @@ async def test_run_cycle_evaluates_and_sends_end_to_end(
         forecast_date=FORECAST_DATE + timedelta(days=1),
         event_type=EventType.FROST,
         probability=10,
+        issued_at=EVAL_NOW,
     )
 
     result = await run_cycle(
@@ -124,7 +127,7 @@ async def test_run_cycle_evaluates_and_sends_end_to_end(
             phone_number="+5491100000001",
             text=(
                 '⚠️ Alerta de helada en "Lote Norte": 85% de probabilidad '
-                "para el 18/11/2026 (tu umbral: 70%)."
+                "para el 03/01/2030 (tu umbral: 70%)."
             ),
         )
     ]
@@ -166,6 +169,7 @@ async def test_run_cycle_drains_several_batches_with_a_fresh_now_per_batch(
             forecast_date=FORECAST_DATE + timedelta(days=offset),
             event_type=EventType.FROST,
             probability=90,
+            issued_at=EVAL_NOW,
         )
 
     recorded: list[datetime] = []
@@ -214,6 +218,7 @@ async def test_run_cycle_does_not_start_a_new_batch_after_stop_event(
             forecast_date=FORECAST_DATE + timedelta(days=offset),
             event_type=EventType.FROST,
             probability=90,
+            issued_at=EVAL_NOW,
         )
 
     stop_event = asyncio.Event()
@@ -319,7 +324,9 @@ async def test_run_cycle_does_not_dispatch_when_evaluate_alerts_raises(
     """Si el evaluador falla, la excepción sube y no se despacha nada a medias."""
     dispatched: list[int] = []
 
-    async def failing_evaluate(session, *, today):  # type: ignore[no-untyped-def]
+    async def failing_evaluate(  # type: ignore[no-untyped-def]
+        session, *, today, now, max_forecast_age_hours, forecast_future_tolerance_minutes
+    ):
         raise RuntimeError("evaluation down")
 
     async def recording_dispatch(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
@@ -362,6 +369,7 @@ async def test_run_cycle_keeps_committed_work_when_a_later_batch_raises(
             forecast_date=FORECAST_DATE + timedelta(days=offset),
             event_type=EventType.FROST,
             probability=90,
+            issued_at=EVAL_NOW,
         )
 
     calls = 0
@@ -719,3 +727,43 @@ def test_main_once_disposes_the_engine_when_the_cycle_fails(monkeypatch) -> None
         worker.main(["--once"])
 
     assert disposed == [True]
+
+
+async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    fake_notifier: FakeNotifier,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El worker le pasa al evaluador su `now` y los settings de frescura (S11)."""
+    captured: dict[str, object] = {}
+
+    async def _fake_evaluate(session: AsyncSession, **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(worker, "evaluate_alerts", _fake_evaluate)
+    settings = Settings(
+        dispatch_batch_size=10,
+        dispatch_max_attempts=3,
+        dispatch_backoff_base_seconds=30,
+        notifier_timeout_seconds=1.0,
+        dispatch_concurrency=10,
+        dispatch_lease_seconds=60,
+        max_forecast_age_hours=6,
+        forecast_future_tolerance_minutes=30,
+    )
+
+    await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        settings,
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert captured == {
+        "today": EVAL_NOW.date(),
+        "now": EVAL_NOW,
+        "max_forecast_age_hours": 6,
+        "forecast_future_tolerance_minutes": 30,
+    }

@@ -100,12 +100,13 @@ Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.p
 ## S10 — Idempotency-Key en los POST · D13 · ✅
 - [ ] Header opcional `Idempotency-Key` en `POST /users`, `/fields`, `/alerts`: replay de la respuesta original, 422 si el body cambió, vigencia 24 h, seguro ante requests concurrentes con la misma clave. Documentado en OpenAPI.
 
-## S11 — Calidad de pronósticos · D14
+## S11 — Calidad de pronósticos · D14 · ✅
 - [ ] `weather_forecasts.issued_at`; upsert condicional (solo datos más nuevos); evaluador ignora pronósticos desactualizados y loguea un warning con la cantidad; `issued_at` visible en `GET /forecasts`.
 
 ## S12 — Evaluador v2: zona horaria, horizonte y re-aviso por episodio · D1, D2, D9
 - [ ] `fields.timezone` (IANA, validada); "hoy" local por campo; horizonte configurable.
 - [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa.
+- [ ] Follow-ups de S11: los scripts `ingest`/`seed` usan `FORECAST_FUTURE_TOLERANCE_MINUTES` del setting (SEC-3); warning `future_forecasts count=<n> fields=<m>` cuando el evaluador excluye pronósticos con `issued_at` adelantado (SEC-4); la validación al enviar compara contra la probabilidad del **pronóstico vigente**, no solo la guardada en la notificación (SEC-5).
 - [ ] **Reactivar** una alerta (`is_active` false → true) también re-evalúa: los días cuya notificación quedó `cancelled` por la pausa vuelven a poder avisarse (QA-1 de S9). Sigue siendo set-based en SQL; la regla de transición se documenta y se testea también como función pura de referencia (tests de equivalencia).
 
 ## S13 — Envío agrupado por usuario + horario de silencio · D15

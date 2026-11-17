@@ -36,6 +36,7 @@ from app.models import (
     Notification,
     NotificationStatus,
     User,
+    WeatherForecast,
 )
 from app.notifiers.base import NotificationMessage, NotifierError
 from app.notifiers.log import LoggingNotifier
@@ -61,6 +62,7 @@ DISPATCH_KWARGS = {
     "timeout_seconds": 1.0,
     "concurrency": 10,
     "lease_seconds": 60,
+    "max_forecast_age_hours": 24,
 }
 
 
@@ -80,7 +82,34 @@ async def _make_notification(
     sent_at: datetime | None = None,
     last_error: str | None = None,
     probability: int = 85,
+    forecast_issued_at: datetime | None = NOW,
 ) -> Notification:
+    """Crea la notificación y, si corresponde, el pronóstico vigente que la respalda.
+
+    `forecast_issued_at=None` simula un pronóstico que ya no existe; otra hora simula uno
+    emitido antes (vencido) o después (fresco) del corte. Los tests nunca usan el reloj real.
+    """
+    if forecast_issued_at is not None:
+        existing_forecast = await session.scalar(
+            select(WeatherForecast.id).where(
+                WeatherForecast.field_id == alert.field_id,
+                WeatherForecast.forecast_date == forecast_date,
+                WeatherForecast.event_type == alert.event_type,
+            )
+        )
+        if existing_forecast is None:
+            session.add(
+                WeatherForecast(
+                    field_id=alert.field_id,
+                    forecast_date=forecast_date,
+                    event_type=alert.event_type,
+                    probability=probability,
+                    source="mock",
+                    issued_at=forecast_issued_at,
+                    fetched_at=NOW,
+                )
+            )
+            await session.flush()
     notification = Notification(
         alert_id=alert.id,
         forecast_date=forecast_date,
@@ -100,7 +129,7 @@ async def _make_notification(
 
 def _compiled_claim_sql() -> str:
     return str(
-        _claim_statement(NOW, 10).compile(
+        _claim_statement(NOW, 10, DISPATCH_KWARGS["max_forecast_age_hours"]).compile(
             dialect=postgresql.dialect(), compile_kwargs={"literal_binds": True}
         )
     )
@@ -671,6 +700,18 @@ async def test_two_concurrent_dispatchers_never_send_the_same_notification() -> 
             setup.add(alert)
             await setup.flush()
             setup.add_all(
+                WeatherForecast(
+                    field_id=field.id,
+                    forecast_date=FORECAST_DATE + timedelta(days=offset),
+                    event_type=EventType.FROST,
+                    probability=80,
+                    source="mock",
+                    issued_at=NOW,
+                    fetched_at=NOW,
+                )
+                for offset in range(6)
+            )
+            setup.add_all(
                 Notification(
                     alert_id=alert.id,
                     forecast_date=FORECAST_DATE + timedelta(days=offset),
@@ -1197,6 +1238,81 @@ async def test_probability_equal_to_the_current_threshold_is_not_cancelled(
     assert notification.status == NotificationStatus.SENT
 
 
+# --- Frescura del pronóstico en el claim (S11 CR-2) ------------------------
+
+
+async def test_a_pending_notification_with_a_stale_forecast_is_cancelled_without_sending(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-2: si el pronóstico vigente venció, el claim cancela con `stale_forecast`."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session,
+        alert,
+        probability=85,
+        forecast_issued_at=NOW - timedelta(hours=24, seconds=1),
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.CANCELLED
+    assert notification.last_error == "stale_forecast"
+    assert notification.sent_at is None
+    assert notification.attempts == 0
+
+
+async def test_a_pending_notification_without_a_forecast_is_cancelled_as_stale(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-2: si el pronóstico vigente ya no existe, tampoco se envía."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session, alert, probability=85, forecast_issued_at=None
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.last_error == "stale_forecast"
+
+
+async def test_a_pending_notification_at_the_freshness_boundary_is_sent(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """CR-2: `issued_at == now - max_forecast_age_hours` sigue fresco (borde inclusivo)."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(
+        db_session,
+        alert,
+        probability=85,
+        forecast_issued_at=NOW - timedelta(hours=24),
+    )
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert [message.notification_id for message in notifier.sent] == [notification.id]
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+
+
 # --- Dueño del teléfono ----------------------------------------------------
 
 
@@ -1411,6 +1527,17 @@ async def test_the_row_is_not_locked_while_the_network_call_is_in_flight() -> No
             alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=50)
             setup.add(alert)
             await setup.flush()
+            setup.add(
+                WeatherForecast(
+                    field_id=field.id,
+                    forecast_date=FORECAST_DATE,
+                    event_type=EventType.FROST,
+                    probability=80,
+                    source="mock",
+                    issued_at=NOW,
+                    fetched_at=NOW,
+                )
+            )
             notification = Notification(
                 alert_id=alert.id,
                 forecast_date=FORECAST_DATE,
@@ -1509,7 +1636,11 @@ async def test_a_stale_lease_owner_cannot_record_its_outcome(
     lease_seconds = DISPATCH_KWARGS["lease_seconds"]
 
     worker_a, cancelled_a = await _claim_batch(
-        test_sessionmaker, now=NOW, batch_size=10, lease_seconds=lease_seconds
+        test_sessionmaker,
+        now=NOW,
+        batch_size=10,
+        lease_seconds=lease_seconds,
+        max_forecast_age_hours=DISPATCH_KWARGS["max_forecast_age_hours"],
     )
     assert cancelled_a == 0
     assert [item.id for item in worker_a] == [notification.id]
@@ -1518,7 +1649,11 @@ async def test_a_stale_lease_owner_cannot_record_its_outcome(
     # El lease de A vence y B reclama la misma fila con una hora posterior.
     later = NOW + timedelta(seconds=lease_seconds + 1)
     worker_b, cancelled_b = await _claim_batch(
-        test_sessionmaker, now=later, batch_size=10, lease_seconds=lease_seconds
+        test_sessionmaker,
+        now=later,
+        batch_size=10,
+        lease_seconds=lease_seconds,
+        max_forecast_age_hours=DISPATCH_KWARGS["max_forecast_age_hours"],
     )
     assert cancelled_b == 0
     assert [item.id for item in worker_b] == [notification.id]
@@ -1657,6 +1792,17 @@ async def test_soft_deleting_the_alert_while_the_send_is_in_flight_keeps_the_rea
             alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=50)
             setup.add(alert)
             await setup.flush()
+            setup.add(
+                WeatherForecast(
+                    field_id=field.id,
+                    forecast_date=FORECAST_DATE,
+                    event_type=EventType.FROST,
+                    probability=80,
+                    source="mock",
+                    issued_at=LEASE_SAFE_NOW,
+                    fetched_at=LEASE_SAFE_NOW,
+                )
+            )
             notification = Notification(
                 alert_id=alert.id,
                 forecast_date=FORECAST_DATE,
@@ -1748,6 +1894,17 @@ async def test_a_leased_notification_of_a_deleted_alert_is_cancelled_when_the_le
             alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=50)
             setup.add(alert)
             await setup.flush()
+            setup.add(
+                WeatherForecast(
+                    field_id=field.id,
+                    forecast_date=FORECAST_DATE,
+                    event_type=EventType.FROST,
+                    probability=80,
+                    source="mock",
+                    issued_at=LEASE_SAFE_NOW,
+                    fetched_at=LEASE_SAFE_NOW,
+                )
+            )
             notification = Notification(
                 alert_id=alert.id,
                 forecast_date=FORECAST_DATE,

@@ -5,8 +5,10 @@ Todas las corridas usan un `today` fijo: nunca el reloj real.
 """
 
 import asyncio
+import logging
 import uuid
-from datetime import UTC, date, datetime, timedelta
+from collections.abc import Awaitable
+from datetime import UTC, date, datetime, timedelta, timezone
 from decimal import Decimal
 
 import pytest
@@ -28,8 +30,32 @@ from app.models import (
 from tests.conftest import TEST_DATABASE_URL, MakeAlert, MakeField, MakeForecast, MakeUser
 
 TODAY = date(2026, 11, 16)
-#: Timestamp fijo para metadatos (`fetched_at`); nunca el reloj real.
+#: Timestamp fijo para metadatos (`fetched_at`, `issued_at`); nunca el reloj real.
 FIXED_AT = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+#: Corrida del evaluador, fija (S11).
+NOW = FIXED_AT
+#: Ventana de frescura por defecto de los tests (docs/JOBS.md §Evaluador).
+MAX_AGE_HOURS = 24
+#: Tolerancia de reloj para un `issued_at` futuro (docs/JOBS.md §Ingesta mock).
+FUTURE_TOLERANCE_MINUTES = 60
+
+
+def _evaluate(
+    session: AsyncSession,
+    *,
+    today: date = TODAY,
+    now: datetime = NOW,
+    max_forecast_age_hours: int = MAX_AGE_HOURS,
+    forecast_future_tolerance_minutes: int = FUTURE_TOLERANCE_MINUTES,
+) -> Awaitable[int]:
+    """Corre el evaluador con `today`/`now`/ventana fijos (nunca el reloj real)."""
+    return evaluate_alerts(
+        session,
+        today=today,
+        now=now,
+        max_forecast_age_hours=max_forecast_age_hours,
+        forecast_future_tolerance_minutes=forecast_future_tolerance_minutes,
+    )
 
 
 async def _notifications(
@@ -47,7 +73,12 @@ def _compiled_sql(*, literal_binds: bool = False) -> str:
     """SQL que Postgres recibe para una corrida (dialecto postgresql)."""
     options = {"literal_binds": True} if literal_binds else {}
     return str(
-        _build_statement(TODAY).compile(dialect=postgresql.dialect(), compile_kwargs=options)
+        _build_statement(
+            TODAY,
+            now=NOW,
+            max_forecast_age_hours=MAX_AGE_HOURS,
+            forecast_future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+        ).compile(dialect=postgresql.dialect(), compile_kwargs=options)
     )
 
 
@@ -130,7 +161,7 @@ async def test_probability_equal_to_threshold_creates_notification(
     alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=70)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 1
     [notification] = await _notifications(db_session)
@@ -157,7 +188,7 @@ async def test_probability_below_threshold_does_not_create_notification(
     await make_alert(field, event_type=EventType.FROST, threshold=70)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=69)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 0
     assert await _notifications(db_session) == []
@@ -173,7 +204,7 @@ async def test_inactive_alert_does_not_create_notification(
     await make_alert(field, event_type=EventType.FROST, threshold=70, is_active=False)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=100)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 0
     assert await _notifications(db_session) == []
@@ -192,7 +223,7 @@ async def test_soft_deleted_alert_does_not_create_notification(
     await db_session.flush()
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=100)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 0
     assert await _notifications(db_session) == []
@@ -213,7 +244,7 @@ async def test_yesterday_forecast_does_not_create_notification(
         probability=100,
     )
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 0
     assert await _notifications(db_session) == []
@@ -229,7 +260,7 @@ async def test_today_forecast_creates_notification(
     await make_alert(field, event_type=EventType.FROST, threshold=70)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=100)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 1
     [notification] = await _notifications(db_session)
@@ -248,7 +279,7 @@ async def test_far_future_forecast_creates_notification(
     await make_alert(field, event_type=EventType.HEAT_WAVE, threshold=40)
     await make_forecast(field, forecast_date=far, event_type=EventType.HEAT_WAVE, probability=55)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 1
     [notification] = await _notifications(db_session)
@@ -271,7 +302,7 @@ async def test_only_same_field_and_same_event_type_match(
         other_field, forecast_date=TODAY, event_type=EventType.FROST, probability=100
     )
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 0
     assert await _notifications(db_session) == []
@@ -287,8 +318,8 @@ async def test_running_twice_does_not_duplicate(
     await make_alert(field, event_type=EventType.FROST, threshold=70)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=90)
 
-    first = await evaluate_alerts(db_session, today=TODAY)
-    second = await evaluate_alerts(db_session, today=TODAY)
+    first = await _evaluate(db_session)
+    second = await _evaluate(db_session)
 
     assert (first, second) == (1, 0)
     assert len(await _notifications(db_session)) == 1
@@ -307,15 +338,15 @@ async def test_forecast_changes_after_notification_do_not_renotify(
         field, forecast_date=TODAY, event_type=EventType.FROST, probability=80
     )
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 1
+    assert await _evaluate(db_session) == 1
 
     forecast.probability = 10  # el pronóstico baja
     await db_session.flush()
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
     forecast.probability = 95  # y vuelve a subir (upsert de la ingesta)
     await db_session.flush()
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
     [notification] = await _notifications(db_session)
     # El snapshot conserva lo que disparó la alerta, no el pronóstico vigente.
@@ -353,7 +384,7 @@ async def test_multiple_alerts_and_days_are_counted_exactly(
         probability=59,
     )
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 6
     notifications = await _notifications(db_session)
@@ -379,7 +410,7 @@ async def test_notifications_are_linked_to_the_alert_of_their_own_user(
         bruno_field, forecast_date=TODAY, event_type=EventType.FROST, probability=95
     )
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 2
     by_alert = {n.alert_id: n for n in await _notifications(db_session)}
@@ -404,7 +435,7 @@ async def test_does_not_commit(
     await make_alert(field, event_type=EventType.FROST, threshold=70)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=90)
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 1
+    assert await _evaluate(db_session) == 1
     assert len(await _notifications(db_session)) == 1
 
     # Si `evaluate_alerts` hubiera commiteado, las filas sobrevivirían a este rollback
@@ -428,7 +459,7 @@ async def test_upper_bounds_fire(
     alert = await make_alert(field, event_type=EventType.FROST, threshold=100)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=100)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 1
     [notification] = await _notifications(db_session)
@@ -450,7 +481,7 @@ async def test_lower_bounds_do_not_fire(
     await make_alert(field, event_type=EventType.FROST, threshold=1)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=0)
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
     assert await _notifications(db_session) == []
 
 
@@ -468,7 +499,7 @@ async def test_no_alerts_returns_zero(
             probability=100,
         )
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
     assert await _notifications(db_session) == []
 
 
@@ -480,7 +511,7 @@ async def test_no_forecasts_returns_zero(
     field = await make_field()
     await make_alert(field, event_type=EventType.FROST, threshold=1)
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
     assert await _notifications(db_session) == []
 
 
@@ -506,7 +537,7 @@ async def test_today_at_month_and_year_boundary(
             probability=80,
         )
 
-    created = await evaluate_alerts(db_session, today=today)
+    created = await _evaluate(db_session, today=today)
 
     assert created == 2
     dates = {notification.forecast_date for notification in await _notifications(db_session)}
@@ -529,12 +560,12 @@ async def test_forecast_crossing_threshold_between_runs_notifies_later(
         field, forecast_date=TODAY + timedelta(days=2), event_type=EventType.FROST, probability=40
     )
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
     forecast.probability = 85  # la ingesta actualiza el pronóstico (upsert)
     await db_session.flush()
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 1
+    assert await _evaluate(db_session) == 1
     [notification] = await _notifications(db_session)
     assert notification.probability == 85
     assert notification.forecast_date == TODAY + timedelta(days=2)
@@ -558,13 +589,13 @@ async def test_lowering_threshold_between_runs_notifies_only_new_days(
             probability=probability,
         )
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 2
+    assert await _evaluate(db_session) == 2
 
     alert.threshold = 50
     await db_session.flush()
 
     # Solo el día 0, que ahora cumple 50 >= 50; los días 1 y 2 siguen con su snapshot.
-    assert await evaluate_alerts(db_session, today=TODAY) == 1
+    assert await _evaluate(db_session) == 1
     notifications = await _notifications(db_session, alert_id=alert.id)
     assert [n.forecast_date for n in notifications] == [
         TODAY,
@@ -589,7 +620,7 @@ async def test_reactivation_notifies_only_days_not_yet_notified(
         field, forecast_date=TODAY + timedelta(days=1), event_type=EventType.FROST, probability=80
     )
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 2
+    assert await _evaluate(db_session) == 2
 
     alert.is_active = False
     await db_session.flush()
@@ -597,14 +628,14 @@ async def test_reactivation_notifies_only_days_not_yet_notified(
     await make_forecast(
         field, forecast_date=TODAY + timedelta(days=2), event_type=EventType.FROST, probability=80
     )
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
     assert len(await _notifications(db_session, alert_id=alert.id)) == 2
 
     alert.is_active = True
     await db_session.flush()
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 1
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 1
+    assert await _evaluate(db_session) == 0
     notifications = await _notifications(db_session, alert_id=alert.id)
     assert [n.forecast_date for n in notifications] == [
         TODAY,
@@ -632,7 +663,7 @@ async def test_several_thresholds_for_the_same_field_and_event_only_fire_the_cro
     }
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=70)
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 2
     notifications = await _notifications(db_session)
@@ -645,7 +676,7 @@ async def test_several_thresholds_for_the_same_field_and_event_only_fire_the_cro
         (alerts[60].id, 60),
     }
     # Re-ejecutar no agrega el nivel 90 ni duplica los otros dos.
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
 
 async def test_reactivation_after_a_cancelled_pending_does_not_recreate_the_day(
@@ -663,7 +694,7 @@ async def test_reactivation_after_a_cancelled_pending_does_not_recreate_the_day(
     field = await make_field()
     alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
     await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=80)
-    assert await evaluate_alerts(db_session, today=TODAY) == 1
+    assert await _evaluate(db_session) == 1
     [notification] = await _notifications(db_session, alert_id=alert.id)
 
     # Pausa + lo que hace el dispatcher en el claim (D12): pending -> cancelled.
@@ -671,11 +702,11 @@ async def test_reactivation_after_a_cancelled_pending_does_not_recreate_the_day(
     notification.status = NotificationStatus.CANCELLED
     notification.last_error = "alert_inactive"
     await db_session.flush()
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
     alert.is_active = True
     await db_session.flush()
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
     [still_cancelled] = await _notifications(db_session, alert_id=alert.id)
     assert still_cancelled.id == notification.id
@@ -701,17 +732,17 @@ async def test_soft_deleted_alert_keeps_its_history_and_a_new_alert_notifies_aga
             probability=80,
         )
 
-    assert await evaluate_alerts(db_session, today=TODAY) == 2
+    assert await _evaluate(db_session) == 2
     assert len(await _notifications(db_session)) == 2
 
     alert.deleted_at = FIXED_AT
     await db_session.flush()
     # El borrado lógico no toca las notificaciones y el evaluador ya no evalúa la alerta.
     assert len(await _notifications(db_session)) == 2
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
     new_alert = await make_alert(field, event_type=EventType.FROST, threshold=60)
-    assert await evaluate_alerts(db_session, today=TODAY) == 2
+    assert await _evaluate(db_session) == 2
     notifications = await _notifications(db_session)
     assert {n.alert_id for n in notifications} == {alert.id, new_alert.id}
     assert len(notifications) == 4
@@ -743,14 +774,14 @@ async def test_thirty_days_five_events_multiple_alerts_counted_exactly(
         for offset in range(30):
             expected.add((alert.id, TODAY + timedelta(days=offset)))
 
-    created = await evaluate_alerts(db_session, today=TODAY)
+    created = await _evaluate(db_session)
 
     assert created == 300
     notifications = await _notifications(db_session)
     assert len(notifications) == 300
     assert {(n.alert_id, n.forecast_date) for n in notifications} == expected
     # Re-ejecutar no agrega nada.
-    assert await evaluate_alerts(db_session, today=TODAY) == 0
+    assert await _evaluate(db_session) == 0
 
 
 # --- Concurrencia ----------------------------------------------------------
@@ -761,7 +792,13 @@ async def _evaluate_and_commit(
 ) -> int:
     """Corre el evaluador en su propia conexión y commitea (libera locks del INSERT)."""
     async with session_factory() as session:
-        created = await evaluate_alerts(session, today=today)
+        created = await evaluate_alerts(
+            session,
+            today=today,
+            now=NOW,
+            max_forecast_age_hours=MAX_AGE_HOURS,
+            forecast_future_tolerance_minutes=FUTURE_TOLERANCE_MINUTES,
+        )
         await session.commit()
         return created
 
@@ -803,6 +840,7 @@ async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
                     event_type=event_type,
                     probability=75,
                     source="mock",
+                    issued_at=FIXED_AT,
                     fetched_at=FIXED_AT,
                 )
                 for day in days
@@ -835,3 +873,440 @@ async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
             async with engine.begin() as conn:
                 await conn.execute(delete(User).where(User.id == user_id))
         await engine.dispose()
+
+
+# --- Frescura de los pronósticos (S11, D14) -------------------------------
+
+
+STALE_AT = NOW - timedelta(hours=MAX_AGE_HOURS)
+
+
+async def test_a_fresh_forecast_fires(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=NOW - timedelta(hours=1),
+    )
+
+    assert await _evaluate(db_session) == 1
+
+
+async def test_a_stale_forecast_does_not_fire(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Emitido antes de `now - 24 h` (por un segundo): no dispara (regla 7)."""
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=STALE_AT - timedelta(seconds=1),
+    )
+
+    assert await _evaluate(db_session) == 0
+    assert await _notifications(db_session) == []
+
+
+async def test_the_exact_freshness_boundary_still_fires(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """`issued_at == now - max_forecast_age_hours` dispara: el corte es inclusivo."""
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=STALE_AT,
+    )
+
+    assert await _evaluate(db_session) == 1
+
+
+async def test_the_freshness_window_is_configurable(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """Con una ventana más chica, el mismo pronóstico deja de evaluarse."""
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=NOW - timedelta(hours=2),
+    )
+
+    assert await _evaluate(db_session, max_forecast_age_hours=1) == 0
+    # El corte es inclusivo también con una ventana no default.
+    assert await _evaluate(db_session, max_forecast_age_hours=2) == 1
+
+
+async def test_stale_forecasts_are_reported_with_counts(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """El warning cuenta los pronósticos viejos y los campos afectados (sin traer filas)."""
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+
+    stale_a = await make_field()
+    await make_alert(stale_a, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        stale_a,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=STALE_AT - timedelta(hours=1),
+    )
+
+    stale_b = await make_field()
+    await make_alert(stale_b, event_type=EventType.RAIN, threshold=50)
+    for offset in range(2):
+        await make_forecast(
+            stale_b,
+            forecast_date=TODAY + timedelta(days=offset),
+            event_type=EventType.RAIN,
+            probability=80,
+            issued_at=STALE_AT - timedelta(days=2),
+        )
+
+    # Alertas borradas o inactivas, días pasados u otro evento no cuentan.
+    deleted = await make_field()
+    deleted_alert = await make_alert(deleted, event_type=EventType.HAIL, threshold=50)
+    deleted_alert.deleted_at = FIXED_AT
+    await make_forecast(
+        deleted,
+        forecast_date=TODAY,
+        event_type=EventType.HAIL,
+        probability=100,
+        issued_at=STALE_AT - timedelta(days=3),
+    )
+    paused = await make_field()
+    await make_alert(paused, event_type=EventType.HEAT_WAVE, threshold=50, is_active=False)
+    await make_forecast(
+        paused,
+        forecast_date=TODAY,
+        event_type=EventType.HEAT_WAVE,
+        probability=100,
+        issued_at=STALE_AT - timedelta(days=3),
+    )
+    past = await make_field()
+    await make_alert(past, event_type=EventType.STRONG_WIND, threshold=50)
+    await make_forecast(
+        past,
+        forecast_date=TODAY - timedelta(days=1),
+        event_type=EventType.STRONG_WIND,
+        probability=100,
+        issued_at=STALE_AT - timedelta(days=3),
+    )
+    other_event = await make_field()
+    await make_alert(other_event, event_type=EventType.FROST, threshold=50)
+    await make_forecast(
+        other_event,
+        forecast_date=TODAY,
+        event_type=EventType.RAIN,
+        probability=100,
+        issued_at=STALE_AT - timedelta(days=3),
+    )
+    await db_session.flush()
+
+    assert await _evaluate(db_session) == 0
+    assert await _notifications(db_session) == []
+    messages = [record.getMessage() for record in caplog.records]
+    assert "stale_forecasts count=3 fields=2 max_age_hours=24" in messages
+
+
+async def test_no_stale_warning_when_every_forecast_is_fresh(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=NOW,
+    )
+
+    assert await _evaluate(db_session) == 1
+    assert "stale_forecasts" not in caplog.text
+
+
+async def test_a_stale_forecast_then_a_fresh_issue_the_same_day_fires_once(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """El pronóstico viejo no dispara; cuando la ingesta trae uno fresco del mismo día, sí.
+
+    La ingesta pisa la misma fila `(campo, día, evento)` con un `issued_at` nuevo: el
+    evaluador lo acepta en la corrida siguiente y el dedupe evita un segundo aviso.
+    """
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    forecast = await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=95,
+        issued_at=STALE_AT - timedelta(hours=1),
+    )
+
+    assert await _evaluate(db_session) == 0
+    assert await _notifications(db_session) == []
+
+    # Reingesta fresca del mismo día (upsert sobre la misma clave natural).
+    forecast.issued_at = NOW
+    forecast.source = "fresh"
+    await db_session.flush()
+
+    assert await _evaluate(db_session) == 1
+    assert await _evaluate(db_session) == 0
+    [notification] = await _notifications(db_session)
+    assert (notification.forecast_date, notification.probability, notification.threshold) == (
+        TODAY,
+        95,
+        70,
+    )
+
+
+async def test_issued_at_with_a_non_utc_offset_is_compared_in_absolute_time(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """`issued_at` con offset se compara en tiempo absoluto: el mismo instante es el borde.
+
+    09:00-03:00 == 12:00Z == `now` (fresco); 14:00+02:00 del día anterior == `now - 24 h`
+    (borde inclusivo, dispara); 13:59:59+02:00 -- un segundo antes del corte -- es viejo.
+    """
+    fresh = await make_field()
+    fresh_alert = await make_alert(fresh, event_type=EventType.FROST, threshold=70)
+    fresh_forecast = await make_forecast(
+        fresh,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=datetime(2026, 11, 16, 9, 0, tzinfo=timezone(timedelta(hours=-3))),
+    )
+
+    boundary = await make_field()
+    boundary_alert = await make_alert(boundary, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        boundary,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=datetime(2026, 11, 15, 14, 0, tzinfo=timezone(timedelta(hours=2))),
+    )
+
+    stale = await make_field()
+    await make_alert(stale, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        stale,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=90,
+        issued_at=datetime(2026, 11, 15, 13, 59, 59, tzinfo=timezone(timedelta(hours=2))),
+    )
+
+    created = await _evaluate(db_session)
+
+    assert created == 2
+    await db_session.refresh(fresh_forecast)
+    # asyncpg devuelve `timestamptz` normalizado a UTC: mismo instante, otra representación.
+    assert fresh_forecast.issued_at == NOW
+    assert {n.alert_id for n in await _notifications(db_session)} == {
+        fresh_alert.id,
+        boundary_alert.id,
+    }
+
+
+async def test_no_stale_warning_for_fields_without_alerts(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Un campo sin alertas con pronósticos viejos no cuenta en el warning (no se evalúa)."""
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    field = await make_field()
+    for offset in range(3):
+        await make_forecast(
+            field,
+            forecast_date=TODAY + timedelta(days=offset),
+            event_type=EventType.FROST,
+            probability=100,
+            issued_at=STALE_AT - timedelta(days=5),
+        )
+
+    assert await _evaluate(db_session) == 0
+    assert await _notifications(db_session) == []
+    assert "stale_forecasts" not in caplog.text
+
+
+async def test_stale_warning_counts_each_forecast_once_with_several_thresholds(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S9 permite varios umbrales por (campo, evento): un solo pronóstico viejo sigue siendo uno.
+
+    El warning se define en docs/JOBS.md §Evaluador como `count=<n>` pronósticos viejos y
+    `fields=<m>` campos distintos, así que el fan-out del JOIN con las alertas no debe inflar
+    el conteo.
+    """
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=50)
+    await make_alert(field, event_type=EventType.FROST, threshold=80)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=STALE_AT - timedelta(hours=1),
+    )
+
+    assert await _evaluate(db_session) == 0
+    messages = [record.getMessage() for record in caplog.records]
+    assert "stale_forecasts count=1 fields=1 max_age_hours=24" in messages
+
+
+async def test_no_stale_warning_when_all_stale_forecasts_belong_to_paused_or_deleted_alerts(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Solo cuentan las alertas activas y no borradas, aunque no haya ninguna fresca."""
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+
+    paused = await make_field()
+    await make_alert(paused, event_type=EventType.FROST, threshold=70, is_active=False)
+    await make_forecast(
+        paused,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=STALE_AT - timedelta(days=1),
+    )
+
+    deleted = await make_field()
+    deleted_alert = await make_alert(deleted, event_type=EventType.RAIN, threshold=50)
+    deleted_alert.deleted_at = FIXED_AT
+    await make_forecast(
+        deleted,
+        forecast_date=TODAY,
+        event_type=EventType.RAIN,
+        probability=100,
+        issued_at=STALE_AT - timedelta(days=1),
+    )
+    await db_session.flush()
+
+    assert await _evaluate(db_session) == 0
+    assert "stale_forecasts" not in caplog.text
+
+
+async def test_a_stale_forecast_below_every_threshold_is_not_counted(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """QA-1/CR-3: el warning cuenta pronósticos que *habrían disparado*; uno bajo el umbral no."""
+    caplog.set_level(logging.WARNING, logger="app.jobs.evaluator")
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=69,
+        issued_at=STALE_AT - timedelta(hours=1),
+    )
+
+    assert await _evaluate(db_session) == 0
+    assert await _notifications(db_session) == []
+    assert "stale_forecasts" not in caplog.text
+
+
+async def test_a_forecast_issued_too_far_in_the_future_is_not_evaluated(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """S11 SEC-1: defensa del evaluador ante un `issued_at > now + tolerancia`.
+
+    La ingesta ya acota ese dato; si por algún camino quedó guardado, el evaluador tampoco lo
+    usa (ni lo cuenta como viejo: queda fuera de ambas ventanas).
+    """
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=NOW + timedelta(minutes=FUTURE_TOLERANCE_MINUTES + 1),
+    )
+
+    assert await _evaluate(db_session) == 0
+    assert await _notifications(db_session) == []
+
+
+async def test_a_forecast_within_the_future_tolerance_is_evaluated(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """El borde `issued_at == now + tolerancia` se acepta (tolerancia de reloj inclusiva)."""
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=TODAY,
+        event_type=EventType.FROST,
+        probability=100,
+        issued_at=NOW + timedelta(minutes=FUTURE_TOLERANCE_MINUTES),
+    )
+
+    assert await _evaluate(db_session) == 1

@@ -59,7 +59,10 @@ Reglas de negocio (cubiertas por tests):
    `issued_at >= now - max_forecast_age_hours` (`MAX_FORECAST_AGE_HOURS`, default 24). Si para
    alertas activas hay pronósticos en la ventana que quedaron afuera por viejos, se loguea un
    **warning** `stale_forecasts count=<n> fields=<m> max_age_hours=<h>` (señal de que la ingesta no
-   está trayendo datos frescos). Se cuentan con una consulta agregada aparte (sin traer filas).
+   está trayendo datos frescos). Se cuentan con una consulta agregada aparte (sin traer filas):
+   `count` = pronósticos **distintos** que habrían disparado alguna alerta activa
+   (`probability >= threshold`) de no ser viejos; `fields` = campos distintos.
+   Defensa adicional: tampoco se evalúan pronósticos con `issued_at > now + FORECAST_FUTURE_TOLERANCE_MINUTES`.
 
 `today` y `now` los calcula el worker (`now = datetime.now(UTC)`, `today = now.date()`) y se inyectan (testeable).
 
@@ -80,7 +83,9 @@ autovacuum de toda la base y bloqueaba DELETEs de la API.)
 Algoritmo, en **dos transacciones cortas** con el envío en el medio:
 
 1. **Claim + lease + validación** (transacción 1, milisegundos). Además del lease, el claim
-   **re-verifica contra la alerta actual** (S9, D12): si la alerta está borrada (`deleted_at`),
+   **re-verifica contra la alerta actual** (S9, D12) **y contra la frescura del pronóstico** (S11, D14):
+   si el pronóstico vigente de ese (campo, día, evento) tiene `issued_at < now - MAX_FORECAST_AGE_HOURS`
+   se cancela con `last_error = stale_forecast`; además, si la alerta está borrada (`deleted_at`),
    inactiva, o `n.probability < a.threshold` (umbral vigente), la notificación pasa a
    `status='cancelled'`, `last_error` = `alert_deleted` | `alert_inactive` | `below_current_threshold`
    en la misma transacción y **no se envía**. Contarlas en `DispatchResult.cancelled`.
@@ -195,6 +200,11 @@ en `[start, start+days)` y **cada** `EventType`, una probabilidad determinístic
 - Itera todos los `fields` ordenados por id, de a 500 (`.limit(500)` + `where id > last_id`).
 - Cada `ForecastPoint` trae `issued_at` (cuándo emitió el proveedor). El mock usa la hora de la
   corrida del modelo: `now` UTC truncado a la hora.
+- **Validación de `issued_at` antes del upsert** (un dato inválido nunca aborta el lote):
+  - `None` o sin zona horaria → el punto se descarta; `logger.warning("forecast_invalid_issued_at count=%d")`.
+  - En el futuro más allá de `FORECAST_FUTURE_TOLERANCE_MINUTES` (default 60) → se **acota a `now`**
+    (así un dato real posterior lo puede pisar); `logger.warning("forecast_issued_in_future count=%d")`.
+  - Se normaliza a UTC.
 - Upsert **condicional** (S11, D14): `postgresql.insert(...).on_conflict_do_update(
   index_elements=[field_id, forecast_date, event_type], set_={probability, source, issued_at,
   fetched_at: func.now(), updated_at: func.now()}, where=WeatherForecast.issued_at < excluded.issued_at)`.
