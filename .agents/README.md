@@ -1,7 +1,10 @@
 # .agents — Equipo de agentes
 
 Fuente única de verdad de cada rol: **modelo, permisos, contexto, entradas, salidas y prompt**.
-El orquestador (T3 Code) lee el archivo del rol y lanza el agente con esos parámetros.
+El orquestador (T3 Code) lee el archivo del rol y lanza el agente con esos parámetros **como
+subagente** (`delegate_task`): corre en segundo plano, sin abrir un hilo en la barra lateral, y su
+reporte vuelve directo al PM. Cada ronda (coder, QA, cada reviewer) es un subagente nuevo; los dos
+reviewers se lanzan en paralelo.
 `AGENTS.md` (raíz) contiene las reglas del repo que aplican a **todos** los agentes que escriben código.
 
 ## Equipo
