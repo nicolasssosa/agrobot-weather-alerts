@@ -793,24 +793,17 @@
         "operationId": "create_alert_endpoint_api_v1_alerts_post",
         "parameters": [
           {
-            "description": "Header `Idempotency-Key` opcional para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
+            "description": "Header `Idempotency-Key` obligatorio para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
             "in": "header",
             "name": "Idempotency-Key",
-            "required": false,
+            "required": true,
             "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Header `Idempotency-Key` opcional para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
+              "description": "Clave aleatoria e impredecible (por ejemplo un UUID v4), 1-255 caracteres ASCII imprimibles sin espacios.",
               "examples": [
                 "7f5c2b1e-4a9d-4c3e-9f2a-1b8e6d0c4a51"
               ],
-              "title": "Idempotency-Key"
+              "title": "Idempotency-Key",
+              "type": "string"
             }
           }
         ],
@@ -888,12 +881,58 @@
           "422": {
             "content": {
               "application/json": {
+                "examples": {
+                  "invalid_body": {
+                    "summary": "Body inválido (validación automática de FastAPI)",
+                    "value": {
+                      "detail": [
+                        {
+                          "ctx": {
+                            "le": 100
+                          },
+                          "input": 101,
+                          "loc": [
+                            "body",
+                            "threshold"
+                          ],
+                          "msg": "Input should be less than or equal to 100",
+                          "type": "less_than_equal"
+                        }
+                      ]
+                    }
+                  },
+                  "invalid_key": {
+                    "summary": "Header `Idempotency-Key` mal formado",
+                    "value": {
+                      "detail": "Invalid Idempotency-Key"
+                    }
+                  },
+                  "missing_key": {
+                    "summary": "Header `Idempotency-Key` ausente",
+                    "value": {
+                      "detail": "Idempotency-Key header is required"
+                    }
+                  },
+                  "reused_key": {
+                    "summary": "Misma clave con un body distinto",
+                    "value": {
+                      "detail": "Idempotency-Key reused with a different request"
+                    }
+                  }
+                },
                 "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponse"
+                    }
+                  ]
                 }
               }
             },
-            "description": "Validation Error"
+            "description": "Cuatro formas según el caso: un body inválido responde `HTTPValidationError` con `detail` como lista de errores; el header `Idempotency-Key` ausente, mal formado o reusado con otro body responde `ErrorResponse` con `detail` string."
           }
         },
         "security": [
@@ -1219,29 +1258,6 @@
       "post": {
         "description": "Crea un campo del usuario autenticado.",
         "operationId": "create_field_endpoint_api_v1_fields_post",
-        "parameters": [
-          {
-            "description": "Header `Idempotency-Key` opcional para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Header `Idempotency-Key` opcional para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
-              "examples": [
-                "7f5c2b1e-4a9d-4c3e-9f2a-1b8e6d0c4a51"
-              ],
-              "title": "Idempotency-Key"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1261,18 +1277,7 @@
                 }
               }
             },
-            "description": "Successful Response",
-            "headers": {
-              "Idempotent-Replayed": {
-                "description": "`true` solo cuando el body es el replay de una respuesta guardada con el mismo `Idempotency-Key` (no se volvió a ejecutar la operación).",
-                "schema": {
-                  "enum": [
-                    "true"
-                  ],
-                  "type": "string"
-                }
-              }
-            }
+            "description": "Successful Response"
           },
           "401": {
             "content": {
@@ -1669,29 +1674,6 @@
       "post": {
         "description": "Crea un usuario (sin autenticación).",
         "operationId": "create_user_endpoint_api_v1_users_post",
-        "parameters": [
-          {
-            "description": "Header `Idempotency-Key` opcional para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
-            "in": "header",
-            "name": "Idempotency-Key",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "description": "Header `Idempotency-Key` opcional para reintentos seguros (1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave es por usuario y por endpoint.",
-              "examples": [
-                "7f5c2b1e-4a9d-4c3e-9f2a-1b8e6d0c4a51"
-              ],
-              "title": "Idempotency-Key"
-            }
-          }
-        ],
         "requestBody": {
           "content": {
             "application/json": {
@@ -1711,18 +1693,7 @@
                 }
               }
             },
-            "description": "Successful Response",
-            "headers": {
-              "Idempotent-Replayed": {
-                "description": "`true` solo cuando el body es el replay de una respuesta guardada con el mismo `Idempotency-Key` (no se volvió a ejecutar la operación).",
-                "schema": {
-                  "enum": [
-                    "true"
-                  ],
-                  "type": "string"
-                }
-              }
-            }
+            "description": "Successful Response"
           },
           "409": {
             "content": {

@@ -126,6 +126,98 @@ def test_migration_0005_upgrade_and_downgrade_are_clean() -> None:
     command.upgrade(cfg, "head")
 
 
+def test_migration_0006_upgrade_and_downgrade_are_clean() -> None:
+    """La migración `0006` se revierte y se vuelve a aplicar sin errores."""
+    cfg = _config()
+
+    command.downgrade(cfg, "0005")
+    command.upgrade(cfg, "head")
+
+
+def test_migration_0006_removes_non_alert_keys_and_makes_user_id_not_null() -> None:
+    """`0006`: borra las claves de users/fields y deja `user_id NOT NULL`."""
+    cfg = _config()
+    phone_number = f"+54{uuid.uuid4().int % 10**12:012d}"
+
+    async def _insert_rows() -> int:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                user_id = (
+                    await conn.execute(
+                        text(
+                            "INSERT INTO users (phone_number, name)"
+                            " VALUES (:phone, 'Idempotency probe') RETURNING id"
+                        ),
+                        {"phone": phone_number},
+                    )
+                ).scalar_one()
+                await conn.execute(
+                    text(
+                        "INSERT INTO idempotency_keys"
+                        " (user_id, scope, key, request_hash, status_code,"
+                        "  response_body, expires_at)"
+                        " VALUES"
+                        " (:user_id, 'POST /api/v1/alerts', 'keep',"
+                        "  repeat('a', 64), 201, '{}', now() + interval '1 day'),"
+                        " (NULL, 'POST /api/v1/users', 'drop',"
+                        "  repeat('b', 64), 201, '{}', now() + interval '1 day')"
+                    ),
+                    {"user_id": user_id},
+                )
+                return int(user_id)
+        finally:
+            await engine.dispose()
+
+    async def _state() -> tuple[list[str], str | None]:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.connect() as conn:
+                scopes = list(
+                    (
+                        await conn.execute(
+                            text("SELECT scope FROM idempotency_keys WHERE key IN ('keep', 'drop')")
+                        )
+                    ).scalars()
+                )
+                nullable = (
+                    await conn.execute(
+                        text(
+                            "SELECT is_nullable FROM information_schema.columns"
+                            " WHERE table_name = 'idempotency_keys' AND column_name = 'user_id'"
+                        )
+                    )
+                ).scalar_one()
+                return scopes, str(nullable)
+        finally:
+            await engine.dispose()
+
+    async def _cleanup() -> None:
+        engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+        try:
+            async with engine.begin() as conn:
+                await conn.execute(
+                    text("DELETE FROM users WHERE phone_number = :phone"),
+                    {"phone": phone_number},
+                )
+                await conn.execute(
+                    text("DELETE FROM idempotency_keys WHERE key IN ('keep', 'drop')")
+                )
+        finally:
+            await engine.dispose()
+
+    command.downgrade(cfg, "0005")
+    try:
+        asyncio.run(_insert_rows())
+        command.upgrade(cfg, "head")
+        scopes, nullable = asyncio.run(_state())
+        assert scopes == ["POST /api/v1/alerts"]
+        assert nullable == "NO"
+    finally:
+        command.upgrade(cfg, "head")
+        asyncio.run(_cleanup())
+
+
 def test_migration_0005_backfills_issued_at_from_fetched_at() -> None:
     """Una fila que existía antes de `0005` queda con `issued_at = fetched_at` (nunca NULL)."""
     cfg = _config()

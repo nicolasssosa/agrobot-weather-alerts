@@ -22,7 +22,7 @@ from app.schemas.alert import AlertCreate
 from app.schemas.common import BIGINT_MAX
 from app.services import alerts as alerts_service
 from app.services.alerts import create_alert
-from tests.conftest import TEST_DATABASE_URL, MakeAlert, MakeField, MakeUser, auth
+from tests.conftest import TEST_DATABASE_URL, ApiClient, MakeAlert, MakeField, MakeUser, auth
 
 API = "/api/v1/alerts"
 OLD_UPDATED_AT = datetime(2020, 1, 1, tzinfo=UTC)
@@ -1149,7 +1149,7 @@ async def test_two_concurrent_deletes_of_the_same_alert_are_both_204_and_cancel_
                     yield session
 
             app.dependency_overrides[get_session] = _override_session
-            return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+            return ApiClient(transport=ASGITransport(app=app), base_url="http://test")
 
         headers = {"X-User-Id": str(user_id)}
         async with build_client() as first, build_client() as second:
@@ -1311,7 +1311,7 @@ async def test_concurrent_identical_posts_produce_exactly_one_alert() -> None:
                     yield session
 
             app.dependency_overrides[get_session] = _override_session
-            return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+            return ApiClient(transport=ASGITransport(app=app), base_url="http://test")
 
         payload = {"field_id": field_id, "event_type": "frost", "threshold": 70}
         headers = {"X-User-Id": str(user_id)}
@@ -1501,7 +1501,7 @@ async def test_concurrent_posts_at_the_per_field_limit_allow_exactly_one() -> No
                     yield session
 
             app.dependency_overrides[get_session] = _override_session
-            return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+            return ApiClient(transport=ASGITransport(app=app), base_url="http://test")
 
         headers = {"X-User-Id": str(user_id)}
         async with build_client() as first, build_client() as second:

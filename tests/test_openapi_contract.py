@@ -144,12 +144,12 @@ def test_post_alerts_409_documents_the_per_field_limit() -> None:
     }
 
 
-_IDEMPOTENT_PATHS = ("/api/v1/users", "/api/v1/fields", "/api/v1/alerts")
+_IDEMPOTENT_PATHS = ("/api/v1/alerts",)
 
 
 @pytest.mark.parametrize("path", _IDEMPOTENT_PATHS)
 def test_idempotent_posts_declare_the_key_and_replay_headers(path: str) -> None:
-    """S10: los tres POST documentan `Idempotency-Key` y `Idempotent-Replayed`."""
+    """S11b: solo `POST /alerts` documenta `Idempotency-Key`, y es obligatorio."""
     operation = _spec()["paths"][path]["post"]
     key_headers = [
         parameter
@@ -158,9 +158,9 @@ def test_idempotent_posts_declare_the_key_and_replay_headers(path: str) -> None:
     ]
     assert len(key_headers) == 1
     key_header = key_headers[0]
-    assert key_header["required"] is False
+    assert key_header["required"] is True
     assert "Idempotency-Key" in key_header["description"]
-    assert key_header["schema"]["anyOf"] == [{"type": "string"}, {"type": "null"}]
+    assert key_header["schema"]["type"] == "string"
 
     replay = operation["responses"]["201"]["headers"]["Idempotent-Replayed"]
     assert replay["schema"] == {"type": "string", "enum": ["true"]}

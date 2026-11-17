@@ -103,7 +103,7 @@ Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.p
 ## S11 — Calidad de pronósticos · D14 · ✅
 - [ ] `weather_forecasts.issued_at`; upsert condicional (solo datos más nuevos); evaluador ignora pronósticos desactualizados y loguea un warning con la cantidad; `issued_at` visible en `GET /forecasts`.
 
-## S11b — Idempotency-Key obligatoria solo en `POST /alerts` · D13
+## S11b — Idempotency-Key obligatoria solo en `POST /alerts` · D13 · ✅
 - [ ] `POST /alerts` sin `Idempotency-Key` → 422 con el mensaje de API.md; el resto del comportamiento de la clave no cambia.
 - [ ] `POST /users` y `POST /fields` sin soporte de `Idempotency-Key` (el header se ignora) y sin el código especial de `/users` (scope por body, reconstrucción sin PII).
 - [ ] Migración 0006 según DATA_MODEL.md; OpenAPI con el header **requerido** en `POST /alerts` y sin header en los otros dos.

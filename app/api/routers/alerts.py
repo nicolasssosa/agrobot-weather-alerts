@@ -1,11 +1,12 @@
 """Router `alerts`. Ver docs/API.md §alerts."""
 
-from typing import Annotated
+from typing import Annotated, Any, Final
 
 from fastapi import APIRouter, Depends, Query, status
 from fastapi.responses import Response
 
 from app.api.deps import (
+    IDEMPOTENCY_KEY_PARAMETER,
     IDEMPOTENT_REPLAYED_HEADER,
     CurrentUser,
     IdempotencyKeyDep,
@@ -30,7 +31,12 @@ from app.services.alerts import (
     list_alerts,
     update_alert,
 )
-from app.services.idempotency import run_idempotent
+from app.services.idempotency import (
+    INVALID_KEY_DETAIL,
+    KEY_REUSED_DETAIL,
+    MISSING_KEY_DETAIL,
+    run_idempotent,
+)
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
 
@@ -47,6 +53,55 @@ _CREATE_ALERT_409 = {
     "content": {"application/json": {"example": {"detail": DUPLICATE_ALERT_DETAIL}}},
 }
 
+#: 422 de POST /alerts: el body inválido responde `HTTPValidationError` (`detail` lista),
+#: pero los rechazos de `Idempotency-Key` responden `ErrorResponse` (`detail` string),
+#: con el mismo patrón que el 422 de forecasts (docs/API.md §Idempotency-Key).
+_CREATE_ALERT_422: Final[dict[str, Any]] = {
+    "description": (
+        "Cuatro formas según el caso: un body inválido responde `HTTPValidationError` con "
+        "`detail` como lista de errores; el header `Idempotency-Key` ausente, mal formado "
+        "o reusado con otro body responde `ErrorResponse` con `detail` string."
+    ),
+    "content": {
+        "application/json": {
+            "schema": {
+                "anyOf": [
+                    {"$ref": "#/components/schemas/HTTPValidationError"},
+                    {"$ref": "#/components/schemas/ErrorResponse"},
+                ]
+            },
+            "examples": {
+                "invalid_body": {
+                    "summary": "Body inválido (validación automática de FastAPI)",
+                    "value": {
+                        "detail": [
+                            {
+                                "type": "less_than_equal",
+                                "loc": ["body", "threshold"],
+                                "msg": "Input should be less than or equal to 100",
+                                "input": 101,
+                                "ctx": {"le": 100},
+                            }
+                        ]
+                    },
+                },
+                "missing_key": {
+                    "summary": "Header `Idempotency-Key` ausente",
+                    "value": {"detail": MISSING_KEY_DETAIL},
+                },
+                "invalid_key": {
+                    "summary": "Header `Idempotency-Key` mal formado",
+                    "value": {"detail": INVALID_KEY_DETAIL},
+                },
+                "reused_key": {
+                    "summary": "Misma clave con un body distinto",
+                    "value": {"detail": KEY_REUSED_DETAIL},
+                },
+            },
+        }
+    },
+}
+
 
 @router.post(
     "",
@@ -61,18 +116,18 @@ _CREATE_ALERT_409 = {
     responses={
         **protected_responses((404, "Field not found")),
         409: _CREATE_ALERT_409,
+        422: _CREATE_ALERT_422,
         201: {"headers": {"Idempotent-Replayed": IDEMPOTENT_REPLAYED_HEADER}},
     },
+    openapi_extra={"parameters": [IDEMPOTENCY_KEY_PARAMETER]},
 )
 async def create_alert_endpoint(
     payload: AlertCreate,
     user: CurrentUser,
     session: SessionDep,
     idempotency_key: IdempotencyKeyDep,
-) -> Alert | Response:
-    """Crea una alerta del usuario autenticado."""
-    if idempotency_key is None:
-        return await create_alert(session, user.id, payload)
+) -> Response:
+    """Crea una alerta del usuario autenticado (idempotente por `Idempotency-Key`)."""
     result = await run_idempotent(
         session,
         user_id=user.id,

@@ -18,13 +18,10 @@ from app.schemas.field import FieldCreate
 from app.services._db_errors import is_unique_violation
 
 
-async def create_field(
-    session: AsyncSession, user_id: int, data: FieldCreate, *, commit: bool = True
-) -> Field:
+async def create_field(session: AsyncSession, user_id: int, data: FieldCreate) -> Field:
     """Crea un campo del usuario. Nombre duplicado -> `ConflictError`.
 
-    La unicidad se detecta con `flush()` (sqlstate 23505). Con `commit=False` la fila
-    queda en la transacción abierta para la idempotencia (docs/API.md §Idempotency-Key).
+    La unicidad se detecta con `flush()` (sqlstate 23505), no con el commit.
     """
     field = Field(
         user_id=user_id,
@@ -40,8 +37,7 @@ async def create_field(
         if not is_unique_violation(exc):
             raise
         raise ConflictError("Field name already exists") from None
-    if commit:
-        await session.commit()
+    await session.commit()
     return field
 
 

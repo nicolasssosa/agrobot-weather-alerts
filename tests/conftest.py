@@ -13,11 +13,13 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from datetime import UTC, date, datetime
 from decimal import Decimal
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from httpx import ASGITransport, AsyncClient
+from httpx import ASGITransport, AsyncClient, Request, Response
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -72,15 +74,61 @@ def test_sessionmaker(db_session: AsyncSession) -> async_sessionmaker[AsyncSessi
     )
 
 
-@pytest.fixture
-async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
+#: Ruta cuyo POST exige `Idempotency-Key` (S11b, docs/API.md §Idempotency-Key).
+ALERTS_PATH = "/api/v1/alerts"
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+
+
+class ApiClient(AsyncClient):
+    """`AsyncClient` que agrega un `Idempotency-Key` único a cada `POST /alerts`.
+
+    Desde S11b ese header es obligatorio, pero la mayoría de los tests que crean alertas
+    no lo necesitan: sin él solo comprobarían el 422 del contrato. El cliente agrega un
+    UUID v4 distinto por request (así no convierte dos POST iguales en un replay) salvo
+    que el test ya mande uno. `auto_idempotency=False` (fixture `raw_client`) lo desactiva
+    para los tests que validan explícitamente el header ausente o inválido.
+    """
+
+    def __init__(self, *args: Any, auto_idempotency: bool = True, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.auto_idempotency = auto_idempotency
+
+    async def send(self, request: Request, **kwargs: Any) -> Response:
+        if (
+            self.auto_idempotency
+            and request.method == "POST"
+            and request.url.path.rstrip("/") == ALERTS_PATH
+            and IDEMPOTENCY_KEY_HEADER not in request.headers
+        ):
+            request.headers[IDEMPOTENCY_KEY_HEADER] = str(uuid4())
+        return await super().send(request, **kwargs)
+
+
+def _api_client(db_session: AsyncSession, *, auto_idempotency: bool) -> ApiClient:
     app = create_app()
 
     async def _override_session() -> AsyncIterator[AsyncSession]:
         yield db_session
 
     app.dependency_overrides[get_session] = _override_session
-    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
+    return ApiClient(
+        transport=ASGITransport(app=app),
+        base_url="http://test",
+        auto_idempotency=auto_idempotency,
+    )
+
+
+@pytest.fixture
+async def client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    """Cliente de la API; agrega `Idempotency-Key` a `POST /alerts` (ver `ApiClient`)."""
+    async with _api_client(db_session, auto_idempotency=True) as ac:
+        yield ac
+
+
+@pytest.fixture
+async def raw_client(db_session: AsyncSession) -> AsyncIterator[AsyncClient]:
+    """Cliente sin el `Idempotency-Key` automático (tests del header ausente)."""
+    async with _api_client(db_session, auto_idempotency=False) as ac:
         yield ac
 
 
