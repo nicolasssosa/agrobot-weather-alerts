@@ -172,12 +172,6 @@ Contrato: API.md §Convenciones y §fields, JOBS.md §Evaluador (paso 0).
 - [ ] 422 acotado: como máximo 20 errores en `detail` (los primeros, en el orden de FastAPI); si hay más, se agrega un último elemento `{"loc": [], "msg": "<n> more errors omitted", "type": "too_many_errors"}` con `n` = cantidad omitida. Con 20 o menos, la respuesta no cambia.
 - [ ] Settings nuevos en `config.py` y `.env.example`. OpenAPI regenerado si cambia algún texto; test de contrato verde.
 
-## S14b — Job de retención y follow-ups de S14a · D16
-- [ ] Job de retención en el worker con `RETENTION_DAYS` (default 30): borra `weather_forecasts` y `alert_day_states` con fecha anterior a hoy UTC − `RETENTION_DAYS` y las claves de idempotencia vencidas; las notificaciones se conservan.
-
-## S15 — Observabilidad
-- [ ] Logs JSON estructurados con `request_id`; métricas Prometheus (`/metrics`); `GET /health/live` y `/health/ready` (DB + heartbeat del worker).
-
 ## S16 — CI (GitHub Actions) + pre-commit + cobertura + GitHub Pages · RNF-07
 Archivos: `.github/workflows/ci.yml` (nuevo), `site/index.html` (nuevo), `.pre-commit-config.yaml` (nuevo),
 `pyproject.toml` + `uv.lock` (dependencia dev `pytest-cov` y config de cobertura), `Makefile` (target `cov`),
@@ -222,7 +216,7 @@ Follow-ups:
 | S2 SEC-3 | minor | Enumeración de teléfonos vía 409 en `POST /users` público. Mitigación: rate limit por IP + log enmascarado; eliminar signup público con auth real | README §Próximos pasos |
 | S2 CR-3 | minor | `X-User-Id` con > 19 caracteres (ceros a la izquierda) → 401 aunque el valor sea válido (falla cerrada) | ✅ documentado en API.md §Convenciones |
 | S2 CR-dup | nit | `_is_unique_violation` duplicado en services users/fields | ✅ resuelto en S4 |
-| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | **S14b** (retención) |
+| S3 SEC-note | minor | Sin retención de `weather_forecasts` (crece ~1.825 filas/campo/año) ni tope de rango en `GET /forecasts`. Mitigación: job de purga de fechas pasadas y/o máximo `date_to - date_from` (ej. 366 días) | README §Próximos pasos |
 | S4 CR-4 + SEC-2 | minor | Sin límite de tamaño de body ni de cantidad de errores en el 422 (20k claves extra → 422 de 2 MB). Fix: middleware de tamaño máximo de request (ej. 64 KB) + tope de errores en el handler | **S14a** |
 | S5 SEC-1 | minor | Sin cuota de campos/alertas por usuario: un usuario puede inflar una corrida del evaluador (y luego el envío). Mitigación: `MAX_FIELDS_PER_USER` en el service de fields + rate limit; opcional horizonte o tope por ciclo | **S14a** (`MAX_FIELDS_PER_USER`; el horizonte ya está en S12a) |
 | S5 CR-3 | minor | Un DELETE de alerta que commitea durante el INSERT…SELECT puede abortar el statement por FK (23503); el worker reintenta al próximo ciclo (autocorrige) | README §Limitaciones |
@@ -233,9 +227,9 @@ Follow-ups:
 | S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S16** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
 | S9 CR-2 | nit | Migración 0003 transaccional (bloquea escrituras mientras crea el índice); en producción con tablas grandes usar `CONCURRENTLY` / `NOT VALID` (documentado en DATA_MODEL) | — |
-| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | **S15** (logs) |
+| S10 SEC-3 | nit | Los logs `idempotency_*` de `POST /users` incluyen el sufijo del scope (huella SHA-256 del body); loguear el scope base o usar HMAC con secreto | README §Próximos pasos |
 | S16 SEC-1 | minor | Acciones de terceros pinneadas por tag mayor: si se mueve el tag de `astral-sh/setup-uv`, podría alterar el HTML de cobertura que se publica en Pages. Fix: pinnear por SHA con la versión en comentario + Dependabot para `github-actions` | S17 |
 | S16 CR-1 | minor | El primer deploy de Pages requiere Pages habilitado con source "GitHub Actions" (el `GITHUB_TOKEN` no puede habilitarlo) | paso único al hacer público el repo |
 | S12b CR-2 | nit | Tests de lock/carrera de S12b: si una regresión deja un PATCH colgado, el cleanup puede bloquearse en vez de fallar (agregar `statement_timeout` en el cleanup o cancelar la task) | S17 (S16 ya mergeada) |
-| S14a CR-4 | minor | `update_alert` decide el re-armado con la lectura previa al lock compartido: dos PATCH simultáneos sobre la misma alerta pueden perder un re-armado (re-aviso perdido hasta que la probabilidad baje del margen) o hacer uno de más. Fix: releer la alerta con `FOR UPDATE` bajo el lock | S14b |
-| S14a CR-5 | nit | Si el `rollback()` del worker tras `evaluation_failed` lanza (conexión caída), ese ciclo no despacha. Fix: proteger el rollback con su propio try/except | S14b |
+| S14a CR-4 | minor | `update_alert` decide el re-armado con la lectura previa al lock compartido: dos PATCH simultáneos sobre la misma alerta pueden perder un re-armado (re-aviso perdido hasta que la probabilidad baje del margen) o hacer uno de más. Fix: releer la alerta con `FOR UPDATE` bajo el lock | README §Limitaciones |
+| S14a CR-5 | nit | Si el `rollback()` del worker tras `evaluation_failed` lanza (conexión caída), ese ciclo no despacha. Fix: proteger el rollback con su propio try/except | README §Limitaciones |
