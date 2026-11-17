@@ -128,7 +128,14 @@ async def test_user_read_exposes_only_the_documented_fields(client: AsyncClient)
     response = await client.post(API, json={"phone_number": "+5491122334458", "name": "Ana"})
 
     assert response.status_code == 201
-    assert set(response.json()) == {"id", "phone_number", "name", "created_at"}
+    assert set(response.json()) == {
+        "id",
+        "phone_number",
+        "name",
+        "timezone",
+        "quiet_hours",
+        "created_at",
+    }
 
 
 @pytest.mark.parametrize(
@@ -219,3 +226,176 @@ async def test_non_unique_integrity_error_is_not_mapped_to_409(
 
     with pytest.raises(IntegrityError):
         await create_user(db_session, payload)
+
+
+# --- Zona horaria y horario de silencio (S13, D15) --------------------------
+
+
+async def test_create_user_defaults_to_the_buenos_aires_timezone_without_quiet_hours(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(API, json={"phone_number": "+5491122334470", "name": "Ana"})
+
+    assert response.status_code == 201
+    assert response.json()["timezone"] == "America/Argentina/Buenos_Aires"
+    assert response.json()["quiet_hours"] is None
+
+
+async def test_create_user_accepts_a_timezone_and_a_quiet_hours_window(
+    client: AsyncClient,
+) -> None:
+    response = await client.post(
+        API,
+        json={
+            "phone_number": "+5491122334471",
+            "name": "Ana",
+            "timezone": "America/Argentina/Cordoba",
+            "quiet_hours": {"start": "22:00", "end": "07:00"},
+        },
+    )
+
+    assert response.status_code == 201
+    body = response.json()
+    assert body["timezone"] == "America/Argentina/Cordoba"
+    assert body["quiet_hours"] == {"start": "22:00", "end": "07:00"}
+
+
+@pytest.mark.parametrize(
+    "quiet_hours",
+    [
+        {"start": "22:00", "end": "22:00"},
+        {"start": "22:00:30", "end": "07:00"},
+        {"start": "22:00+03:00", "end": "07:00"},
+        {"start": "25:00", "end": "07:00"},
+        {"start": "22:00"},
+    ],
+)
+async def test_create_user_with_an_invalid_quiet_hours_window_returns_422(
+    client: AsyncClient, quiet_hours: dict[str, str]
+) -> None:
+    response = await client.post(
+        API,
+        json={
+            "phone_number": "+5491122334472",
+            "name": "Ana",
+            "quiet_hours": quiet_hours,
+        },
+    )
+
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("timezone", ["Mars/Olympus", "localtime", "", "../etc/passwd"])
+async def test_create_user_with_an_invalid_timezone_returns_422(
+    client: AsyncClient, timezone: str
+) -> None:
+    response = await client.post(
+        API,
+        json={"phone_number": "+5491122334473", "name": "Ana", "timezone": timezone},
+    )
+
+    assert response.status_code == 422
+
+
+async def test_patch_sets_the_quiet_hours_window(client: AsyncClient, make_user: MakeUser) -> None:
+    user = await make_user()
+
+    response = await client.patch(
+        f"{API}/me", json={"quiet_hours": {"start": "22:00", "end": "07:00"}}, headers=auth(user)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["quiet_hours"] == {"start": "22:00", "end": "07:00"}
+    # La zona no se toca si no se envía.
+    assert response.json()["timezone"] == "America/Argentina/Buenos_Aires"
+
+
+async def test_patch_updates_the_timezone(client: AsyncClient, make_user: MakeUser) -> None:
+    user = await make_user()
+
+    response = await client.patch(
+        f"{API}/me",
+        json={"timezone": "America/Argentina/Cordoba"},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["timezone"] == "America/Argentina/Cordoba"
+
+
+async def test_patch_null_quiet_hours_disables_the_silence(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    user = await make_user()
+    await client.patch(
+        f"{API}/me", json={"quiet_hours": {"start": "22:00", "end": "07:00"}}, headers=auth(user)
+    )
+
+    response = await client.patch(f"{API}/me", json={"quiet_hours": None}, headers=auth(user))
+
+    assert response.status_code == 200
+    assert response.json()["quiet_hours"] is None
+
+
+async def test_patch_omitting_quiet_hours_keeps_the_configured_window(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    user = await make_user()
+    await client.patch(
+        f"{API}/me", json={"quiet_hours": {"start": "22:00", "end": "07:00"}}, headers=auth(user)
+    )
+
+    response = await client.patch(
+        f"{API}/me", json={"timezone": "America/Argentina/Cordoba"}, headers=auth(user)
+    )
+
+    assert response.status_code == 200
+    assert response.json()["quiet_hours"] == {"start": "22:00", "end": "07:00"}
+    assert response.json()["timezone"] == "America/Argentina/Cordoba"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {},
+        {"quiet_hours": {"start": "22:00", "end": "22:00"}},
+        {"quiet_hours": {"start": "22:00:30", "end": "07:00"}},
+        {"quiet_hours": {"start": "22:00+03:00", "end": "07:00"}},
+        {"timezone": "Mars/Olympus"},
+        {"timezone": "localtime"},
+        {"timezone": None},
+        {"phone_number": "+5491122334499"},
+        {"name": "Otro Nombre"},
+        {"quiet_hours": {"start": "22:00", "end": "07:00", "extra": 1}},
+    ],
+)
+async def test_invalid_patch_returns_422(
+    client: AsyncClient, make_user: MakeUser, payload: dict[str, object]
+) -> None:
+    user = await make_user()
+
+    response = await client.patch(f"{API}/me", json=payload, headers=auth(user))
+
+    assert response.status_code == 422
+
+
+async def test_patch_without_the_auth_header_returns_401(client: AsyncClient) -> None:
+    response = await client.patch(f"{API}/me", json={"quiet_hours": None})
+
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Missing or invalid X-User-Id header"}
+
+
+async def test_patch_only_touches_the_authenticated_user(
+    client: AsyncClient, make_user: MakeUser
+) -> None:
+    ana = await make_user()
+    bruno = await make_user()
+
+    await client.patch(
+        f"{API}/me", json={"quiet_hours": {"start": "22:00", "end": "07:00"}}, headers=auth(ana)
+    )
+
+    other = await client.get(f"{API}/me", headers=auth(bruno))
+    assert other.json()["quiet_hours"] is None
+    assert other.json()["timezone"] == "America/Argentina/Buenos_Aires"

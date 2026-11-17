@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     notifier_timeout_seconds: float = Field(default=10.0, gt=0)
     dispatch_concurrency: int = Field(default=10, ge=1, le=100)
     dispatch_lease_seconds: int = Field(default=120, ge=10, le=3600)
+    # Tope de notificaciones por mensaje en el envío agrupado por usuario (S13, D15).
+    digest_max_items: int = Field(default=10, ge=1, le=20)
 
     @model_validator(mode="after")
     def _lease_covers_the_worst_case_batch(self) -> Self:

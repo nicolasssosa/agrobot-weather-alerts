@@ -19,7 +19,7 @@ from app.schemas.common import ErrorResponse
 from app.schemas.field import FieldCreate, FieldPage, FieldRead
 from app.schemas.forecast import ForecastRead
 from app.schemas.notification import NotificationPage, NotificationRead
-from app.schemas.user import UserCreate, UserRead
+from app.schemas.user import UserCreate, UserRead, UserUpdate
 from app.scripts.export_openapi import OPENAPI_PATH, render_openapi
 from app.services.alerts import ALERT_LIMIT_DETAIL
 
@@ -54,6 +54,7 @@ EXPECTED_409 = {
 _SCHEMA_MODELS: dict[str, type[Any]] = {
     "UserCreate": UserCreate,
     "UserRead": UserRead,
+    "UserUpdate": UserUpdate,
     "FieldCreate": FieldCreate,
     "FieldRead": FieldRead,
     "ForecastRead": ForecastRead,

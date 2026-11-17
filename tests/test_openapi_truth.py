@@ -247,6 +247,8 @@ def _valid_body(method: str, path: str, ctx: Ctx) -> dict[str, Any] | None:
         return {"field_id": ctx.field.id, "event_type": "hail", "threshold": 50}
     if key == ("patch", f"{_API}/alerts/{{alert_id}}"):
         return {"threshold": 60}
+    if key == ("patch", f"{_API}/users/me"):
+        return {"quiet_hours": {"start": "22:00", "end": "07:00"}}
     return None
 
 
@@ -344,6 +346,8 @@ async def _probe_422(ctx: Ctx, method: str, path: str) -> Response:
         )
     if key == ("patch", f"{_API}/alerts/{{alert_id}}"):
         return await _request(ctx, method, path, headers=headers, json_body={})
+    if key == ("patch", f"{_API}/users/me"):
+        return await _request(ctx, method, path, headers=headers, json_body={})
     if key == ("delete", f"{_API}/alerts/{{alert_id}}"):
         return await _request(
             ctx, method, path, headers=headers, raw_path_params={"alert_id": "not-an-int"}
@@ -427,6 +431,14 @@ async def _probe_success(ctx: Ctx, method: str, path: str) -> Response:
         )
     if key == ("get", f"{_API}/users/me"):
         return await _request(ctx, method, path, headers=headers)
+    if key == ("patch", f"{_API}/users/me"):
+        return await _request(
+            ctx,
+            method,
+            path,
+            headers=headers,
+            json_body={"timezone": "America/Argentina/Cordoba"},
+        )
     if key == ("post", f"{_API}/fields"):
         return await _request(
             ctx,
@@ -492,6 +504,7 @@ _EXPECTED_ERROR_CODES: dict[tuple[str, str], set[int]] = {
     ("get", "/health"): {503},
     ("post", f"{_API}/users"): {409, 422},
     ("get", f"{_API}/users/me"): {401},
+    ("patch", f"{_API}/users/me"): {401, 422},
     ("post", f"{_API}/fields"): {401, 409, 422},
     ("get", f"{_API}/fields"): {401, 422},
     ("get", f"{_API}/fields/{{field_id}}"): {401, 404, 422},
@@ -548,6 +561,7 @@ _REQUEST_BODY_OPERATIONS = {
     ("post", f"{_API}/fields"),
     ("post", f"{_API}/alerts"),
     ("patch", f"{_API}/alerts/{{alert_id}}"),
+    ("patch", f"{_API}/users/me"),
 }
 
 
@@ -592,6 +606,12 @@ async def test_try_it_out_examples_work_without_editing_the_body(client: AsyncCl
     _validate_body(
         _json_content("patch", f"{_API}/alerts/{{alert_id}}", 200)["schema"], patched.json()
     )
+
+    user_update_example = _request_example("patch", f"{_API}/users/me")
+    updated_user = await client.patch(f"{_API}/users/me", json=user_update_example, headers=headers)
+    assert updated_user.status_code == 200, updated_user.text
+    assert updated_user.json()["timezone"] == user_update_example["timezone"]
+    _validate_body(_json_content("patch", f"{_API}/users/me", 200)["schema"], updated_user.json())
 
 
 # --- Ejemplos de response -----------------------------------------------------

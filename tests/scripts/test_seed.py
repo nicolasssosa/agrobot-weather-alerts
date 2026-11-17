@@ -70,6 +70,11 @@ async def test_seed_then_one_worker_cycle_sends_notifications(
             notifier_timeout_seconds=1.0,
             dispatch_concurrency=10,
             dispatch_lease_seconds=60,
+            # S13: el digest topa las notificaciones por usuario y lote. Con el default (10)
+            # y menos usuarios que `batch_size`, el excedente sale en el ciclo siguiente: acá
+            # se pide el máximo documentado para que un solo ciclo drene todo (cada usuario
+            # demo tiene a lo sumo 2 alertas x 7 días = 14 avisos).
+            digest_max_items=20,
         ),
         now=NOW,
         clock=lambda: CLAIM_NOW,
@@ -79,7 +84,9 @@ async def test_seed_then_one_worker_cycle_sends_notifications(
     assert result.dispatch.sent == result.created
     assert result.dispatch.retried == 0
     assert result.dispatch.failed == 0
-    assert len(fake_notifier.sent) == result.created
+    # S13: un solo mensaje por usuario (el digest agrupa sus notificaciones).
+    assert len(fake_notifier.sent) == result.dispatch.users
+    assert result.dispatch.users <= 2
     statuses = (await db_session.scalars(select(Notification.status))).all()
     assert len(statuses) == result.created
     assert all(status == NotificationStatus.SENT for status in statuses)

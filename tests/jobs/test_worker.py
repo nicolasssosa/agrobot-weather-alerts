@@ -13,6 +13,7 @@ import signal
 import time
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
+from datetime import time as dt_time
 
 import pytest
 from sqlalchemy import select
@@ -118,7 +119,9 @@ async def test_run_cycle_evaluates_and_sends_end_to_end(
         clock=_clock_at(CLAIM_NOW),
     )
 
-    assert result == CycleResult(created=1, dispatch=DispatchResult(sent=1, retried=0, failed=0))
+    assert result == CycleResult(
+        created=1, dispatch=DispatchResult(sent=1, retried=0, failed=0, users=1)
+    )
     notification = await db_session.scalar(select(Notification))
     assert notification is not None
     assert fake_notifier.sent == [
@@ -154,19 +157,20 @@ async def test_run_cycle_evaluates_and_sends_end_to_end(
 async def test_run_cycle_drains_several_batches_with_a_fresh_now_per_batch(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
     make_field: MakeField,
     make_forecast: MakeForecast,
     make_alert: MakeAlert,
     fake_notifier: FakeNotifier,
     monkeypatch,
 ) -> None:
-    """Con `batch_size=2` y 5 pendientes se hacen 3 lotes, cada uno con su propio `now`."""
-    field = await make_field()
-    await make_alert(field, event_type=EventType.FROST, threshold=70)
-    for offset in range(5):
+    """Con `batch_size=2` (usuarios) y 5 usuarios con avisos se hacen 3 lotes."""
+    for _ in range(5):
+        field = await make_field(await make_user())
+        await make_alert(field, event_type=EventType.FROST, threshold=70)
         await make_forecast(
             field,
-            forecast_date=FORECAST_DATE + timedelta(days=offset),
+            forecast_date=FORECAST_DATE,
             event_type=EventType.FROST,
             probability=90,
             issued_at=EVAL_NOW,
@@ -191,7 +195,7 @@ async def test_run_cycle_drains_several_batches_with_a_fresh_now_per_batch(
     )
 
     assert result.created == 5
-    assert result.dispatch == DispatchResult(sent=5, retried=0, failed=0)
+    assert result.dispatch == DispatchResult(sent=5, retried=0, failed=0, users=5)
     assert len(fake_notifier.sent) == 5
     assert len(recorded) == 3
     # Un `now` fresco y distinto por lote (SEC-3), en orden creciente.
@@ -205,17 +209,18 @@ async def test_run_cycle_drains_several_batches_with_a_fresh_now_per_batch(
 async def test_run_cycle_does_not_start_a_new_batch_after_stop_event(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
     make_field: MakeField,
     make_forecast: MakeForecast,
     make_alert: MakeAlert,
 ) -> None:
     """Si el notifier setea `stop_event` en el primer lote, no se arranca el segundo (SEC-2)."""
-    field = await make_field()
-    await make_alert(field, event_type=EventType.FROST, threshold=70)
-    for offset in range(4):
+    for _ in range(4):
+        field = await make_field(await make_user())
+        await make_alert(field, event_type=EventType.FROST, threshold=70)
         await make_forecast(
             field,
-            forecast_date=FORECAST_DATE + timedelta(days=offset),
+            forecast_date=FORECAST_DATE,
             event_type=EventType.FROST,
             probability=90,
             issued_at=EVAL_NOW,
@@ -244,9 +249,9 @@ async def test_run_cycle_does_not_start_a_new_batch_after_stop_event(
         stop_event=stop_event,
     )
 
-    # Solo se envió el primer lote; las 2 pendientes quedan para el próximo arranque.
+    # Solo se envió el primer lote (2 usuarios); las 2 pendientes quedan para el próximo arranque.
     assert result.created == 4
-    assert result.dispatch == DispatchResult(sent=2, retried=0, failed=0)
+    assert result.dispatch == DispatchResult(sent=2, retried=0, failed=0, users=2)
     assert len(notifier.sent) == 2
     statuses = (await db_session.scalars(select(Notification.status))).all()
     assert statuses.count(NotificationStatus.SENT) == 2
@@ -313,21 +318,31 @@ async def test_run_cycle_stops_draining_when_a_batch_changes_nothing(
     assert calls == 1
 
 
-async def test_run_cycle_accumulates_cancelled_and_counts_them_as_processed(
+async def test_run_cycle_accumulates_cancelled_and_keeps_draining_a_full_batch(
     test_sessionmaker: async_sessionmaker[AsyncSession],
     fake_notifier: FakeNotifier,
     monkeypatch,
     caplog,
 ) -> None:
-    """S9: `cancelled` se acumula, se loguea y un lote lleno de canceladas no corta el drenado."""
+    """S9/S13: `cancelled` se acumula y un lote lleno de canceladas no corta el drenado.
+
+    Lo que decide seguir es `users == batch_size` (usuarios procesados), no la cantidad de
+    notificaciones enviadas.
+    """
     calls = 0
 
     async def cancelling_then_sending(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
         if calls == 1:
-            return DispatchResult(sent=0, retried=0, failed=0, cancelled=kwargs["batch_size"])
-        return DispatchResult(sent=1, retried=0, failed=0)
+            return DispatchResult(
+                sent=0,
+                retried=0,
+                failed=0,
+                cancelled=kwargs["batch_size"],
+                users=kwargs["batch_size"],
+            )
+        return DispatchResult(sent=1, retried=0, failed=0, users=1)
 
     monkeypatch.setattr(worker, "dispatch_pending", cancelling_then_sending)
 
@@ -341,7 +356,7 @@ async def test_run_cycle_accumulates_cancelled_and_counts_them_as_processed(
         )
 
     assert calls == 2
-    assert result.dispatch == DispatchResult(sent=1, retried=0, failed=0, cancelled=2)
+    assert result.dispatch == DispatchResult(sent=1, retried=0, failed=0, cancelled=2, users=3)
     assert any(
         "cycle_done" in record.getMessage() and "cancelled=2" in record.getMessage()
         for record in caplog.records
@@ -393,6 +408,7 @@ async def test_run_cycle_does_not_dispatch_when_evaluate_alerts_raises(
 async def test_run_cycle_keeps_committed_work_when_a_later_batch_raises(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
     make_field: MakeField,
     make_forecast: MakeForecast,
     make_alert: MakeAlert,
@@ -400,12 +416,12 @@ async def test_run_cycle_keeps_committed_work_when_a_later_batch_raises(
     monkeypatch,
 ) -> None:
     """Un lote que lanza no pierde lo ya evaluado/commiteado; el ciclo siguiente lo drena."""
-    field = await make_field()
-    await make_alert(field, event_type=EventType.FROST, threshold=70)
-    for offset in range(5):
+    for _ in range(5):
+        field = await make_field(await make_user())
+        await make_alert(field, event_type=EventType.FROST, threshold=70)
         await make_forecast(
             field,
-            forecast_date=FORECAST_DATE + timedelta(days=offset),
+            forecast_date=FORECAST_DATE,
             event_type=EventType.FROST,
             probability=90,
             issued_at=EVAL_NOW,
@@ -449,7 +465,9 @@ async def test_run_cycle_keeps_committed_work_when_a_later_batch_raises(
         clock=_clock_at(CLAIM_NOW),
     )
 
-    assert second == CycleResult(created=0, dispatch=DispatchResult(sent=3, retried=0, failed=0))
+    assert second == CycleResult(
+        created=0, dispatch=DispatchResult(sent=3, retried=0, failed=0, users=3)
+    )
     assert fake_notifier.sent != []
 
 
@@ -464,7 +482,7 @@ async def test_run_cycle_caps_the_number_of_batches_per_cycle(
     async def always_full(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
         nonlocal calls
         calls += 1
-        return DispatchResult(sent=kwargs["batch_size"], retried=0, failed=0)
+        return DispatchResult(sent=1, retried=0, failed=0, users=kwargs["batch_size"])
 
     monkeypatch.setattr(worker, "dispatch_pending", always_full)
 
@@ -478,7 +496,10 @@ async def test_run_cycle_caps_the_number_of_batches_per_cycle(
 
     assert calls == MAX_DISPATCH_BATCHES_PER_CYCLE
     assert result.dispatch == DispatchResult(
-        sent=MAX_DISPATCH_BATCHES_PER_CYCLE * 2, retried=0, failed=0
+        sent=MAX_DISPATCH_BATCHES_PER_CYCLE,
+        retried=0,
+        failed=0,
+        users=MAX_DISPATCH_BATCHES_PER_CYCLE * 2,
     )
 
 
@@ -942,7 +963,9 @@ async def test_one_cycle_evaluates_each_field_with_its_own_local_today(
         clock=_clock_at(CLAIM_NOW),
     )
 
-    assert result == CycleResult(created=2, dispatch=DispatchResult(sent=2, retried=0, failed=0))
+    assert result == CycleResult(
+        created=2, dispatch=DispatchResult(sent=2, retried=0, failed=0, users=2)
+    )
     notifications = list((await db_session.execute(select(Notification))).scalars().all())
     rows = {(notification.alert_id, notification.forecast_date) for notification in notifications}
     assert rows == {
@@ -951,3 +974,138 @@ async def test_one_cycle_evaluates_each_field_with_its_own_local_today(
     }
     assert {notification.status for notification in notifications} == {NotificationStatus.SENT}
     assert len(fake_notifier.sent) == 2
+
+
+# --- S13: envío agrupado, digest y horario de silencio ----------------------
+
+
+async def test_run_cycle_passes_digest_max_items_to_the_dispatcher(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    fake_notifier: FakeNotifier,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    async def recording_dispatch(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
+        captured.update(kwargs)
+        return DispatchResult(sent=0, retried=0, failed=0)
+
+    monkeypatch.setattr(worker, "dispatch_pending", recording_dispatch)
+    settings = _settings(batch_size=3).model_copy(update={"digest_max_items": 4})
+
+    await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        settings,
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert captured["digest_max_items"] == 4
+    assert captured["batch_size"] == 3
+
+
+async def test_run_cycle_keeps_draining_while_the_batch_comes_full(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    make_alert: MakeAlert,
+    fake_notifier: FakeNotifier,
+) -> None:
+    """`batch_size=1` y 3 avisos del mismo usuario con `digest_max_items=2`: 2 lotes (2+1).
+
+    El lote vino lleno (1 usuario == batch_size) aunque no quedaran notificaciones: el worker
+    sigue drenando; el excedente del digest sale en el lote siguiente.
+    """
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    for offset in range(3):
+        await make_forecast(
+            field,
+            forecast_date=FORECAST_DATE + timedelta(days=offset),
+            event_type=EventType.FROST,
+            probability=90,
+            issued_at=EVAL_NOW,
+        )
+    settings = _settings(batch_size=1).model_copy(update={"digest_max_items": 2})
+
+    result = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        settings,
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert result.created == 3
+    assert result.dispatch == DispatchResult(sent=3, retried=0, failed=0, users=2)
+    # Un mensaje con 2 avisos y otro con el que quedó para el lote siguiente.
+    assert len(fake_notifier.sent) == 2
+    assert fake_notifier.sent[0].text.startswith("⚠️ Tenés 2 alertas climáticas:")
+    assert "Tenés" not in fake_notifier.sent[1].text
+    statuses = (await db_session.scalars(select(Notification.status))).all()
+    assert statuses.count(NotificationStatus.SENT) == 3
+
+
+async def test_run_cycle_defers_during_quiet_hours_and_sends_a_digest_when_it_ends(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    make_alert: MakeAlert,
+    fake_notifier: FakeNotifier,
+) -> None:
+    """S13/D15: en silencio no se envía nada; al terminar salen todas juntas en un mensaje."""
+    owner = await make_user()
+    owner.quiet_hours_start = dt_time(8, 0)
+    owner.quiet_hours_end = dt_time(10, 0)
+    await db_session.flush()
+    field = await make_field(owner, name="Lote Norte")
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    for offset in range(2):
+        await make_forecast(
+            field,
+            forecast_date=FORECAST_DATE + timedelta(days=offset),
+            event_type=EventType.FROST,
+            probability=90,
+            issued_at=EVAL_NOW,
+        )
+
+    # 12:01Z del 01/01/2030 = 09:01 local: adentro de la ventana 08:00-10:00.
+    deferred = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        _settings(),
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert deferred == CycleResult(
+        created=2,
+        dispatch=DispatchResult(sent=0, retried=0, failed=0, deferred=2, users=1),
+    )
+    assert fake_notifier.sent == []
+    quiet_until_local_end = datetime(2030, 1, 1, 13, 0, tzinfo=UTC)  # 10:00 local
+    for notification in (await db_session.scalars(select(Notification))).all():
+        assert notification.status == NotificationStatus.PENDING
+        assert notification.next_attempt_at == quiet_until_local_end
+        assert notification.attempts == 0
+
+    sent = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        _settings(),
+        now=datetime(2030, 1, 1, 12, 0, tzinfo=UTC),
+        clock=_clock_at(quiet_until_local_end),
+    )
+
+    assert sent == CycleResult(
+        created=0,
+        dispatch=DispatchResult(sent=2, retried=0, failed=0, users=1),
+    )
+    assert len(fake_notifier.sent) == 1
+    assert fake_notifier.sent[0].text.startswith("⚠️ Tenés 2 alertas climáticas:")
+    statuses = (await db_session.scalars(select(Notification.status))).all()
+    assert statuses.count(NotificationStatus.SENT) == 2

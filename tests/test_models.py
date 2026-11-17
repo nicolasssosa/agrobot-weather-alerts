@@ -1,6 +1,6 @@
 """Tests de constraints del modelo de datos (docs/DATA_MODEL.md)."""
 
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal
 
 import pytest
@@ -702,3 +702,48 @@ async def test_last_error_longer_than_1000_characters_is_rejected(
             notification = await _make_notification(db_session, alert)
             notification.last_error = "x" * 1001
             await db_session.flush()
+
+
+# --- Horario de silencio del usuario (S13, migración 0009) ------------------
+
+
+async def test_quiet_hours_requires_both_boundaries(db_session: AsyncSession) -> None:
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            db_session.add(
+                User(
+                    phone_number="+5491100077001",
+                    name="Solo inicio",
+                    quiet_hours_start=time(22, 0),
+                )
+            )
+            await db_session.flush()
+
+
+async def test_quiet_hours_start_and_end_must_differ(db_session: AsyncSession) -> None:
+    with pytest.raises(IntegrityError):
+        async with db_session.begin_nested():
+            db_session.add(
+                User(
+                    phone_number="+5491100077002",
+                    name="Ventana vacía",
+                    quiet_hours_start=time(22, 0),
+                    quiet_hours_end=time(22, 0),
+                )
+            )
+            await db_session.flush()
+
+
+async def test_a_window_crossing_midnight_is_accepted(db_session: AsyncSession) -> None:
+    user = User(
+        phone_number="+5491100077003",
+        name="Noche",
+        quiet_hours_start=time(22, 0),
+        quiet_hours_end=time(7, 0),
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    assert user.timezone == "America/Argentina/Buenos_Aires"
+    assert user.quiet_hours_start == time(22, 0)
+    assert user.quiet_hours_end == time(7, 0)

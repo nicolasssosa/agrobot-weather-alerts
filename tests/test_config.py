@@ -98,3 +98,24 @@ def test_rearm_margin_rejects_out_of_range_values(value: object) -> None:
 def test_rearm_margin_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("REARM_MARGIN", "25")
     assert Settings().rearm_margin == 25
+
+
+def test_digest_max_items_defaults_to_10() -> None:
+    """D15: tope de notificaciones por mensaje en el envío agrupado (S13)."""
+    assert Settings().digest_max_items == 10
+
+
+@pytest.mark.parametrize("value", [1, 10, 20])
+def test_digest_max_items_accepts_the_documented_range(value: int) -> None:
+    assert Settings(digest_max_items=value).digest_max_items == value
+
+
+@pytest.mark.parametrize("value", [0, -1, 21, 1000, "abc", "10.5"])
+def test_digest_max_items_rejects_out_of_range_values(value: object) -> None:
+    with pytest.raises(ValidationError):
+        Settings(digest_max_items=value)  # type: ignore[arg-type]
+
+
+def test_digest_max_items_reads_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DIGEST_MAX_ITEMS", "5")
+    assert Settings().digest_max_items == 5

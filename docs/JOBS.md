@@ -337,7 +337,8 @@ usuario. Un lote reclama a lo sumo `batch_size * digest_max_items` notificacione
    por usuario**, las más antiguas primero (`next_attempt_at, id`; con `row_number() OVER
    (PARTITION BY f.user_id ...)` en una subconsulta de ids, y el `FOR UPDATE OF n SKIP LOCKED` en la
    consulta exterior, que no puede llevar funciones de ventana). El excedente queda `pending` y
-   vencido: sale en el próximo lote (el worker sigue mientras el lote venga lleno).
+   vencido: sale en el **próximo ciclo** (D15: un mensaje por usuario y ciclo), salvo que el lote
+   haya venido lleno de usuarios y el worker siga drenando en el mismo ciclo.
 3. **Validación** (`_cancellation_reason`), con un motivo nuevo **`forecast_date_passed`**: el día
    pronosticado ya pasó en la zona del campo (`forecast_date < (now en fields.timezone).date()`).
    Orden: `alert_deleted` → `alert_inactive` → `forecast_date_passed` → `below_current_threshold` →
