@@ -31,6 +31,7 @@ from app.jobs.evaluator import (
     DEFAULT_LOCK_WAIT_MS,
     EVALUATOR_LOCK_KEY,
     _build_statement,
+    _take_evaluation_lock,
     evaluate_alerts,
 )
 from app.models import (
@@ -1455,6 +1456,95 @@ async def test_the_busy_lock_log_is_a_warning_that_names_the_wait(
     assert record.getMessage() == f"evaluation_skipped reason=lock_busy wait_ms={LOCK_WAIT_MS}"
 
 
+#: `lock_timeout` de la transacción que distinguen los dos valores posibles (la espera del
+#: lock y el default de la conexión en la base de test, que es `0`).
+TRANSACTION_LOCK_TIMEOUT = "2500ms"
+
+
+async def test_a_skipped_lock_restores_the_transaction_lock_timeout(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """S14a: tras el skip, ni la espera ni el default de la conexión: el valor de la transacción.
+
+    El `lock_timeout` de la espera vive solo dentro del savepoint: al vencer y hacer rollback,
+    la transacción queda con el valor que tenía (aquí uno distinto de `0` y de la espera) y
+    sigue usable — el ciclo siguiente, en la misma transacción, evalúa y dispara.
+    """
+    field = await make_field()
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=80)
+    await db_session.execute(text(f"SET LOCAL lock_timeout = '{TRANSACTION_LOCK_TIMEOUT}'"))
+    assert await _lock_timeout_of(db_session) == TRANSACTION_LOCK_TIMEOUT
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as holder:
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock_shared(:key)"),
+                {"key": EVALUATOR_LOCK_KEY},
+            )
+            assert await _evaluate(db_session, lock_wait_ms=LOCK_WAIT_MS) == 0
+            await holder.rollback()
+    finally:
+        await engine.dispose()
+
+    # Ni `200ms` (la espera) ni `0` (la conexión): el valor que tenía la transacción.
+    assert await _lock_timeout_of(db_session) == TRANSACTION_LOCK_TIMEOUT
+    assert await _notifications(db_session) == []
+    assert await _day_states(db_session) == []
+    # La sesión sigue usable en la misma transacción: el ciclo siguiente evalúa el día.
+    assert await _evaluate(db_session) == 1
+    assert await _day_state(db_session, alert.id, TODAY) == DayState(episode=1, armed=False)
+    assert await _lock_timeout_of(db_session) == TRANSACTION_LOCK_TIMEOUT
+
+
+async def test_a_successful_evaluation_restores_the_transaction_lock_timeout(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    make_forecast: MakeForecast,
+) -> None:
+    """S14a: tomar el lock no deja `lock_timeout` en la espera; se restaura al de la transacción."""
+    field = await make_field()
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(field, forecast_date=TODAY, event_type=EventType.FROST, probability=80)
+    await db_session.execute(text(f"SET LOCAL lock_timeout = '{TRANSACTION_LOCK_TIMEOUT}'"))
+
+    assert await _evaluate(db_session, lock_wait_ms=LOCK_WAIT_MS) == 1
+
+    assert await _lock_timeout_of(db_session) == TRANSACTION_LOCK_TIMEOUT
+    # El resto de la evaluación corrió sin dejar el GUC de la espera: una sentencia posterior
+    # funciona y la transacción sigue abierta.
+    assert (await db_session.execute(text("SELECT 1"))).scalar_one() == 1
+    assert await _lock_timeout_of(db_session) == TRANSACTION_LOCK_TIMEOUT
+
+
+async def test_a_non_lock_timeout_error_while_taking_the_lock_is_reraised(
+    db_session: AsyncSession,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """S14a: solo `55P03` es un skip; cualquier otro error de DB al pedir el lock se re-lanza.
+
+    Se fuerza un error real de Postgres distinto de `55P03` (`22023`, valor de `lock_timeout`
+    fuera de rango) al fijar la espera, sin mocks de la base.
+    """
+    caplog.set_level(logging.INFO, logger="app.jobs.evaluator")
+    previous = await _lock_timeout_of(db_session)
+
+    with pytest.raises(DBAPIError) as caught:
+        await _take_evaluation_lock(db_session, lock_wait_ms=-1)
+
+    assert _sqlstate(caught.value) != "55P03"
+    assert "lock_timeout" in str(caught.value)
+    assert not [record for record in caplog.records if "evaluation_skipped" in record.getMessage()]
+    # El savepoint se revirtió: el GUC que tenía la transacción y la sesión siguen usables.
+    assert await _lock_timeout_of(db_session) == previous
+    assert (await db_session.execute(text("SELECT 1"))).scalar_one() == 1
+
+
 async def test_two_concurrent_evaluations_create_exactly_the_total() -> None:
     """Dos evaluadores en conexiones distintas y datos ya commiteados: la suma es el total
     exacto y no hay duplicados (RNF-03)."""
@@ -1792,6 +1882,82 @@ async def test_patch_of_a_missing_or_foreign_alert_returns_404_without_the_lock(
     assert missing.json() == {"detail": "Alert not found"}
     assert foreign.status_code == 404
     assert foreign.json() == {"detail": "Alert not found"}
+
+
+async def test_patch_of_an_own_alert_waits_for_the_evaluation_lock(
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S14a: el PATCH de una alerta propia **sí** espera al lock exclusivo y aplica el cambio.
+
+    El lock compartido se toma después de la ownership y antes del UPDATE (JOBS.md
+    §Re-armado por cambio de alerta): con una evaluación en curso, el PATCH queda esperando.
+    """
+    owner = await make_user()
+    field = await make_field(owner)
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as holder:
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": EVALUATOR_LOCK_KEY}
+            )
+            patch = asyncio.create_task(
+                client.patch(
+                    f"{ALERTS_API}/{alert.id}", json={"threshold": 90}, headers=auth(owner)
+                )
+            )
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(asyncio.shield(patch), timeout=BLOCKED_TIMEOUT)
+            assert not patch.done()
+            await holder.rollback()
+        response = await asyncio.wait_for(patch, timeout=5)
+    finally:
+        await engine.dispose()
+
+    assert response.status_code == 200
+    assert response.json()["threshold"] == 90
+
+
+async def test_a_patch_waiting_behind_the_evaluator_lock_returns_503(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S14a: si la espera del PATCH detrás del evaluador supera `DB_LOCK_TIMEOUT_MS` → 503.
+
+    JOBS.md §Re-armado por cambio de alerta: el PATCH es reintentable. El `lock_timeout`
+    corto de la transacción emula el `DB_LOCK_TIMEOUT_MS` del engine de la API.
+    """
+    owner = await make_user()
+    field = await make_field(owner)
+    alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await db_session.execute(text(f"SET LOCAL lock_timeout = '{LOCK_WAIT_MS}ms'"))
+
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    try:
+        async with engine.connect() as holder:
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock(:key)"), {"key": EVALUATOR_LOCK_KEY}
+            )
+            response = await asyncio.wait_for(
+                client.patch(
+                    f"{ALERTS_API}/{alert.id}", json={"threshold": 90}, headers=auth(owner)
+                ),
+                timeout=5,
+            )
+            await holder.rollback()
+    finally:
+        await engine.dispose()
+
+    assert response.status_code == 503
+    assert response.json() == {"detail": "Database busy, try again later"}
+    assert response.headers["Retry-After"] == "1"
 
 
 async def test_two_concurrent_patches_of_different_alerts_do_not_block() -> None:

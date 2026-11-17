@@ -21,7 +21,7 @@ from alembic import command
 from alembic.config import Config
 from fastapi import HTTPException
 from httpx import ASGITransport, AsyncClient
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -31,7 +31,8 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import NullPool
 
 from app.api.deps import validate_idempotency_key
-from app.core.db import get_session
+from app.core.config import Settings
+from app.core.db import build_engine, get_session
 from app.main import create_app
 from app.models import Alert, Field, IdempotencyKey, User
 from app.schemas.alert import AlertCreate
@@ -855,6 +856,91 @@ async def test_concurrent_posts_with_the_same_key_and_different_bodies_conflict(
             await session.execute(delete(IdempotencyKey).where(IdempotencyKey.key == key))
             await session.commit()
         await engine.dispose()
+
+
+async def test_a_timeout_waiting_for_the_key_returns_503_and_the_retry_replays() -> None:
+    """S14a: si el primero tarda más que `DB_LOCK_TIMEOUT_MS`, el segundo recibe 503.
+
+    docs/API.md §Idempotency-Key: los requests de una misma clave se serializan con un
+    advisory lock; si la espera vence (55P03) el segundo responde 503 reintentable y, al
+    reintentar con la misma clave, recibe el replay de la respuesta guardada.
+    """
+    fast_engine: AsyncEngine = build_engine(
+        Settings(
+            database_url=TEST_DATABASE_URL,
+            db_lock_timeout_ms=200,
+            db_statement_timeout_ms=0,
+        )
+    )
+    fast_sessionmaker = async_sessionmaker(fast_engine, expire_on_commit=False)
+    holder_engine: AsyncEngine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    phone_number = f"+54{uuid4().int % 10**12:012d}"
+    key = f"busy-{uuid4()}"
+    try:
+        async with fast_sessionmaker() as session:
+            user = User(phone_number=phone_number, name="QA Idem Busy")
+            session.add(user)
+            await session.flush()
+            field = Field(
+                user_id=user.id,
+                name="QA Idem Busy Field",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            session.add(field)
+            await session.commit()
+            user_id = user.id
+            field_id = field.id
+
+        body = {"field_id": field_id, "event_type": "frost", "threshold": 70}
+        headers = {"X-User-Id": str(user_id), KEY_HEADER: key}
+        lock_key = f"{user_id}|POST /api/v1/alerts|{key}"
+        async with (
+            holder_engine.connect() as holder,
+            _client_with_committed_session(fast_sessionmaker) as client,
+        ):
+            # El primer request guardó la respuesta; esta es la que el reintento repite.
+            created = await client.post(ALERTS, json=body, headers=headers)
+            assert created.status_code == 201
+
+            # "El primero" todavía en vuelo: tiene el advisory lock de la clave abierto.
+            await holder.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:lock_key, 0))"),
+                {"lock_key": lock_key},
+            )
+            busy = await asyncio.wait_for(
+                client.post(ALERTS, json=body, headers=headers), timeout=5
+            )
+            await holder.rollback()
+
+            # Reintento con la misma clave: el replay de la respuesta guardada, sin ejecutar.
+            replay = await asyncio.wait_for(
+                client.post(ALERTS, json=body, headers=headers), timeout=5
+            )
+
+        async with fast_sessionmaker() as session:
+            alerts = await session.scalar(
+                select(func.count()).select_from(Alert).where(Alert.field_id == field_id)
+            )
+            keys = await session.scalar(
+                select(func.count())
+                .select_from(IdempotencyKey)
+                .where(IdempotencyKey.user_id == user_id, IdempotencyKey.key == key)
+            )
+    finally:
+        async with fast_sessionmaker() as session:
+            await session.execute(delete(User).where(User.phone_number == phone_number))
+            await session.commit()
+        await fast_engine.dispose()
+        await holder_engine.dispose()
+
+    assert busy.status_code == 503
+    assert busy.json() == {"detail": "Database busy, try again later"}
+    assert busy.headers["Retry-After"] == "1"
+    assert replay.status_code == created.status_code
+    assert replay.headers.get(REPLAY_HEADER) == "true"
+    assert replay.json() == created.json()
+    assert (alerts, keys) == (1, 1)
 
 
 async def test_a_failed_key_insert_rolls_back_the_resource(

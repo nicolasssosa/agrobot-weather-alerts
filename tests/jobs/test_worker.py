@@ -20,6 +20,7 @@ from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
+import app.jobs.evaluator as evaluator
 import app.jobs.worker as worker
 from app.core.config import Settings
 from app.jobs.dispatcher import DispatchResult, dispatch_pending
@@ -425,6 +426,71 @@ async def test_run_cycle_dispatches_when_evaluate_alerts_raises(
     [record] = [record for record in caplog.records if record.getMessage() == "evaluation_failed"]
     assert record.levelno == logging.ERROR
     assert record.exc_info is not None
+    statuses = (await db_session.scalars(select(Notification.status))).all()
+    assert statuses == [NotificationStatus.SENT]
+
+
+async def test_run_cycle_evaluates_normally_after_a_failed_evaluation(
+    db_session: AsyncSession,
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_forecast: MakeForecast,
+    make_alert: MakeAlert,
+    fake_notifier: FakeNotifier,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S14a CR-2: tras un `evaluation_failed` el rollback deja el ciclo siguiente intacto.
+
+    La primera evaluación lanza (como un `statement_timeout`); la segunda, con los mismos
+    datos, evalúa normalmente porque la transacción fallida se revirtió.
+    """
+    caplog.set_level(logging.INFO, logger="app.jobs.worker")
+    field = await make_field(await make_user(), name="Evaluación que falla una vez")
+    await make_alert(field, event_type=EventType.FROST, threshold=70)
+    await make_forecast(
+        field,
+        forecast_date=FORECAST_DATE,
+        event_type=EventType.FROST,
+        probability=85,
+        issued_at=EVAL_NOW,
+    )
+
+    calls = 0
+
+    async def flaky_evaluate(session: AsyncSession, **kwargs: object) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("statement timeout simulado")
+        return await evaluator.evaluate_alerts(session, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(worker, "evaluate_alerts", flaky_evaluate)
+
+    first = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        _settings(),
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert first == CycleResult(created=0, dispatch=DispatchResult(sent=0, retried=0, failed=0))
+    assert "evaluation_failed" in [record.getMessage() for record in caplog.records]
+    assert (await db_session.scalars(select(Notification.id))).all() == []
+
+    second = await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        _settings(),
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert second.created == 1
+    assert second.dispatch == DispatchResult(sent=1, retried=0, failed=0, users=1)
+    assert len(fake_notifier.sent) == 1
     statuses = (await db_session.scalars(select(Notification.status))).all()
     assert statuses == [NotificationStatus.SENT]
 
@@ -945,6 +1011,32 @@ async def test_run_cycle_evaluates_with_now_and_the_freshness_setting(
         "rearm_margin": 15,
         "lock_wait_ms": settings.evaluator_lock_wait_ms,
     }
+
+
+async def test_run_cycle_passes_the_configured_lock_wait_to_the_evaluator(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    fake_notifier: FakeNotifier,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """S14a: el worker pasa `EVALUATOR_LOCK_WAIT_MS` (no un default fijo) al evaluador."""
+    captured: dict[str, object] = {}
+
+    async def _fake_evaluate(session: AsyncSession, **kwargs: object) -> int:
+        captured.update(kwargs)
+        return 0
+
+    monkeypatch.setattr(worker, "evaluate_alerts", _fake_evaluate)
+    settings = _settings().model_copy(update={"evaluator_lock_wait_ms": 250})
+
+    await run_cycle(
+        test_sessionmaker,
+        fake_notifier,
+        settings,
+        now=EVAL_NOW,
+        clock=_clock_at(CLAIM_NOW),
+    )
+
+    assert captured["lock_wait_ms"] == 250
 
 
 async def test_one_cycle_evaluates_each_field_with_its_own_local_today(

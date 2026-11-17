@@ -8,6 +8,7 @@ import pytest
 from pydantic import ValidationError
 
 from app.core.config import Settings
+from app.jobs.evaluator import DEFAULT_LOCK_WAIT_MS
 
 
 def test_max_forecast_age_hours_defaults_to_24() -> None:
@@ -200,3 +201,8 @@ def test_evaluator_lock_wait_ms_accepts_the_documented_range(value: int) -> None
 def test_evaluator_lock_wait_ms_rejects_out_of_range_values(value: object) -> None:
     with pytest.raises(ValidationError):
         Settings(evaluator_lock_wait_ms=value)  # type: ignore[arg-type]
+
+
+def test_the_evaluator_default_lock_wait_matches_the_setting() -> None:
+    """El default del evaluador y el de `Settings` no pueden divergir (docs/JOBS.md §Evaluador)."""
+    assert Settings().evaluator_lock_wait_ms == DEFAULT_LOCK_WAIT_MS
