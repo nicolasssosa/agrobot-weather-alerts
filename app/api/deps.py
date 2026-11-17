@@ -3,7 +3,7 @@
 import re
 from typing import Annotated, Any
 
-from fastapi import Depends, Header, HTTPException, Security, status
+from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.responses import JSONResponse, Response
 from fastapi.security import APIKeyHeader
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -11,7 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.db import get_session
 from app.models import User
 from app.schemas.common import AUTH_ERROR_DETAIL, BIGINT_MAX
-from app.services.idempotency import INVALID_KEY_DETAIL, IdempotentResult
+from app.services.idempotency import (
+    INVALID_KEY_DETAIL,
+    MISSING_KEY_DETAIL,
+    IdempotentResult,
+)
 from app.services.users import get_user
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -65,8 +69,33 @@ CurrentUser = Annotated[User, Depends(get_current_user)]
 
 # --- Idempotency-Key (docs/API.md §Idempotency-Key) --------------------------
 
-#: Header opcional: 1..255 caracteres ASCII imprimibles, sin espacios (ni controles).
+#: Header obligatorio: 1..255 caracteres ASCII imprimibles, sin espacios (ni controles).
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"[\x21-\x7E]{1,255}")
+
+#: Parámetro de OpenAPI de `POST /alerts`. El header se lee del `Request` para poder
+#: devolver el `detail` plano del contrato cuando falta (FastAPI lo rechazaría con su 422
+#: de validación), así que el parámetro se declara acá con `required: true`.
+IDEMPOTENCY_KEY_PARAMETER: dict[str, Any] = {
+    "name": "Idempotency-Key",
+    "in": "header",
+    "required": True,
+    "description": (
+        "Header `Idempotency-Key` obligatorio para reintentos seguros "
+        "(1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el "
+        "mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); "
+        "con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave "
+        "es por usuario y por endpoint."
+    ),
+    "schema": {
+        "type": "string",
+        "description": (
+            "Clave aleatoria e impredecible (por ejemplo un UUID v4), "
+            "1-255 caracteres ASCII imprimibles sin espacios."
+        ),
+        "examples": ["7f5c2b1e-4a9d-4c3e-9f2a-1b8e6d0c4a51"],
+        "title": "Idempotency-Key",
+    },
+}
 
 #: Header de respuesta que marca un replay (solo en las respuestas repetidas).
 IDEMPOTENT_REPLAYED_HEADER: dict[str, Any] = {
@@ -86,29 +115,15 @@ def validate_idempotency_key(value: str) -> str:
     return value
 
 
-async def get_idempotency_key(
-    idempotency_key: Annotated[
-        str | None,
-        Header(
-            alias="Idempotency-Key",
-            description=(
-                "Header `Idempotency-Key` opcional para reintentos seguros "
-                "(1-255 caracteres ASCII imprimibles, sin espacios). La misma clave con el "
-                "mismo body devuelve la respuesta original (header `Idempotent-Replayed: true`); "
-                "con otro body, 422. Vigencia: `IDEMPOTENCY_TTL_HOURS` (default 24 h). La clave "
-                "es por usuario y por endpoint."
-            ),
-            examples=["7f5c2b1e-4a9d-4c3e-9f2a-1b8e6d0c4a51"],
-        ),
-    ] = None,
-) -> str | None:
-    """Resuelve y valida el header opcional `Idempotency-Key`."""
-    if idempotency_key is None:
-        return None
-    return validate_idempotency_key(idempotency_key)
+async def get_idempotency_key(request: Request) -> str:
+    """Exige y valida el header `Idempotency-Key` (docs/API.md §Idempotency-Key)."""
+    value = request.headers.get("Idempotency-Key")
+    if value is None:
+        raise HTTPException(status_code=422, detail=MISSING_KEY_DETAIL)
+    return validate_idempotency_key(value)
 
 
-IdempotencyKeyDep = Annotated[str | None, Depends(get_idempotency_key)]
+IdempotencyKeyDep = Annotated[str, Depends(get_idempotency_key)]
 
 
 def render_json_body(body: dict[str, Any]) -> str:

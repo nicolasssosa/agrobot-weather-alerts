@@ -44,6 +44,11 @@ from app.schemas.field import FieldCreate, FieldPage, FieldRead
 from app.schemas.forecast import ForecastRead
 from app.schemas.notification import NotificationPage, NotificationRead
 from app.schemas.user import UserCreate, UserRead
+from app.services.idempotency import (
+    INVALID_KEY_DETAIL,
+    KEY_REUSED_DETAIL,
+    MISSING_KEY_DETAIL,
+)
 from tests.conftest import MakeAlert, MakeField, MakeForecast, MakeUser, auth
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -775,5 +780,106 @@ def test_forecasts_422_declares_both_error_shapes_with_an_example_each() -> None
 
     examples = content["examples"]
     assert set(examples) == {"invalid_query_param", "date_range"}
+    for example in examples.values():
+        _validate_body(content["schema"], example["value"])
+
+
+# --- 422 de POST /alerts: body inválido y las tres formas de la clave ---------
+
+
+def _create_alert_body(ctx: Ctx) -> dict[str, Any]:
+    return {"field_id": ctx.field.id, "event_type": "rain", "threshold": 50}
+
+
+def _assert_create_alert_422(response: Response) -> dict[str, Any]:
+    """El 422 de POST /alerts valida contra el schema declarado y devuelve su content."""
+    assert response.status_code == 422, response.text
+    content = _json_content("post", f"{_API}/alerts", 422)
+    _validate_body(content["schema"], response.json())
+    return content
+
+
+async def test_create_alert_missing_key_422_body_matches_the_declared_schema(
+    raw_client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    user = await make_user()
+    field = await make_field(user=user)
+    response = await raw_client.post(
+        f"{_API}/alerts",
+        json={"field_id": field.id, "event_type": "rain", "threshold": 50},
+        headers=auth(user),
+    )
+
+    content = _assert_create_alert_422(response)
+    assert response.json() == {"detail": MISSING_KEY_DETAIL}
+    assert response.json() == content["examples"]["missing_key"]["value"]
+
+
+async def test_create_alert_invalid_key_422_body_matches_the_declared_schema(ctx: Ctx) -> None:
+    response = await _request(
+        ctx,
+        "post",
+        f"{_API}/alerts",
+        headers={**auth(ctx.user), "Idempotency-Key": "with space"},
+        json_body=_create_alert_body(ctx),
+    )
+
+    content = _assert_create_alert_422(response)
+    assert response.json() == {"detail": INVALID_KEY_DETAIL}
+    assert response.json() == content["examples"]["invalid_key"]["value"]
+
+
+async def test_create_alert_reused_key_422_body_matches_the_declared_schema(ctx: Ctx) -> None:
+    key = "openapi-reused-key"
+    payload = _create_alert_body(ctx)
+    first = await _request(
+        ctx,
+        "post",
+        f"{_API}/alerts",
+        headers={**auth(ctx.user), "Idempotency-Key": key},
+        json_body=payload,
+    )
+    assert first.status_code == 201, first.text
+
+    response = await _request(
+        ctx,
+        "post",
+        f"{_API}/alerts",
+        headers={**auth(ctx.user), "Idempotency-Key": key},
+        json_body={**payload, "threshold": 60},
+    )
+
+    content = _assert_create_alert_422(response)
+    assert response.json() == {"detail": KEY_REUSED_DETAIL}
+    assert response.json() == content["examples"]["reused_key"]["value"]
+
+
+async def test_create_alert_invalid_body_422_body_matches_the_declared_schema(ctx: Ctx) -> None:
+    response = await _request(
+        ctx,
+        "post",
+        f"{_API}/alerts",
+        headers={**auth(ctx.user), "Idempotency-Key": "invalid-body-key"},
+        json_body={**_create_alert_body(ctx), "threshold": 101},
+    )
+
+    content = _assert_create_alert_422(response)
+    assert isinstance(response.json()["detail"], list)
+    assert response.json() == content["examples"]["invalid_body"]["value"]
+
+
+def test_create_alert_422_declares_both_error_shapes_with_an_example_each() -> None:
+    content = _json_content("post", f"{_API}/alerts", 422)
+    refs = {
+        variant.get("$ref")
+        for variant in content["schema"].get("anyOf", []) + content["schema"].get("oneOf", [])
+    }
+    assert refs == {
+        "#/components/schemas/HTTPValidationError",
+        "#/components/schemas/ErrorResponse",
+    }
+
+    examples = content["examples"]
+    assert set(examples) == {"invalid_body", "missing_key", "invalid_key", "reused_key"}
     for example in examples.values():
         _validate_body(content["schema"], example["value"])

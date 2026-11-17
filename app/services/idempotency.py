@@ -1,6 +1,6 @@
-"""Idempotencia de los POST con header `Idempotency-Key`. Ver docs/API.md §Idempotency-Key.
+"""Idempotencia de `POST /alerts` con header `Idempotency-Key`. Ver docs/API.md §Idempotency-Key.
 
-Un único punto de orquestación (`run_idempotent`) para los tres POST que la soportan:
+Un único punto de orquestación (`run_idempotent`):
 
 1. `pg_advisory_xact_lock` sobre `(user_id, scope, key)` serializa los requests concurrentes
    con la misma clave (el lock se libera al terminar la transacción).
@@ -13,9 +13,7 @@ Un único punto de orquestación (`run_idempotent`) para los tres POST que la so
 
 La operación y la serialización de la respuesta las define el router; acá no se conoce
 ningún schema concreto. `response_body` es TEXT con los bytes exactos de la respuesta
-(docs/DATA_MODEL.md §idempotency_keys). En `POST /users` el router guarda solo `{"id": …}`
-(sin PII) y aporta `replay_loader` para reconstruir la respuesta leyendo el usuario; si ya
-no existe, el loader devuelve `None` y la clave se trata como nueva.
+(docs/DATA_MODEL.md §idempotency_keys).
 """
 
 import hashlib
@@ -34,6 +32,9 @@ from app.core.errors import DomainError
 from app.models import IdempotencyKey
 
 logger = logging.getLogger(__name__)
+
+#: Mensaje exacto del 422 cuando falta el header (docs/API.md §Idempotency-Key).
+MISSING_KEY_DETAIL = "Idempotency-Key header is required"
 
 #: Mensaje exacto del 422 con un header mal formado (docs/API.md §Idempotency-Key).
 INVALID_KEY_DETAIL = "Invalid Idempotency-Key"
@@ -70,15 +71,16 @@ def compute_request_hash(request_model: BaseModel) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def _key_filters(user_id: int | None, scope: str, key: str) -> tuple[ColumnElement[bool], ...]:
-    """Filtro de la clave: por usuario (NULL en `POST /users`) y por endpoint."""
-    owner: ColumnElement[bool] = (
-        IdempotencyKey.user_id.is_(None) if user_id is None else IdempotencyKey.user_id == user_id
+def _key_filters(user_id: int, scope: str, key: str) -> tuple[ColumnElement[bool], ...]:
+    """Filtro de la clave: por usuario y por endpoint."""
+    return (
+        IdempotencyKey.user_id == user_id,
+        IdempotencyKey.scope == scope,
+        IdempotencyKey.key == key,
     )
-    return (owner, IdempotencyKey.scope == scope, IdempotencyKey.key == key)
 
 
-async def _lock(session: AsyncSession, *, user_id: int | None, scope: str, key: str) -> None:
+async def _lock(session: AsyncSession, *, user_id: int, scope: str, key: str) -> None:
     """Toma el advisory lock de transacción de la clave (serializa los concurrentes)."""
     lock_key = f"{user_id}|{scope}|{key}"
     await session.execute(select(func.pg_advisory_xact_lock(func.hashtextextended(lock_key, 0))))
@@ -87,7 +89,7 @@ async def _lock(session: AsyncSession, *, user_id: int | None, scope: str, key: 
 async def _store(
     session: AsyncSession,
     *,
-    user_id: int | None,
+    user_id: int,
     scope: str,
     key: str,
     request_hash: str,
@@ -114,33 +116,26 @@ async def _store(
 async def run_idempotent[T](
     session: AsyncSession,
     *,
-    user_id: int | None,
+    user_id: int,
     scope: str,
     key: str,
     request_model: BaseModel,
     operation: Callable[[], Awaitable[T]],
     serializer: Callable[[T], str],
     status_code: int,
-    stored_serializer: Callable[[T], str] | None = None,
-    replay_loader: Callable[[str], Awaitable[str | None]] | None = None,
 ) -> IdempotentResult:
     """Ejecuta `operation` una sola vez por clave y guarda su respuesta.
 
     - clave vigente + mismo body -> `IdempotentResult(replayed=True)` sin ejecutar nada;
     - clave vigente + otro body -> `IdempotencyKeyReusedError` (422);
     - clave vencida -> se borra y se ejecuta de nuevo;
-    - sin clave -> se ejecuta y se guarda la respuesta (status y body) en la misma
+    - sin clave vigente -> se ejecuta y se guarda la respuesta (status y body) en la misma
       transacción. Si la operación falla no se guarda nada.
 
-    `serializer` devuelve el body ya serializado tal cual se responde. `stored_serializer`
-    permite guardar algo más chico que la respuesta (en `POST /users`, solo el id, sin PII)
-    y `replay_loader` reconstruye el texto del replay a partir de lo guardado; si devuelve
-    `None` (el recurso ya no existe) la fila se descarta y la clave se ejecuta de nuevo.
+    `serializer` devuelve el body ya serializado tal cual se responde.
     """
     request_hash = compute_request_hash(request_model)
     filters = _key_filters(user_id, scope, key)
-    store_serializer = stored_serializer or serializer
-    body: str
     try:
         await _lock(session, user_id=user_id, scope=scope, key=key)
         stored = (
@@ -154,22 +149,14 @@ async def run_idempotent[T](
         if stored is not None:
             if stored.request_hash != request_hash:
                 raise IdempotencyKeyReusedError(KEY_REUSED_DETAIL)
-            replay_body = (
-                stored.response_body
-                if replay_loader is None
-                else await replay_loader(stored.response_body)
+            logger.info("idempotency_replay scope=%s user_id=%s", scope, user_id)
+            return IdempotentResult(
+                status_code=stored.status_code,
+                body=stored.response_body,
+                replayed=True,
             )
-            if replay_body is not None:
-                logger.info("idempotency_replay scope=%s user_id=%s", scope, user_id)
-                return IdempotentResult(
-                    status_code=stored.status_code,
-                    body=replay_body,
-                    replayed=True,
-                )
-            logger.info("idempotency_stale_replay scope=%s user_id=%s", scope, user_id)
 
-        # Sin clave vigente (o con el recurso del replay ya borrado): se descarta la fila
-        # existente y se ejecuta la operación.
+        # Sin clave vigente: se descarta la fila existente (vencida) y se ejecuta la operación.
         await session.execute(delete(IdempotencyKey).where(*filters))
         result = await operation()
         body = serializer(result)
@@ -180,7 +167,7 @@ async def run_idempotent[T](
             key=key,
             request_hash=request_hash,
             status_code=status_code,
-            body=store_serializer(result),
+            body=body,
         )
         await session.commit()
     except Exception:

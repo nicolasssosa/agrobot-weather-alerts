@@ -8,7 +8,11 @@
 - `tests/conftest.py` (ya implementado, no modificar salvo para agregar factories):
   - aplica `alembic downgrade base` + `upgrade head` una vez por sesión → **las migraciones se testean**;
   - fixture `db_session`: transacción por test con rollback al final;
-  - fixture `client`: `httpx.AsyncClient` contra la app con la sesión inyectada;
+  - fixture `client`: `httpx.AsyncClient` contra la app con la sesión inyectada. **Agrega
+    automáticamente un `Idempotency-Key` único (UUID v4) a todo `POST /api/v1/alerts` que no lo
+    traiga** (desde S11b el header es obligatorio y la mayoría de los tests no prueban eso);
+  - fixture `raw_client`: igual que `client` pero **sin** la clave automática; usarla para probar
+    el header ausente o inválido;
   - `FakeNotifier(fail_times=n)` + fixture `fake_notifier`.
 - `asyncio_mode = "auto"`: los tests son `async def test_...` sin decorador.
 - Para jobs, llamar a las funciones con `db_session` directamente y pasar `today`/`now` fijos

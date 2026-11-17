@@ -80,7 +80,7 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
     ],
     "idempotency_keys": [
         ("id", "bigint", "NO", None, 64, 0),
-        ("user_id", "bigint", "YES", None, 64, 0),
+        ("user_id", "bigint", "NO", None, 64, 0),
         ("scope", "character varying", "NO", 64, None, None),
         ("key", "character varying", "NO", 255, None, None),
         ("request_hash", "character", "NO", 64, None, None),
@@ -98,7 +98,8 @@ EXPECTED_UNIQUES: dict[str, set[frozenset[str]]] = {
     # La unicidad de alerts pasó a un índice único parcial en `0003` (no es un constraint).
     "alerts": set(),
     "notifications": {frozenset({"alert_id", "forecast_date"})},
-    # `0004`: NULLS NOT DISTINCT (POST /users guarda user_id NULL).
+    # `0006`: solo `POST /alerts` guarda claves; `user_id` es NOT NULL y el UNIQUE ya no
+    # necesita `NULLS NOT DISTINCT`.
     "idempotency_keys": {frozenset({"user_id", "scope", "key"})},
 }
 
@@ -245,6 +246,25 @@ async def test_unique_constraints_match_data_model(db_session: AsyncSession) -> 
         table: constraints for table, constraints in EXPECTED_UNIQUES.items() if constraints
     }
     assert actual == expected
+
+
+async def test_idempotency_unique_does_not_use_nulls_not_distinct(
+    db_session: AsyncSession,
+) -> None:
+    """`0006`: `user_id` es NOT NULL y el UNIQUE vuelve a la forma estándar."""
+    nulls_not_distinct = (
+        await db_session.execute(
+            text(
+                """
+                SELECT i.indnullsnotdistinct
+                FROM pg_index i
+                JOIN pg_class c ON c.oid = i.indexrelid
+                WHERE c.relname = 'uq_idempotency_keys_user_id_scope_key'
+                """
+            )
+        )
+    ).scalar_one()
+    assert nulls_not_distinct is False
 
 
 async def test_foreign_keys_are_bigint_and_on_delete_cascade(db_session: AsyncSession) -> None:
@@ -409,11 +429,11 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_then_0002_then_0003_then_0004_then_0005() -> None:
+def test_migration_chain_is_0001_through_0006() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0005"
+    assert script.get_current_head() == "0006"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
@@ -429,3 +449,6 @@ def test_migration_chain_is_0001_then_0002_then_0003_then_0004_then_0005() -> No
     forecast_freshness = script.get_revision("0005")
     assert forecast_freshness is not None
     assert forecast_freshness.down_revision == "0004"
+    idempotency_alerts_only = script.get_revision("0006")
+    assert idempotency_alerts_only is not None
+    assert idempotency_alerts_only.down_revision == "0005"
