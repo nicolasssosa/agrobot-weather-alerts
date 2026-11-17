@@ -21,6 +21,7 @@ dev = [
     "httpx>=0.28",
     "ruff>=0.8",
     "mypy>=1.13",
+    "pytest-cov>=7.1.0",
 ]
 
 [tool.uv]
@@ -32,6 +33,13 @@ asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
 addopts = "-ra --strict-markers"
 filterwarnings = ["error::RuntimeWarning"]
+
+[tool.coverage.run]
+source = ["app"]
+
+[tool.coverage.report]
+# Cobertura medida al cierre de S16: 94% (redondeada hacia abajo al múltiplo de 5).
+fail_under = 90
 
 [tool.ruff]
 line-length = 100

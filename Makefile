@@ -1,4 +1,4 @@
-.PHONY: install db-up db-down migrate migration seed ingest api worker jobs-once openapi test lint fmt typecheck check up down
+.PHONY: install db-up db-down migrate migration seed ingest api worker jobs-once openapi test cov lint fmt typecheck check up down
 
 install:        ## Instala dependencias (incluye dev)
 	uv sync
@@ -35,6 +35,9 @@ jobs-once:      ## Un solo ciclo de evaluación + despacho
 
 test:           ## Requiere `make db-up`
 	uv run pytest
+
+cov:            ## Tests con cobertura: resumen en terminal + HTML en htmlcov/
+	uv run pytest --cov=app --cov-report=term --cov-report=html
 
 lint:
 	uv run ruff check .
