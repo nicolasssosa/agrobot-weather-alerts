@@ -39,6 +39,7 @@ from app.models import (
 )
 from app.notifiers.base import NotificationMessage, NotifierError
 from app.notifiers.log import LoggingNotifier
+from app.services.alerts import delete_alert
 from tests.conftest import (
     TEST_DATABASE_URL,
     FakeNotifier,
@@ -48,6 +49,9 @@ from tests.conftest import (
 )
 
 NOW = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+#: Claim con un lease en el futuro lejano: el `DELETE` de la API compara contra `now()` real,
+#: así que la fila arrendada no debe parecer vencida por el reloj del test.
+LEASE_SAFE_NOW = datetime(2099, 1, 1, tzinfo=UTC)
 FORECAST_DATE = date(2026, 11, 18)
 
 DISPATCH_KWARGS = {
@@ -1069,6 +1073,130 @@ async def test_an_empty_queue_reports_zeroes_and_sends_nothing(
     assert notifier.calls == 0
 
 
+# --- Validación al enviar (S9/D12) -----------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("deleted", "alert_deleted"),
+        ("inactive", "alert_inactive"),
+        ("threshold", "below_current_threshold"),
+    ],
+    ids=["deleted-alert", "paused-alert", "threshold-raised"],
+)
+async def test_a_notification_that_no_longer_applies_is_cancelled_without_sending(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    mutation: str,
+    reason: str,
+) -> None:
+    """Alerta borrada, pausada o con umbral vigente mayor: `cancelled`, nunca se envía."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(db_session, alert, probability=85)
+    if mutation == "deleted":
+        alert.deleted_at = NOW
+    elif mutation == "inactive":
+        alert.is_active = False
+    else:
+        alert.threshold = 90
+    await db_session.flush()
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+    assert notifier.calls == 0
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.CANCELLED
+    assert notification.last_error == reason
+    assert notification.attempts == 0
+    assert notification.sent_at is None
+
+
+async def test_a_mixed_batch_sends_only_the_valid_notifications(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    field = await make_field()
+    valid_alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
+    deleted_alert = await make_alert(field, event_type=EventType.RAIN, threshold=70)
+    inactive_alert = await make_alert(field, event_type=EventType.HAIL, threshold=70)
+    raised_alert = await make_alert(field, event_type=EventType.HEAT_WAVE, threshold=70)
+    valid = await _make_notification(db_session, valid_alert, probability=85)
+    deleted = await _make_notification(db_session, deleted_alert, probability=85)
+    inactive = await _make_notification(db_session, inactive_alert, probability=85)
+    raised = await _make_notification(db_session, raised_alert, probability=60)
+    deleted_alert.deleted_at = NOW
+    inactive_alert.is_active = False
+    raised_alert.threshold = 90
+    await db_session.flush()
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0, cancelled=3)
+    assert [message.notification_id for message in notifier.sent] == [valid.id]
+    statuses = {}
+    for notification in (valid, deleted, inactive, raised):
+        await db_session.refresh(notification)
+        statuses[notification.id] = (notification.status, notification.last_error)
+    assert statuses == {
+        valid.id: (NotificationStatus.SENT, None),
+        deleted.id: (NotificationStatus.CANCELLED, "alert_deleted"),
+        inactive.id: (NotificationStatus.CANCELLED, "alert_inactive"),
+        raised.id: (NotificationStatus.CANCELLED, "below_current_threshold"),
+    }
+
+
+async def test_lowering_the_current_threshold_does_not_cancel_a_pending_notification(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """D12: la re-validación es contra el umbral vigente; si bajó, la notificación se envía."""
+    alert = await make_alert(await make_field(), threshold=70)
+    notification = await _make_notification(db_session, alert, probability=60)
+    alert.threshold = 50
+    await db_session.flush()
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert [message.notification_id for message in notifier.sent] == [notification.id]
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+    # El snapshot conserva el umbral con el que se creó la notificación.
+    assert notification.threshold == 70
+
+
+async def test_probability_equal_to_the_current_threshold_is_not_cancelled(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """El límite es `probability < threshold` (no `<=`): igual al umbral vigente se envía."""
+    alert = await make_alert(await make_field(), threshold=50)
+    notification = await _make_notification(db_session, alert, probability=50)
+    alert.threshold = 50
+    await db_session.flush()
+    notifier = FakeNotifier()
+
+    result = await dispatch_pending(test_sessionmaker, notifier, now=NOW, **DISPATCH_KWARGS)
+
+    assert result == DispatchResult(sent=1, retried=0, failed=0)
+    assert [message.notification_id for message in notifier.sent] == [notification.id]
+    await db_session.refresh(notification)
+    assert notification.status == NotificationStatus.SENT
+
+
 # --- Dueño del teléfono ----------------------------------------------------
 
 
@@ -1380,17 +1508,19 @@ async def test_a_stale_lease_owner_cannot_record_its_outcome(
     notification = await _make_notification(db_session, alert)
     lease_seconds = DISPATCH_KWARGS["lease_seconds"]
 
-    worker_a = await _claim_batch(
+    worker_a, cancelled_a = await _claim_batch(
         test_sessionmaker, now=NOW, batch_size=10, lease_seconds=lease_seconds
     )
+    assert cancelled_a == 0
     assert [item.id for item in worker_a] == [notification.id]
     assert worker_a[0].lease_until == NOW + timedelta(seconds=lease_seconds)
 
     # El lease de A vence y B reclama la misma fila con una hora posterior.
     later = NOW + timedelta(seconds=lease_seconds + 1)
-    worker_b = await _claim_batch(
+    worker_b, cancelled_b = await _claim_batch(
         test_sessionmaker, now=later, batch_size=10, lease_seconds=lease_seconds
     )
+    assert cancelled_b == 0
     assert [item.id for item in worker_b] == [notification.id]
     assert worker_b[0].lease_until == later + timedelta(seconds=lease_seconds)
     assert worker_b[0].lease_until != worker_a[0].lease_until
@@ -1494,6 +1624,195 @@ async def test_a_notification_deleted_between_the_claim_and_the_update_is_ignore
         select(func.count()).select_from(Notification).where(Notification.id == notification.id)
     )
     assert remaining == 0
+
+
+async def test_soft_deleting_the_alert_while_the_send_is_in_flight_keeps_the_real_outcome() -> None:
+    """SEC-2/D11/D12: DELETE con la notificación ya reclamada y el envío en vuelo.
+
+    El `DELETE` solo cancela las pendientes no arrendadas (`next_attempt_at <= now()`). La fila
+    en vuelo queda `pending` con su lease vigente, así que el dispatcher registra el resultado
+    real: `sent`, `attempts=1`, `sent_at` seteado. El historial nunca dice `cancelled` para un
+    mensaje que salió.
+
+    El claim usa una hora fija futura (`LEASE_SAFE_NOW`) para que el lease quede por delante
+    del reloj real de la base que usa el `DELETE` (`now()`), sin depender del reloj del test.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    phone_number = f"+54911{uuid.uuid4().int % 10**8:08d}"
+    notifier = _BlockingNotifier()
+    try:
+        async with session_factory() as setup:
+            user = User(phone_number=phone_number, name=f"QA inflight delete {uuid.uuid4().hex}")
+            setup.add(user)
+            await setup.flush()
+            field = Field(
+                user_id=user.id,
+                name=f"QA inflight field {uuid.uuid4().hex}",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            setup.add(field)
+            await setup.flush()
+            alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=50)
+            setup.add(alert)
+            await setup.flush()
+            notification = Notification(
+                alert_id=alert.id,
+                forecast_date=FORECAST_DATE,
+                event_type=EventType.FROST,
+                probability=80,
+                threshold=50,
+                status=NotificationStatus.PENDING,
+                attempts=0,
+                next_attempt_at=NOW - timedelta(minutes=1),
+            )
+            setup.add(notification)
+            await setup.commit()
+            user_id = user.id
+            alert_id = alert.id
+            notification_id = notification.id
+
+        dispatch = asyncio.create_task(
+            dispatch_pending(
+                session_factory,
+                notifier,
+                now=LEASE_SAFE_NOW,
+                clock=_clock_at(LEASE_SAFE_NOW),
+                **{**DISPATCH_KWARGS, "timeout_seconds": 10.0},
+            )
+        )
+        try:
+            await asyncio.wait_for(notifier.started.wait(), timeout=5)
+            # El DELETE de la API, en su propia conexión y commiteado, con el envío en vuelo.
+            async with session_factory() as api_session:
+                await delete_alert(api_session, user_id, alert_id)
+        finally:
+            notifier.release.set()
+
+        result = await dispatch
+        assert result == DispatchResult(sent=1, retried=0, failed=0)
+
+        async with session_factory() as check:
+            stored_alert = (
+                await check.execute(select(Alert).where(Alert.id == alert_id))
+            ).scalar_one()
+            stored_notification = (
+                await check.execute(select(Notification).where(Notification.id == notification_id))
+            ).scalar_one()
+        assert stored_alert.deleted_at is not None
+        assert stored_notification.status == NotificationStatus.SENT
+        assert stored_notification.last_error is None
+        assert stored_notification.attempts == 1
+        assert stored_notification.sent_at == LEASE_SAFE_NOW
+
+        # El próximo ciclo no encuentra nada pendiente: no hay reenvío.
+        assert await dispatch_pending(
+            session_factory,
+            FakeNotifier(),
+            now=LEASE_SAFE_NOW + timedelta(minutes=2),
+            **DISPATCH_KWARGS,
+        ) == DispatchResult(sent=0, retried=0, failed=0)
+    finally:
+        notifier.release.set()
+        async with engine.begin() as conn:
+            await conn.execute(delete(User).where(User.phone_number == phone_number))
+        await engine.dispose()
+
+
+async def test_a_leased_notification_of_a_deleted_alert_is_cancelled_when_the_lease_expires() -> (
+    None
+):
+    """SEC-2: el worker muere con la fila arrendada; al vencer el lease, el claim la cancela.
+
+    El DELETE no toca la fila (lease vigente). Cuando el lease vence, el próximo claim la
+    selecciona y la validación D12 la pasa a `cancelled` con `alert_deleted`, sin enviarla.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    phone_number = f"+54911{uuid.uuid4().int % 10**8:08d}"
+    notifier = _BlockingNotifier()
+    try:
+        async with session_factory() as setup:
+            user = User(phone_number=phone_number, name=f"QA dead worker {uuid.uuid4().hex}")
+            setup.add(user)
+            await setup.flush()
+            field = Field(
+                user_id=user.id,
+                name=f"QA dead worker field {uuid.uuid4().hex}",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            setup.add(field)
+            await setup.flush()
+            alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=50)
+            setup.add(alert)
+            await setup.flush()
+            notification = Notification(
+                alert_id=alert.id,
+                forecast_date=FORECAST_DATE,
+                event_type=EventType.FROST,
+                probability=80,
+                threshold=50,
+                status=NotificationStatus.PENDING,
+                attempts=0,
+                next_attempt_at=NOW - timedelta(minutes=1),
+            )
+            setup.add(notification)
+            await setup.commit()
+            user_id = user.id
+            alert_id = alert.id
+            notification_id = notification.id
+
+        dispatch = asyncio.create_task(
+            dispatch_pending(
+                session_factory,
+                notifier,
+                now=LEASE_SAFE_NOW,
+                clock=_clock_at(LEASE_SAFE_NOW),
+                **{**DISPATCH_KWARGS, "timeout_seconds": 10.0},
+            )
+        )
+        await asyncio.wait_for(notifier.started.wait(), timeout=5)
+        # El worker muere con el envío en vuelo: la fila queda `pending` y arrendada.
+        dispatch.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await dispatch
+
+        async with session_factory() as api_session:
+            await delete_alert(api_session, user_id, alert_id)
+
+        async with session_factory() as check:
+            leased = (
+                await check.execute(select(Notification).where(Notification.id == notification_id))
+            ).scalar_one()
+        assert leased.status == NotificationStatus.PENDING
+        assert leased.next_attempt_at == LEASE_SAFE_NOW + timedelta(
+            seconds=DISPATCH_KWARGS["lease_seconds"]
+        )
+
+        # Al vencer el lease, el claim re-valida contra la alerta borrada y la cancela.
+        result = await dispatch_pending(
+            session_factory,
+            FakeNotifier(),
+            now=LEASE_SAFE_NOW + timedelta(seconds=DISPATCH_KWARGS["lease_seconds"] + 1),
+            **DISPATCH_KWARGS,
+        )
+        assert result == DispatchResult(sent=0, retried=0, failed=0, cancelled=1)
+
+        async with session_factory() as check:
+            stored = (
+                await check.execute(select(Notification).where(Notification.id == notification_id))
+            ).scalar_one()
+        assert stored.status == NotificationStatus.CANCELLED
+        assert stored.last_error == "alert_deleted"
+        assert stored.attempts == 0
+        assert stored.sent_at is None
+    finally:
+        notifier.release.set()
+        async with engine.begin() as conn:
+            await conn.execute(delete(User).where(User.phone_number == phone_number))
+        await engine.dispose()
 
 
 # --- Settings: el lease cubre el peor caso del lote ------------------------

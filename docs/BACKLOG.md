@@ -87,12 +87,7 @@ Archivos: `app/main.py` (solo metadata OpenAPI: descripción y `openapi_tags`), 
 - [ ] Test de contrato: `app.openapi()` == `docs/openapi.json`; si difieren, falla con el mensaje "corré `make openapi`". Tests de que cada endpoint protegido declara 401 y el security scheme, y que los ejemplos validan contra sus propios schemas.
 - [ ] Ningún cambio de comportamiento: toda la suite existente sigue verde sin modificarse.
 
-# Fase 2 — Mejoras de producción
-
-Decisiones D1, D2, D5, D9 (revisadas) y D11–D16 en `REQUIREMENTS.md` §6. Cada historia detalla
-su contrato en `DATA_MODEL.md` / `API.md` / `JOBS.md` antes de arrancar.
-
-## S9 — Alertas: borrado lógico, varios umbrales y validación al enviar · D5, D11, D12
+## S9 — Alertas: borrado lógico, varios umbrales y validación al enviar · D5, D11, D12 · ✅
 Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.py`,
 `app/services/alerts.py`, `app/api/routers/alerts.py`, `app/jobs/{evaluator,dispatcher}.py`,
 `docs/openapi.json`, tests.
@@ -110,7 +105,8 @@ Archivos: migración `0003`, `app/models/{alert,enums}.py`, `app/schemas/alert.p
 
 ## S12 — Evaluador v2: zona horaria, horizonte y re-aviso por episodio · D1, D2, D9
 - [ ] `fields.timezone` (IANA, validada); "hoy" local por campo; horizonte configurable.
-- [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa. Sigue siendo set-based en SQL; la regla de transición se documenta y se testea también como función pura de referencia (tests de equivalencia).
+- [ ] Estado por (alerta, día): re-aviso en cada cruce hacia arriba, margen anti-oscilación, cambio de umbral re-evalúa.
+- [ ] **Reactivar** una alerta (`is_active` false → true) también re-evalúa: los días cuya notificación quedó `cancelled` por la pausa vuelven a poder avisarse (QA-1 de S9). Sigue siendo set-based en SQL; la regla de transición se documenta y se testea también como función pura de referencia (tests de equivalencia).
 
 ## S13 — Envío agrupado por usuario + horario de silencio · D15
 - [ ] Un mensaje por usuario y ciclo con todas sus notificaciones; cada notificación conserva su estado individual. Horario de silencio configurable: se difiere el envío hasta que termine.
@@ -159,3 +155,4 @@ Archivos: `.github/workflows/ci.yml`.
 | S7 SEC-4 | minor | El seed reutiliza un usuario existente con el teléfono demo (aunque sea real) y le agrega datos mock. Fix: abortar si el nombre no coincide o usar un rango de teléfonos no asignable | README §Limitaciones |
 | S7 SEC-5 | minor | La guarda del seed es denylist y `environment` default es `local`: si `ENVIRONMENT` no está seteada, pasa. Fix: exigir `ENVIRONMENT` explícita o flag `--yes-demo`; declarar `ENVIRONMENT` en el compose | **S16** |
 | S7 CR-1 | minor | Seed no seguro ante dos corridas concurrentes (documentado en el docstring) | — |
+| S9 CR-2 | nit | Migración 0003 transaccional (bloquea escrituras mientras crea el índice); en producción con tablas grandes usar `CONCURRENTLY` / `NOT VALID` (documentado en DATA_MODEL) | — |

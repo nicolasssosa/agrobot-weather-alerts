@@ -275,6 +275,41 @@ async def test_run_cycle_stops_draining_when_a_batch_changes_nothing(
     assert calls == 1
 
 
+async def test_run_cycle_accumulates_cancelled_and_counts_them_as_processed(
+    test_sessionmaker: async_sessionmaker[AsyncSession],
+    fake_notifier: FakeNotifier,
+    monkeypatch,
+    caplog,
+) -> None:
+    """S9: `cancelled` se acumula, se loguea y un lote lleno de canceladas no corta el drenado."""
+    calls = 0
+
+    async def cancelling_then_sending(sessionmaker, notifier, **kwargs):  # type: ignore[no-untyped-def]
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return DispatchResult(sent=0, retried=0, failed=0, cancelled=kwargs["batch_size"])
+        return DispatchResult(sent=1, retried=0, failed=0)
+
+    monkeypatch.setattr(worker, "dispatch_pending", cancelling_then_sending)
+
+    with caplog.at_level(logging.INFO, logger="app.jobs.worker"):
+        result = await run_cycle(
+            test_sessionmaker,
+            fake_notifier,
+            _settings(batch_size=2),
+            now=EVAL_NOW,
+            clock=_clock_at(CLAIM_NOW),
+        )
+
+    assert calls == 2
+    assert result.dispatch == DispatchResult(sent=1, retried=0, failed=0, cancelled=2)
+    assert any(
+        "cycle_done" in record.getMessage() and "cancelled=2" in record.getMessage()
+        for record in caplog.records
+    )
+
+
 async def test_run_cycle_does_not_dispatch_when_evaluate_alerts_raises(
     db_session: AsyncSession,
     test_sessionmaker: async_sessionmaker[AsyncSession],

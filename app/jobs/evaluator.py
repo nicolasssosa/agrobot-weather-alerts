@@ -50,9 +50,11 @@ def _build_statement(today: date) -> Select[tuple[int]]:
             & (WeatherForecast.event_type == Alert.event_type),
         )
         .where(
-            # Boolean bare (no `IS true`): habilita el índice parcial
-            # `ix_alerts_active_field_event ... WHERE is_active`.
+            # Predicado igual al del índice parcial (S9):
+            # `ix_alerts_active_field_event ... WHERE is_active AND deleted_at IS NULL`.
+            # Boolean bare (no `IS true`) para que el planner pueda usar el índice.
             Alert.is_active,
+            Alert.deleted_at.is_(None),
             WeatherForecast.forecast_date >= today,
             WeatherForecast.probability >= Alert.threshold,
         )

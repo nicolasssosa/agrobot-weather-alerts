@@ -68,9 +68,12 @@ async def run_cycle(
        **fresco** de `clock()`: el lease se calcula desde el momento real del claim.
     3. Si `stop_event` está seteado no se arranca un lote nuevo (S7 SEC-2): el shutdown no
        espera a drenar toda la cola, lo pendiente queda para el próximo arranque.
-    4. Un lote que no cambia el estado de ninguna fila (`sent + retried + failed == 0`) corta
-       el drenado, para no girar en vacío si todas las filas fueron ignoradas por las guardas
-       del dispatcher. Además hay un tope de `MAX_DISPATCH_BATCHES_PER_CYCLE` lotes por ciclo.
+    4. Un lote que no cambia el estado de ninguna fila
+       (`sent + retried + failed + cancelled == 0`) corta el drenado, para no girar en vacío
+       si todas las filas fueron ignoradas por las guardas del dispatcher. Las canceladas
+       cuentan como procesadas: un lote lleno de cancelaciones no corta el drenado porque
+       puede haber más pendientes detrás. Además hay un tope de
+       `MAX_DISPATCH_BATCHES_PER_CYCLE` lotes por ciclo.
 
     Devuelve lo creado y la suma de los lotes; loguea `cycle_done` (RNF-06).
     """
@@ -81,7 +84,7 @@ async def run_cycle(
         created = await evaluate_alerts(session, today=cycle_now.date())
         await session.commit()
 
-    sent = retried = failed = 0
+    sent = retried = failed = cancelled = 0
     batches = 0
     while batches < MAX_DISPATCH_BATCHES_PER_CYCLE:
         if stop_event is not None and stop_event.is_set():
@@ -102,7 +105,8 @@ async def run_cycle(
         sent += batch.sent
         retried += batch.retried
         failed += batch.failed
-        processed = batch.sent + batch.retried + batch.failed
+        cancelled += batch.cancelled
+        processed = batch.sent + batch.retried + batch.failed + batch.cancelled
         # `processed == 0`: el lote (aunque haya venido lleno) no cambió ninguna fila.
         # `processed < batch_size`: el lote no vino lleno, la cola vencida se vació.
         if processed == 0 or processed < settings.dispatch_batch_size:
@@ -110,14 +114,15 @@ async def run_cycle(
     else:
         logger.warning("dispatch_drain_capped batches=%d", MAX_DISPATCH_BATCHES_PER_CYCLE)
 
-    dispatch = DispatchResult(sent=sent, retried=retried, failed=failed)
+    dispatch = DispatchResult(sent=sent, retried=retried, failed=failed, cancelled=cancelled)
     duration_ms = int((time.perf_counter() - started) * 1000)
     logger.info(
-        "cycle_done created=%d sent=%d retried=%d failed=%d duration_ms=%d",
+        "cycle_done created=%d sent=%d retried=%d failed=%d cancelled=%d duration_ms=%d",
         created,
         dispatch.sent,
         dispatch.retried,
         dispatch.failed,
+        dispatch.cancelled,
         duration_ms,
     )
     return CycleResult(created=created, dispatch=dispatch)

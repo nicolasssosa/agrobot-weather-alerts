@@ -20,6 +20,7 @@ from app.schemas.forecast import ForecastRead
 from app.schemas.notification import NotificationPage, NotificationRead
 from app.schemas.user import UserCreate, UserRead
 from app.scripts.export_openapi import OPENAPI_PATH, render_openapi
+from app.services.alerts import ALERT_LIMIT_DETAIL
 
 _HTTP_METHODS = frozenset({"get", "put", "post", "delete", "options", "head", "patch", "trace"})
 
@@ -40,7 +41,12 @@ EXPECTED_404 = {
 EXPECTED_409 = {
     ("post", "/api/v1/users"): "User with this phone number already exists",
     ("post", "/api/v1/fields"): "Field name already exists",
-    ("post", "/api/v1/alerts"): "An alert for this field and event type already exists",
+    ("post", "/api/v1/alerts"): (
+        "An alert with this field, event type and threshold already exists"
+    ),
+    ("patch", "/api/v1/alerts/{alert_id}"): (
+        "An alert with this field, event type and threshold already exists"
+    ),
 }
 
 #: Nombre del schema en `components.schemas` -> modelo Pydantic que lo valida.
@@ -123,6 +129,19 @@ def test_uniqueness_posts_declare_409() -> None:
         responses = spec["paths"][path][method]["responses"]
         assert "409" in responses, (method, path)
         assert responses["409"]["content"]["application/json"]["example"] == {"detail": detail}
+
+
+def test_post_alerts_409_documents_the_per_field_limit() -> None:
+    """SEC-1: el 409 de POST /alerts también cubre el tope de alertas vivas por campo."""
+    responses = _spec()["paths"]["/api/v1/alerts"]["post"]["responses"]
+
+    description = responses["409"]["description"]
+    assert ALERT_LIMIT_DETAIL in description
+    assert "MAX_ALERTS_PER_FIELD" in description
+    # El ejemplo sigue siendo el de unicidad (el contrato existente no cambia).
+    assert responses["409"]["content"]["application/json"]["example"] == {
+        "detail": "An alert with this field, event type and threshold already exists"
+    }
 
 
 @pytest.mark.parametrize(("schema_name", "model"), _SCHEMA_MODELS.items())

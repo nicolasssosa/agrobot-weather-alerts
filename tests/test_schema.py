@@ -58,6 +58,8 @@ EXPECTED_COLUMNS: dict[str, list[ColumnSpec]] = {
         ("is_active", "boolean", "NO", None, None, None),
         ("created_at", "timestamp with time zone", "NO", None, None, None),
         ("updated_at", "timestamp with time zone", "NO", None, None, None),
+        # `0003` agrega la columna al final (ADD COLUMN): el orden físico es el de la migración.
+        ("deleted_at", "timestamp with time zone", "YES", None, None, None),
     ],
     "notifications": [
         ("id", "bigint", "NO", None, 64, 0),
@@ -80,7 +82,8 @@ EXPECTED_UNIQUES: dict[str, set[frozenset[str]]] = {
     "users": {frozenset({"phone_number"})},
     "fields": {frozenset({"user_id", "name"})},
     "weather_forecasts": {frozenset({"field_id", "forecast_date", "event_type"})},
-    "alerts": {frozenset({"field_id", "event_type"})},
+    # La unicidad de alerts pasó a un índice único parcial en `0003` (no es un constraint).
+    "alerts": set(),
     "notifications": {frozenset({"alert_id", "forecast_date"})},
 }
 
@@ -127,7 +130,11 @@ EXPECTED_INDEXES = {
         "pk_weather_forecasts",
         "uq_weather_forecasts_field_id_forecast_date_event_type",
     },
-    "alerts": {"pk_alerts", "uq_alerts_field_id_event_type", "ix_alerts_active_field_event"},
+    "alerts": {
+        "pk_alerts",
+        "uq_alerts_field_event_threshold_alive",
+        "ix_alerts_active_field_event",
+    },
     "notifications": {
         "pk_notifications",
         "uq_notifications_alert_id_forecast_date",
@@ -205,7 +212,11 @@ async def test_unique_constraints_match_data_model(db_session: AsyncSession) -> 
     actual: dict[str, set[frozenset[str]]] = {}
     for table, columns in rows:
         actual.setdefault(table, set()).add(frozenset(columns))
-    assert actual == EXPECTED_UNIQUES
+    # `alerts` ya no tiene UNIQUE constraints (su unicidad es un índice parcial en 0003).
+    expected = {
+        table: constraints for table, constraints in EXPECTED_UNIQUES.items() if constraints
+    }
+    assert actual == expected
 
 
 async def test_foreign_keys_are_bigint_and_on_delete_cascade(db_session: AsyncSession) -> None:
@@ -314,7 +325,13 @@ async def test_partial_indexes_declare_expected_predicates_and_columns(
 
     alerts_index = definitions["ix_alerts_active_field_event"]
     assert "(field_id, event_type)" in alerts_index
-    assert "WHERE is_active" in alerts_index
+    assert "is_active" in alerts_index
+    assert "deleted_at IS NULL" in alerts_index
+
+    alive_unique = definitions["uq_alerts_field_event_threshold_alive"]
+    assert "UNIQUE INDEX" in alive_unique
+    assert "(field_id, event_type, threshold)" in alive_unique
+    assert "deleted_at IS NULL" in alive_unique
 
     pending_index = definitions["ix_notifications_pending_due"]
     assert "(next_attempt_at)" in pending_index
@@ -362,14 +379,17 @@ async def test_migration_0002_check_constraints_are_in_the_catalog(
     assert "1000" in definitions["ck_notifications_last_error_length"]
 
 
-def test_migration_chain_is_0001_then_0002() -> None:
+def test_migration_chain_is_0001_then_0002_then_0003() -> None:
     cfg = Config(str(ROOT / "alembic.ini"))
     cfg.set_main_option("script_location", str(ROOT / "migrations"))
     script = ScriptDirectory.from_config(cfg)
-    assert script.get_current_head() == "0002"
+    assert script.get_current_head() == "0003"
     initial = script.get_revision("0001")
     assert initial is not None
     assert initial.down_revision is None
     hardening = script.get_revision("0002")
     assert hardening is not None
     assert hardening.down_revision == "0001"
+    soft_delete = script.get_revision("0003")
+    assert soft_delete is not None
+    assert soft_delete.down_revision == "0002"

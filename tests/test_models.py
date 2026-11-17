@@ -1,6 +1,6 @@
 """Tests de constraints del modelo de datos (docs/DATA_MODEL.md)."""
 
-from datetime import date
+from datetime import UTC, date, datetime
 from decimal import Decimal
 
 import pytest
@@ -84,7 +84,7 @@ async def test_duplicate_phone_number_is_rejected(
             await make_user(phone_number=user.phone_number)
 
 
-async def test_duplicate_alert_for_same_field_and_event_is_rejected(
+async def test_duplicate_alert_for_same_field_event_and_threshold_is_rejected(
     db_session: AsyncSession,
     make_field: MakeField,
     make_alert: MakeAlert,
@@ -93,7 +93,34 @@ async def test_duplicate_alert_for_same_field_and_event_is_rejected(
     await make_alert(field, event_type=EventType.RAIN, threshold=60)
     with pytest.raises(IntegrityError):
         async with db_session.begin_nested():
-            await make_alert(field, event_type=EventType.RAIN, threshold=90)
+            await make_alert(field, event_type=EventType.RAIN, threshold=60)
+
+
+async def test_alerts_with_different_thresholds_for_same_field_and_event_are_allowed(
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """D5/S9: varias alertas por (campo, evento) con umbrales distintos (50 y 80)."""
+    field = await make_field()
+    first = await make_alert(field, event_type=EventType.RAIN, threshold=60)
+    second = await make_alert(field, event_type=EventType.RAIN, threshold=90)
+
+    assert first.id != second.id
+
+
+async def test_a_soft_deleted_alert_does_not_block_the_same_threshold(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    field = await make_field()
+    deleted = await make_alert(field, event_type=EventType.RAIN, threshold=60)
+    deleted.deleted_at = datetime(2026, 11, 16, 12, 0, tzinfo=UTC)
+    await db_session.flush()
+
+    recreated = await make_alert(field, event_type=EventType.RAIN, threshold=60)
+
+    assert recreated.id != deleted.id
 
 
 async def test_threshold_out_of_range_is_rejected(
@@ -373,10 +400,35 @@ async def test_invalid_notification_status_is_rejected(
                 text(
                     "INSERT INTO notifications"
                     " (alert_id, forecast_date, event_type, probability, threshold, status)"
-                    " VALUES (:alert_id, :day, 'frost', 50, 50, 'cancelled')"
+                    " VALUES (:alert_id, :day, 'frost', 50, 50, 'bogus')"
                 ),
                 {"alert_id": alert.id, "day": DAY},
             )
+
+
+async def test_cancelled_is_a_valid_notification_status_in_database(
+    db_session: AsyncSession,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S9: `cancelled` entra en el CHECK de `notifications.status`."""
+    alert = await make_alert(await make_field())
+    await db_session.execute(
+        text(
+            "INSERT INTO notifications"
+            " (alert_id, forecast_date, event_type, probability, threshold, status)"
+            " VALUES (:alert_id, :day, 'frost', 50, 50, 'cancelled')"
+        ),
+        {"alert_id": alert.id, "day": DAY},
+    )
+
+    status = (
+        await db_session.execute(
+            text("SELECT status FROM notifications WHERE alert_id = :alert_id"),
+            {"alert_id": alert.id},
+        )
+    ).scalar_one()
+    assert status == "cancelled"
 
 
 async def test_deleting_user_cascades_to_fields_and_descendants(

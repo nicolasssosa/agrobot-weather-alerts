@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     db_pool_size: PositiveInt = 5
     db_max_overflow: int = Field(default=10, ge=0)
 
+    # Tope de alertas vivas por campo (docs/API.md §alerts, "Límite").
+    max_alerts_per_field: int = Field(default=10, ge=1, le=100)
+
     # Background job
     worker_interval_seconds: PositiveInt = 60
     dispatch_batch_size: int = Field(default=100, ge=1, le=1000)

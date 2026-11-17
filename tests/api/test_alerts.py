@@ -17,7 +17,7 @@ from sqlalchemy.pool import NullPool
 from app.core.db import get_session
 from app.core.errors import ConflictError
 from app.main import create_app
-from app.models import Alert, EventType, Field, Notification, User
+from app.models import Alert, EventType, Field, Notification, NotificationStatus, User
 from app.schemas.alert import AlertCreate
 from app.schemas.common import BIGINT_MAX
 from app.services import alerts as alerts_service
@@ -68,7 +68,7 @@ async def test_created_alert_appears_in_the_listing(
     assert listing.json()["items"] == [created.json()]
 
 
-async def test_duplicate_field_and_event_type_returns_409(
+async def test_duplicate_field_event_and_threshold_returns_409(
     client: AsyncClient, make_user: MakeUser, make_field: MakeField
 ) -> None:
     user = await make_user()
@@ -79,7 +79,32 @@ async def test_duplicate_field_and_event_type_returns_409(
     response = await client.post(API, json=payload, headers=auth(user))
 
     assert response.status_code == 409
-    assert response.json() == {"detail": "An alert for this field and event type already exists"}
+    assert response.json() == {
+        "detail": "An alert with this field, event type and threshold already exists"
+    }
+
+
+async def test_same_field_and_event_with_different_thresholds_is_accepted(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    """D5/S9: 50 = atención y 80 = crítico conviven en el mismo (campo, evento)."""
+    user = await make_user()
+    field = await make_field(user=user)
+
+    low = await client.post(
+        API,
+        json={"field_id": field.id, "event_type": "frost", "threshold": 50},
+        headers=auth(user),
+    )
+    high = await client.post(
+        API,
+        json={"field_id": field.id, "event_type": "frost", "threshold": 80},
+        headers=auth(user),
+    )
+
+    assert low.status_code == 201
+    assert high.status_code == 201
+    assert low.json()["id"] != high.json()["id"]
 
 
 async def test_same_event_type_on_another_field_is_accepted(
@@ -612,8 +637,12 @@ async def test_patch_of_an_unknown_or_out_of_range_alert_returns_404(
     assert response.json() == {"detail": "Alert not found"}
 
 
-async def test_delete_returns_204_without_body_and_the_alert_disappears(
-    client: AsyncClient, make_user: MakeUser, make_field: MakeField, make_alert: MakeAlert
+async def test_delete_marks_deleted_at_and_the_alert_disappears(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
 ) -> None:
     user = await make_user()
     field = await make_field(user=user)
@@ -623,36 +652,123 @@ async def test_delete_returns_204_without_body_and_the_alert_disappears(
 
     assert response.status_code == 204
     assert response.content == b""
+    await db_session.refresh(alert)
+    assert alert.deleted_at is not None
     assert (await client.get(f"{API}/{alert.id}", headers=auth(user))).status_code == 404
 
 
-async def test_delete_cascades_to_the_alert_notifications(
+async def test_delete_is_idempotent_for_an_own_alert(
     client: AsyncClient,
     db_session: AsyncSession,
     make_user: MakeUser,
     make_field: MakeField,
     make_alert: MakeAlert,
 ) -> None:
+    """Repetir el DELETE de una alerta propia ya borrada sigue siendo 204 (D11)."""
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field)
+
+    first = await client.delete(f"{API}/{alert.id}", headers=auth(user))
+    await db_session.refresh(alert)
+    first_deleted_at = alert.deleted_at
+    second = await client.delete(f"{API}/{alert.id}", headers=auth(user))
+
+    assert first.status_code == 204
+    assert second.status_code == 204
+    await db_session.refresh(alert)
+    assert alert.deleted_at == first_deleted_at
+
+
+async def test_a_deleted_alert_returns_404_on_get_and_patch(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField, make_alert: MakeAlert
+) -> None:
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field)
+    assert (await client.delete(f"{API}/{alert.id}", headers=auth(user))).status_code == 204
+
+    read = await client.get(f"{API}/{alert.id}", headers=auth(user))
+    patched = await client.patch(f"{API}/{alert.id}", json={"threshold": 90}, headers=auth(user))
+
+    assert read.status_code == 404
+    assert read.json() == {"detail": "Alert not found"}
+    assert patched.status_code == 404
+    assert patched.json() == {"detail": "Alert not found"}
+
+
+async def test_a_deleted_alert_is_excluded_from_the_listing(
+    client: AsyncClient,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    user = await make_user()
+    field = await make_field(user=user)
+    kept = await make_alert(field, event_type=EventType.FROST)
+    deleted = await make_alert(field, event_type=EventType.RAIN)
+    assert (await client.delete(f"{API}/{deleted.id}", headers=auth(user))).status_code == 204
+
+    response = await client.get(API, headers=auth(user))
+
+    assert response.status_code == 200
+    assert [item["id"] for item in response.json()["items"]] == [kept.id]
+
+
+async def test_delete_cancels_only_the_pending_notifications(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """S9/D11: pending -> cancelled (`alert_deleted`); sent/failed no cambian y no se borran."""
     user = await make_user()
     field = await make_field(user=user)
     alert = await make_alert(field, event_type=EventType.FROST, threshold=70)
-    notification = Notification(
+    pending = Notification(
         alert_id=alert.id,
         forecast_date=date(2026, 11, 20),
         event_type=EventType.FROST,
         probability=90,
         threshold=70,
+        status=NotificationStatus.PENDING,
     )
-    db_session.add(notification)
+    sent = Notification(
+        alert_id=alert.id,
+        forecast_date=date(2026, 11, 21),
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+        status=NotificationStatus.SENT,
+        attempts=1,
+        sent_at=datetime(2026, 11, 16, 12, 0, tzinfo=UTC),
+    )
+    failed = Notification(
+        alert_id=alert.id,
+        forecast_date=date(2026, 11, 22),
+        event_type=EventType.FROST,
+        probability=90,
+        threshold=70,
+        status=NotificationStatus.FAILED,
+        attempts=3,
+        last_error="NotifierError: boom",
+    )
+    db_session.add_all([pending, sent, failed])
     await db_session.flush()
 
     response = await client.delete(f"{API}/{alert.id}", headers=auth(user))
 
     assert response.status_code == 204
-    count = await db_session.execute(
-        select(func.count()).select_from(Notification).where(Notification.alert_id == alert.id)
-    )
-    assert count.scalar_one() == 0
+    await db_session.refresh(pending)
+    await db_session.refresh(sent)
+    await db_session.refresh(failed)
+    assert pending.status == NotificationStatus.CANCELLED
+    assert pending.last_error == "alert_deleted"
+    assert sent.status == NotificationStatus.SENT
+    assert sent.last_error is None
+    assert failed.status == NotificationStatus.FAILED
+    assert failed.last_error == "NotifierError: boom"
 
 
 async def test_delete_of_another_users_alert_returns_404_and_keeps_it(
@@ -779,6 +895,10 @@ async def test_the_409_comes_from_the_unique_violation_of_the_insert(
         def add(self, instance: object) -> None:
             pass
 
+        async def execute(self, _statement: object) -> SimpleNamespace:
+            # Lock/conteo de `create_alert`: el test solo ejercita add/commit/rollback.
+            return SimpleNamespace(scalar_one=lambda: 0)
+
         async def commit(self) -> None:
             raise unique_violation
 
@@ -795,7 +915,9 @@ async def test_the_409_comes_from_the_unique_violation_of_the_insert(
         # Sesión duck-typed: el test solo ejercita add/commit/rollback.
         await create_alert(session, user.id, payload)  # type: ignore[arg-type]
 
-    assert exc_info.value.detail == "An alert for this field and event type already exists"
+    assert exc_info.value.detail == (
+        "An alert with this field, event type and threshold already exists"
+    )
     assert session.rolled_back is True
 
 
@@ -861,6 +983,202 @@ async def test_patch_with_the_same_threshold_is_a_200_noop(
     assert body["id"] == alert.id
     assert body["threshold"] == 70
     assert body["is_active"] is True
+
+
+async def test_patch_that_collides_with_another_alive_threshold_returns_409(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField, make_alert: MakeAlert
+) -> None:
+    user = await make_user()
+    field = await make_field(user=user)
+    low = await make_alert(field, event_type=EventType.FROST, threshold=50)
+    high = await make_alert(field, event_type=EventType.FROST, threshold=80)
+
+    response = await client.patch(
+        f"{API}/{low.id}", json={"threshold": high.threshold}, headers=auth(user)
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": "An alert with this field, event type and threshold already exists"
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"threshold": 101}, {"is_active": None}, {"unknown": 1}],
+    ids=["empty", "threshold-out-of-range", "null-value", "unknown-field"],
+)
+async def test_patch_of_a_deleted_alert_with_an_invalid_body_returns_422(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+    payload: dict[str, object],
+) -> None:
+    """Precedencia documentada: la validación del body (422) corre antes que el handler (404).
+
+    `API.md` §alerts solo exige 404 en `GET`/`PATCH` de una alerta borrada; no define qué gana
+    frente a un body inválido. FastAPI valida el body antes de ejecutar el endpoint, así que el
+    422 gana. Con un body válido la respuesta sigue siendo 404 (test siguiente).
+    """
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field)
+    assert (await client.delete(f"{API}/{alert.id}", headers=auth(user))).status_code == 204
+
+    response = await client.patch(f"{API}/{alert.id}", json=payload, headers=auth(user))
+
+    assert response.status_code == 422
+    await db_session.refresh(alert)
+    assert alert.deleted_at is not None
+
+
+async def test_a_valid_patch_of_a_deleted_alert_still_returns_404(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField, make_alert: MakeAlert
+) -> None:
+    """Complemento del test anterior: con un body válido gana el 404 del recurso borrado."""
+    user = await make_user()
+    field = await make_field(user=user)
+    alert = await make_alert(field)
+    assert (await client.delete(f"{API}/{alert.id}", headers=auth(user))).status_code == 204
+
+    response = await client.patch(f"{API}/{alert.id}", json={"threshold": 90}, headers=auth(user))
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Alert not found"}
+
+
+async def test_a_threshold_freed_by_a_delete_can_be_recreated_beside_the_other_one(
+    client: AsyncClient,
+    db_session: AsyncSession,
+    make_user: MakeUser,
+    make_field: MakeField,
+    make_alert: MakeAlert,
+) -> None:
+    """D5/S9: dos umbrales vivos, se borra uno y se recrea con el umbral liberado → 201.
+
+    El índice único parcial solo mira las alertas vivas, así que el borrado libera el
+    `(campo, evento, umbral)` sin afectar al otro umbral vivo.
+    """
+    user = await make_user()
+    field = await make_field(user=user)
+    low = await make_alert(field, event_type=EventType.FROST, threshold=50)
+    high = await make_alert(field, event_type=EventType.FROST, threshold=80)
+    assert (await client.delete(f"{API}/{low.id}", headers=auth(user))).status_code == 204
+
+    recreated = await client.post(
+        API,
+        json={"field_id": field.id, "event_type": "frost", "threshold": 50},
+        headers=auth(user),
+    )
+
+    assert recreated.status_code == 201
+    assert recreated.json()["threshold"] == 50
+    assert recreated.json()["id"] != low.id
+    listing = await client.get(API, headers=auth(user))
+    assert {item["id"] for item in listing.json()["items"]} == {high.id, recreated.json()["id"]}
+    # El umbral recreado vuelve a estar tomado entre las alertas vivas.
+    duplicate = await client.post(
+        API,
+        json={"field_id": field.id, "event_type": "frost", "threshold": 50},
+        headers=auth(user),
+    )
+    assert duplicate.status_code == 409
+
+
+async def test_two_concurrent_deletes_of_the_same_alert_are_both_204_and_cancel_once() -> None:
+    """D11: dos DELETE simultáneos de la misma alerta → 204 + 204 y una sola cancelación.
+
+    Igual que `test_concurrent_identical_posts...`: sesiones y datos commiteados en un engine
+    propio (la sesión de `db_session` está atada a una única conexión). El `FOR UPDATE OF
+    alerts` serializa los dos DELETEs: el segundo relee `deleted_at` y no vuelve a moverlo ni
+    a re-cancelar nada.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    phone_number = f"+54{uuid4().int % 10**12:012d}"
+    try:
+        async with sessionmaker() as setup:
+            user = User(phone_number=phone_number, name="QA concurrent delete")
+            setup.add(user)
+            await setup.flush()
+            field = Field(
+                user_id=user.id,
+                name="QA concurrent delete field",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            setup.add(field)
+            await setup.flush()
+            alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=70)
+            setup.add(alert)
+            await setup.flush()
+            setup.add_all(
+                [
+                    Notification(
+                        alert_id=alert.id,
+                        forecast_date=date(2026, 11, 20),
+                        event_type=EventType.FROST,
+                        probability=90,
+                        threshold=70,
+                        status=NotificationStatus.PENDING,
+                    ),
+                    Notification(
+                        alert_id=alert.id,
+                        forecast_date=date(2026, 11, 21),
+                        event_type=EventType.FROST,
+                        probability=90,
+                        threshold=70,
+                        status=NotificationStatus.PENDING,
+                    ),
+                ]
+            )
+            await setup.commit()
+            user_id = user.id
+            alert_id = alert.id
+
+        def build_client() -> AsyncClient:
+            app = create_app()
+
+            async def _override_session() -> AsyncIterator[AsyncSession]:
+                async with sessionmaker() as session:
+                    yield session
+
+            app.dependency_overrides[get_session] = _override_session
+            return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+        headers = {"X-User-Id": str(user_id)}
+        async with build_client() as first, build_client() as second:
+            responses = await asyncio.gather(
+                first.delete(f"{API}/{alert_id}", headers=headers),
+                second.delete(f"{API}/{alert_id}", headers=headers),
+            )
+
+        assert [response.status_code for response in responses] == [204, 204]
+        async with sessionmaker() as check:
+            stored = (await check.execute(select(Alert).where(Alert.id == alert_id))).scalar_one()
+            notifications = (
+                (
+                    await check.execute(
+                        select(Notification)
+                        .where(Notification.alert_id == alert_id)
+                        .order_by(Notification.id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+        assert stored.deleted_at is not None
+        assert [(row.status, row.last_error) for row in notifications] == [
+            (NotificationStatus.CANCELLED, "alert_deleted"),
+            (NotificationStatus.CANCELLED, "alert_deleted"),
+        ]
+    finally:
+        async with sessionmaker() as cleanup:
+            await cleanup.execute(delete(User).where(User.phone_number == phone_number))
+            await cleanup.commit()
+        await engine.dispose()
 
 
 async def test_patch_is_active_false_is_reflected_in_the_filtered_listing(
@@ -1003,7 +1321,7 @@ async def test_concurrent_identical_posts_produce_exactly_one_alert() -> None:
         assert sorted([first_response.status_code, second_response.status_code]) == [201, 409]
         conflict = first_response if first_response.status_code == 409 else second_response
         assert conflict.json() == {
-            "detail": "An alert for this field and event type already exists"
+            "detail": "An alert with this field, event type and threshold already exists"
         }
         async with sessionmaker() as session:
             count = await session.scalar(
@@ -1014,4 +1332,201 @@ async def test_concurrent_identical_posts_produce_exactly_one_alert() -> None:
         async with sessionmaker() as session:
             await session.execute(delete(User).where(User.phone_number == phone_number))
             await session.commit()
+        await engine.dispose()
+
+
+async def test_patch_racing_a_committed_soft_delete_returns_404_and_keeps_the_alert_deleted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CR-1: DELETE commiteado entre la lectura y la escritura del PATCH.
+
+    Se usa un engine propio (como en docs/TESTING.md §Concurrencia) para que el DELETE sea
+    visible desde otra conexión, igual que en producción. El `UPDATE ... WHERE deleted_at IS
+    NULL` afecta 0 filas -> 404, y la alerta queda borrada con su threshold original.
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    phone_number = f"+54{uuid4().int % 10**12:012d}"
+    try:
+        async with sessionmaker() as setup:
+            user = User(phone_number=phone_number, name="QA patch vs delete")
+            setup.add(user)
+            await setup.flush()
+            field = Field(
+                user_id=user.id,
+                name="QA patch vs delete field",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            setup.add(field)
+            await setup.flush()
+            alert = Alert(field_id=field.id, event_type=EventType.FROST, threshold=70)
+            setup.add(alert)
+            await setup.commit()
+            user_id = user.id
+            alert_id = alert.id
+
+        original_get_alert = alerts_service.get_alert
+
+        async def get_alert_then_soft_delete(
+            session: AsyncSession, user_id: int, alert_id: int
+        ) -> Alert:
+            found = await original_get_alert(session, user_id, alert_id)
+            # El DELETE de la API, commiteado desde otra conexión, con el PATCH en curso.
+            async with sessionmaker() as deleter:
+                await deleter.execute(
+                    update(Alert)
+                    .where(Alert.id == found.id)
+                    .values(deleted_at=func.now(), updated_at=func.now())
+                )
+                await deleter.commit()
+            return found
+
+        monkeypatch.setattr(alerts_service, "get_alert", get_alert_then_soft_delete)
+
+        app = create_app()
+
+        async def _override_session() -> AsyncIterator[AsyncSession]:
+            async with sessionmaker() as session:
+                yield session
+
+        app.dependency_overrides[get_session] = _override_session
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+            response = await client.patch(
+                f"{API}/{alert_id}",
+                json={"threshold": 90},
+                headers={"X-User-Id": str(user_id)},
+            )
+
+        assert response.status_code == 404
+        assert response.json() == {"detail": "Alert not found"}
+        async with sessionmaker() as check:
+            stored = (await check.execute(select(Alert).where(Alert.id == alert_id))).scalar_one()
+        assert stored.deleted_at is not None
+        assert stored.threshold == 70
+    finally:
+        async with sessionmaker() as cleanup:
+            await cleanup.execute(delete(User).where(User.phone_number == phone_number))
+            await cleanup.commit()
+        await engine.dispose()
+
+
+async def test_the_alert_after_the_per_field_limit_returns_409(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    """SEC-1: `MAX_ALERTS_PER_FIELD` (default 10) alertas vivas; la siguiente -> 409."""
+    user = await make_user()
+    field = await make_field(user=user)
+    for threshold in range(1, 11):
+        created = await client.post(
+            API,
+            json={"field_id": field.id, "event_type": "frost", "threshold": threshold},
+            headers=auth(user),
+        )
+        assert created.status_code == 201, created.text
+
+    response = await client.post(
+        API,
+        json={"field_id": field.id, "event_type": "frost", "threshold": 11},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "Alert limit reached for this field"}
+
+
+async def test_deleting_an_alert_frees_a_slot_under_the_per_field_limit(
+    client: AsyncClient, make_user: MakeUser, make_field: MakeField
+) -> None:
+    """SEC-1: el tope cuenta solo alertas vivas; borrar una libera cupo."""
+    user = await make_user()
+    field = await make_field(user=user)
+    created = []
+    for threshold in range(1, 11):
+        response = await client.post(
+            API,
+            json={"field_id": field.id, "event_type": "frost", "threshold": threshold},
+            headers=auth(user),
+        )
+        assert response.status_code == 201, response.text
+        created.append(response.json())
+
+    assert (await client.delete(f"{API}/{created[0]['id']}", headers=auth(user))).status_code == 204
+    response = await client.post(
+        API,
+        json={"field_id": field.id, "event_type": "frost", "threshold": 11},
+        headers=auth(user),
+    )
+
+    assert response.status_code == 201
+
+
+async def test_concurrent_posts_at_the_per_field_limit_allow_exactly_one() -> None:
+    """SEC-1: dos POST concurrentes con N-1 alertas vivas -> un 201 y un 409.
+
+    Sin el lock de la fila del campo ambos contaban N-1 e insertaban: una quedaba en N+1.
+    Engine propio, datos commiteados y limpieza por teléfono en el `finally` (como el test
+    de unicidad concurrente).
+    """
+    engine = create_async_engine(TEST_DATABASE_URL, poolclass=NullPool)
+    sessionmaker = async_sessionmaker(engine, expire_on_commit=False)
+    phone_number = f"+54{uuid4().int % 10**12:012d}"
+    try:
+        async with sessionmaker() as setup:
+            user = User(phone_number=phone_number, name="QA limit concurrent")
+            setup.add(user)
+            await setup.flush()
+            field = Field(
+                user_id=user.id,
+                name="QA limit concurrent field",
+                latitude=Decimal("-34.6"),
+                longitude=Decimal("-58.4"),
+            )
+            setup.add(field)
+            await setup.flush()
+            for threshold in range(1, 10):
+                setup.add(Alert(field_id=field.id, event_type=EventType.FROST, threshold=threshold))
+            await setup.commit()
+            user_id = user.id
+            field_id = field.id
+
+        def build_client() -> AsyncClient:
+            app = create_app()
+
+            async def _override_session() -> AsyncIterator[AsyncSession]:
+                async with sessionmaker() as session:
+                    yield session
+
+            app.dependency_overrides[get_session] = _override_session
+            return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+        headers = {"X-User-Id": str(user_id)}
+        async with build_client() as first, build_client() as second:
+            first_response, second_response = await asyncio.gather(
+                first.post(
+                    API,
+                    json={"field_id": field_id, "event_type": "frost", "threshold": 98},
+                    headers=headers,
+                ),
+                second.post(
+                    API,
+                    json={"field_id": field_id, "event_type": "frost", "threshold": 99},
+                    headers=headers,
+                ),
+            )
+
+        assert sorted([first_response.status_code, second_response.status_code]) == [201, 409]
+        conflict = first_response if first_response.status_code == 409 else second_response
+        assert conflict.json() == {"detail": "Alert limit reached for this field"}
+        async with sessionmaker() as check:
+            live = await check.scalar(
+                select(func.count())
+                .select_from(Alert)
+                .where(Alert.field_id == field_id, Alert.deleted_at.is_(None))
+            )
+        assert live == 10
+    finally:
+        async with sessionmaker() as cleanup:
+            await cleanup.execute(delete(User).where(User.phone_number == phone_number))
+            await cleanup.commit()
         await engine.dispose()

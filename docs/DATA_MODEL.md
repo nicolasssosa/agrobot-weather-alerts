@@ -127,12 +127,12 @@ Configuración del usuario: "avisame cuando la probabilidad de `event_type` en `
 
 Constraints / índices:
 - `deleted_at TIMESTAMPTZ NULL` (S9, migración 0003): borrado lógico. Una alerta borrada no se lista, no se evalúa y no se puede modificar; su historial de notificaciones se conserva.
-- ~~`UNIQUE (field_id, event_type)`~~ (Fase 1) → reemplazado en 0003 por el **índice único parcial**
-  `uq_alerts_field_event_threshold_alive` en `(field_id, event_type, threshold) WHERE deleted_at IS NULL`:
+- **Índice único parcial** `uq_alerts_field_event_threshold_alive` en
+  `(field_id, event_type, threshold) WHERE deleted_at IS NULL` (migración 0003):
   varias alertas por evento con umbrales distintos; una borrada se puede recrear.
 - Índice parcial `ix_alerts_active_field_event` en `(field_id, event_type) WHERE is_active AND deleted_at IS NULL` (0003)
   (lo usa el evaluador). En el modelo:
-  `Index("ix_alerts_active_field_event", "field_id", "event_type", postgresql_where=text("is_active"))`.
+  `Index("ix_alerts_active_field_event", "field_id", "event_type", postgresql_where=text("is_active AND deleted_at IS NULL"))`.
 
 > El dueño de la alerta se deriva de `fields.user_id` (no se duplica `user_id` en `alerts`:
 > imposible que queden inconsistentes).
@@ -175,6 +175,9 @@ Constraints / índices:
   `(field_id, event_type, threshold) WHERE deleted_at IS NULL`.
 - Recrear `ix_alerts_active_field_event` con predicado `is_active AND deleted_at IS NULL`.
 - Recrear los CHECK de `notifications.status` con el valor nuevo `cancelled`.
+- En producción con tablas grandes: crear el índice con `CREATE UNIQUE INDEX CONCURRENTLY` y el CHECK
+  con `NOT VALID` + `VALIDATE CONSTRAINT` para no bloquear escrituras (con el volumen del challenge
+  la versión transaccional es instantánea).
 - `downgrade()`: revierte todo; si hay alertas duplicadas vivas por (campo, evento) o notificaciones
   `cancelled`, el downgrade falla con un mensaje claro (no borra datos en silencio).
 

@@ -7,8 +7,15 @@ from fastapi import APIRouter, Depends, Query, status
 from app.api.deps import CurrentUser, SessionDep
 from app.models import Alert, EventType
 from app.schemas.alert import AlertCreate, AlertPage, AlertRead, AlertUpdate
-from app.schemas.common import BIGINT_MAX, PaginationParams, protected_responses
+from app.schemas.common import (
+    BIGINT_MAX,
+    ErrorResponse,
+    PaginationParams,
+    protected_responses,
+)
 from app.services.alerts import (
+    ALERT_LIMIT_DETAIL,
+    DUPLICATE_ALERT_DETAIL,
     create_alert,
     delete_alert,
     get_alert,
@@ -17,6 +24,16 @@ from app.services.alerts import (
 )
 
 router = APIRouter(prefix="/alerts", tags=["alerts"])
+
+#: 409 de POST /alerts: unicidad y tope por campo comparten status pero no detalle.
+_CREATE_ALERT_409 = {
+    "model": ErrorResponse,
+    "description": (
+        f"{DUPLICATE_ALERT_DETAIL}. También {ALERT_LIMIT_DETAIL} si el campo ya tiene "
+        "`MAX_ALERTS_PER_FIELD` (default 10) alertas vivas."
+    ),
+    "content": {"application/json": {"example": {"detail": DUPLICATE_ALERT_DETAIL}}},
+}
 
 
 @router.post(
@@ -29,10 +46,10 @@ router = APIRouter(prefix="/alerts", tags=["alerts"])
         "propio (creado con `POST /api/v1/fields`). Un campo inexistente o de otro usuario "
         "responde 404 `Field not found`."
     ),
-    responses=protected_responses(
-        (404, "Field not found"),
-        (409, "An alert for this field and event type already exists"),
-    ),
+    responses={
+        **protected_responses((404, "Field not found")),
+        409: _CREATE_ALERT_409,
+    },
 )
 async def create_alert_endpoint(
     payload: AlertCreate, user: CurrentUser, session: SessionDep
@@ -87,7 +104,10 @@ async def read_alert_endpoint(alert_id: int, user: CurrentUser, session: Session
     "/{alert_id}",
     response_model=AlertRead,
     summary="Actualizar una alerta",
-    responses=protected_responses((404, "Alert not found")),
+    responses=protected_responses(
+        (404, "Alert not found"),
+        (409, DUPLICATE_ALERT_DETAIL),
+    ),
 )
 async def update_alert_endpoint(
     alert_id: int, payload: AlertUpdate, user: CurrentUser, session: SessionDep
@@ -103,5 +123,5 @@ async def update_alert_endpoint(
     responses=protected_responses((404, "Alert not found")),
 )
 async def delete_alert_endpoint(alert_id: int, user: CurrentUser, session: SessionDep) -> None:
-    """Borra una alerta del usuario; 204 sin body."""
+    """Borra lógicamente una alerta propia; 204 sin body (idempotente)."""
     await delete_alert(session, user.id, alert_id)
